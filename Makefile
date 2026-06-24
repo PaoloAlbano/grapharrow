@@ -1,0 +1,119 @@
+UV ?= uv
+PACKAGE ?= grapharrow
+SRC_DIRS := src tests
+
+.PHONY: help sync sync-dev lint format format-check typecheck test test-unit test-integration test-integration-live coverage check cli-help server-help bolt-help db-init db-show-catalog db-show-snapshot db-verify db-recover-dry-run db-bulk-add-nodes db-bulk-add-edges db-import-nodes db-import-edges serve benchmark-backends benchmark-cypher-engine clean
+
+help:
+	@printf "Available targets:\n"
+	@printf "  make sync         Install runtime dependencies with uv\n"
+	@printf "  make sync-dev     Install development dependencies with uv\n"
+	@printf "  make lint         Run Ruff lint checks\n"
+	@printf "  make format       Format the repository with Ruff\n"
+	@printf "  make format-check Check formatting with Ruff\n"
+	@printf "  make typecheck    Run mypy on the source tree\n"
+	@printf "  make test         Run the test suite\n"
+	@printf "  make test-unit    Run the unit test suite\n"
+	@printf "  make test-integration Run the integration test suite\n"
+	@printf "  make test-integration-live Run live object-storage integration tests when env vars are configured\n"
+	@printf "  make coverage     Run the test suite with coverage\n"
+	@printf "  make check        Run lint, typecheck, and tests\n"
+	@printf "  make cli-help     Show the GraphArrow CLI help\n"
+	@printf "  make server-help  Show the GraphArrow server help\n"
+	@printf "  make bolt-help    Show the GraphArrow Bolt help\n"
+	@printf "  make db-init DB=path             Initialize a local database path\n"
+	@printf "  make db-show-catalog DB=path     Print the current catalog\n"
+	@printf "  make db-show-snapshot DB=path    Print the current snapshot\n"
+	@printf "  make db-verify DB=path           Verify the current database state\n"
+	@printf "  make db-recover-dry-run DB=path  Run recovery in dry-run mode\n"
+	@printf "  make db-bulk-add-nodes DB=path FILE=input.json [DEFAULT_LABEL=Label]\n"
+	@printf "  make db-bulk-add-edges DB=path FILE=input.json [SOURCE_LABEL=Label SOURCE_KEY=key TARGET_LABEL=Label TARGET_KEY=key]\n"
+	@printf "  make db-import-nodes DB=path FILE=input.csv [DEFAULT_LABEL=Label]\n"
+	@printf "  make db-import-edges DB=path FILE=input.parquet [SOURCE_LABEL=Label SOURCE_KEY=key TARGET_LABEL=Label TARGET_KEY=key]\n"
+	@printf "  make serve DB=path               Run the REST server for a database path\n"
+	@printf "  make benchmark-backends          Run the backend comparison benchmark\n"
+	@printf "  make benchmark-cypher-engine     Run the Cypher engine benchmark\n"
+	@printf "  make clean        Remove local tool caches\n"
+
+sync:
+	$(UV) sync --no-dev
+
+sync-dev:
+	$(UV) sync
+
+lint:
+	$(UV) run ruff check .
+
+format:
+	$(UV) run ruff format .
+
+format-check:
+	$(UV) run ruff format --check .
+
+typecheck:
+	$(UV) run mypy src
+
+test:
+	$(UV) run pytest
+
+test-unit:
+	$(UV) run pytest tests/unit
+
+test-integration:
+	$(UV) run pytest -m integration tests/integration
+
+test-integration-live:
+	$(UV) run pytest -m "integration and live_storage" tests/integration
+
+coverage:
+	$(UV) run pytest --cov=grapharrow tests
+
+check: lint typecheck test
+
+cli-help:
+	$(UV) run grapharrow --help
+
+server-help:
+	$(UV) run grapharrow-server --help
+
+bolt-help:
+	$(UV) run grapharrow-bolt --help
+
+db-init:
+	$(UV) run grapharrow init $(DB)
+
+db-show-catalog:
+	$(UV) run grapharrow show-catalog $(DB)
+
+db-show-snapshot:
+	$(UV) run grapharrow show-snapshot $(DB)
+
+db-verify:
+	$(UV) run grapharrow verify $(DB)
+
+db-recover-dry-run:
+	$(UV) run grapharrow recover $(DB)
+
+db-bulk-add-nodes:
+	$(UV) run grapharrow bulk-add-nodes $(DB) $(FILE) $(if $(DEFAULT_LABEL),--default-label $(DEFAULT_LABEL),)
+
+db-bulk-add-edges:
+	$(UV) run grapharrow bulk-add-edges $(DB) $(FILE) $(if $(SOURCE_LABEL),--source-label $(SOURCE_LABEL),) $(if $(SOURCE_KEY),--source-key $(SOURCE_KEY),) $(if $(TARGET_LABEL),--target-label $(TARGET_LABEL),) $(if $(TARGET_KEY),--target-key $(TARGET_KEY),)
+
+db-import-nodes:
+	$(UV) run grapharrow import-nodes $(DB) $(FILE) $(if $(DEFAULT_LABEL),--default-label $(DEFAULT_LABEL),)
+
+db-import-edges:
+	$(UV) run grapharrow import-edges $(DB) $(FILE) $(if $(SOURCE_LABEL),--source-label $(SOURCE_LABEL),) $(if $(SOURCE_KEY),--source-key $(SOURCE_KEY),) $(if $(TARGET_LABEL),--target-label $(TARGET_LABEL),) $(if $(TARGET_KEY),--target-key $(TARGET_KEY),)
+
+serve:
+	$(UV) run grapharrow-server --path $(DB)
+
+benchmark-backends:
+	$(UV) run python scripts/benchmark_backends.py
+
+benchmark-cypher-engine:
+	$(UV) run python scripts/benchmark_cypher_engine.py
+
+clean:
+	rm -rf .pytest_cache .mypy_cache .ruff_cache
