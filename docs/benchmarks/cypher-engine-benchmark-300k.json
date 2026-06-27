@@ -1,0 +1,266 @@
+{
+  "config": {
+    "nodes": 300000,
+    "edges": 1800000,
+    "repeats": 1,
+    "warmups": 0,
+    "memory_repeats": 1,
+    "seed": 42,
+    "workspace": ".benchmarks/cypher_engine"
+  },
+  "results": [
+    {
+      "query": "scalar_filter_sort_limit",
+      "median_seconds": 0.6460108747705817,
+      "best_seconds": 0.6460108747705817,
+      "worst_seconds": 0.6460108747705817,
+      "runs": [
+        0.6460108747705817
+      ],
+      "row_count": 100,
+      "checksum": "5c7d22240ce5235444fceba0a26dc9ed102fe03bd5677fdb931de9e3e8973aee",
+      "median_rss_delta_mb": 314.953125,
+      "best_rss_delta_mb": 314.953125,
+      "worst_rss_delta_mb": 314.953125,
+      "rss_delta_runs": [
+        314.953125
+      ],
+      "median_arrow_peak_mb": 290.17657470703125,
+      "best_arrow_peak_mb": 290.17657470703125,
+      "worst_arrow_peak_mb": 290.17657470703125,
+      "arrow_peak_runs": [
+        290.17657470703125
+      ]
+    },
+    {
+      "query": "relationship_property_filter_sort_limit",
+      "median_seconds": 2.1733464170247316,
+      "best_seconds": 2.1733464170247316,
+      "worst_seconds": 2.1733464170247316,
+      "runs": [
+        2.1733464170247316
+      ],
+      "row_count": 500,
+      "checksum": "59876888157ed91c5aed9127c91e7ff15302fe8a69a508f52a127b7d7227a3a1",
+      "median_rss_delta_mb": 816.84375,
+      "best_rss_delta_mb": 816.84375,
+      "worst_rss_delta_mb": 816.84375,
+      "rss_delta_runs": [
+        816.84375
+      ],
+      "median_arrow_peak_mb": 694.7037963867188,
+      "best_arrow_peak_mb": 694.7037963867188,
+      "worst_arrow_peak_mb": 694.7037963867188,
+      "arrow_peak_runs": [
+        694.7037963867188
+      ]
+    },
+    {
+      "query": "grouped_with_count",
+      "median_seconds": 1.0871660830453038,
+      "best_seconds": 1.0871660830453038,
+      "worst_seconds": 1.0871660830453038,
+      "runs": [
+        1.0871660830453038
+      ],
+      "row_count": 6,
+      "checksum": "1d82529979e61b03eefbadaa2b773932d495ae22d9742c9be06110a68a8651f0",
+      "median_rss_delta_mb": 276.0625,
+      "best_rss_delta_mb": 276.0625,
+      "worst_rss_delta_mb": 276.0625,
+      "rss_delta_runs": [
+        276.0625
+      ],
+      "median_arrow_peak_mb": 236.81365966796875,
+      "best_arrow_peak_mb": 236.81365966796875,
+      "worst_arrow_peak_mb": 236.81365966796875,
+      "arrow_peak_runs": [
+        236.81365966796875
+      ]
+    },
+    {
+      "query": "optional_match_projection",
+      "median_seconds": 1.3197801248170435,
+      "best_seconds": 1.3197801248170435,
+      "worst_seconds": 1.3197801248170435,
+      "runs": [
+        1.3197801248170435
+      ],
+      "row_count": 1000,
+      "checksum": "83b9b6769b04ba11a5438ef4a8cb306a4f235ab98418a01711bd6733b798dbc9",
+      "median_rss_delta_mb": 872.96875,
+      "best_rss_delta_mb": 872.96875,
+      "worst_rss_delta_mb": 872.96875,
+      "rss_delta_runs": [
+        872.96875
+      ],
+      "median_arrow_peak_mb": 728.9588623046875,
+      "best_arrow_peak_mb": 728.9588623046875,
+      "worst_arrow_peak_mb": 728.9588623046875,
+      "arrow_peak_runs": [
+        728.9588623046875
+      ]
+    },
+    {
+      "query": "three_hop_traversal",
+      "median_seconds": 3.8170540421269834,
+      "best_seconds": 3.8170540421269834,
+      "worst_seconds": 3.8170540421269834,
+      "runs": [
+        3.8170540421269834
+      ],
+      "row_count": 1,
+      "checksum": "dd41391174b05f2597f6a65b891264d8fb2a9ecab84e958aec8ebf4b9e6b3e5b",
+      "median_rss_delta_mb": 377.390625,
+      "best_rss_delta_mb": 377.390625,
+      "worst_rss_delta_mb": 377.390625,
+      "rss_delta_runs": [
+        377.390625
+      ],
+      "median_arrow_peak_mb": 318.4190673828125,
+      "best_arrow_peak_mb": 318.4190673828125,
+      "worst_arrow_peak_mb": 318.4190673828125,
+      "arrow_peak_runs": [
+        318.4190673828125
+      ]
+    },
+    {
+      "query": "three_hop_projection_order_limit",
+      "median_seconds": 3.8108622496947646,
+      "best_seconds": 3.8108622496947646,
+      "worst_seconds": 3.8108622496947646,
+      "runs": [
+        3.8108622496947646
+      ],
+      "row_count": 500,
+      "checksum": "be5d783c7c8ed0009444734dd3db4f8731aab236a0a1c4a6a908484a59bd5b9f",
+      "median_rss_delta_mb": 404.234375,
+      "best_rss_delta_mb": 404.234375,
+      "worst_rss_delta_mb": 404.234375,
+      "rss_delta_runs": [
+        404.234375
+      ],
+      "median_arrow_peak_mb": 330.38031005859375,
+      "best_arrow_peak_mb": 330.38031005859375,
+      "worst_arrow_peak_mb": 330.38031005859375,
+      "arrow_peak_runs": [
+        330.38031005859375
+      ]
+    },
+    {
+      "query": "three_hop_traversal_dense_where",
+      "median_seconds": 3.8629253329709172,
+      "best_seconds": 3.8629253329709172,
+      "worst_seconds": 3.8629253329709172,
+      "runs": [
+        3.8629253329709172
+      ],
+      "row_count": 1,
+      "checksum": "e7696b63b9a17f19f000d16594e8c5b79e37a4d5fe34167be9ab6dcce441241e",
+      "median_rss_delta_mb": 170.15625,
+      "best_rss_delta_mb": 170.15625,
+      "worst_rss_delta_mb": 170.15625,
+      "rss_delta_runs": [
+        170.15625
+      ],
+      "median_arrow_peak_mb": 310.04327392578125,
+      "best_arrow_peak_mb": 310.04327392578125,
+      "worst_arrow_peak_mb": 310.04327392578125,
+      "arrow_peak_runs": [
+        310.04327392578125
+      ]
+    },
+    {
+      "query": "three_hop_traversal_mixed_where",
+      "median_seconds": 3.9543520002625883,
+      "best_seconds": 3.9543520002625883,
+      "worst_seconds": 3.9543520002625883,
+      "runs": [
+        3.9543520002625883
+      ],
+      "row_count": 1,
+      "checksum": "6ba2754f298e8a7c0b813975ebce93e38e1ad62d4bf393caae52b72a528531b1",
+      "median_rss_delta_mb": 387.6875,
+      "best_rss_delta_mb": 387.6875,
+      "worst_rss_delta_mb": 387.6875,
+      "rss_delta_runs": [
+        387.6875
+      ],
+      "median_arrow_peak_mb": 346.9071044921875,
+      "best_arrow_peak_mb": 346.9071044921875,
+      "worst_arrow_peak_mb": 346.9071044921875,
+      "arrow_peak_runs": [
+        346.9071044921875
+      ]
+    },
+    {
+      "query": "three_hop_wildcard_projection_order_limit",
+      "median_seconds": 3.162959082983434,
+      "best_seconds": 3.162959082983434,
+      "worst_seconds": 3.162959082983434,
+      "runs": [
+        3.162959082983434
+      ],
+      "row_count": 500,
+      "checksum": "be5d783c7c8ed0009444734dd3db4f8731aab236a0a1c4a6a908484a59bd5b9f",
+      "median_rss_delta_mb": 364.09375,
+      "best_rss_delta_mb": 364.09375,
+      "worst_rss_delta_mb": 364.09375,
+      "rss_delta_runs": [
+        364.09375
+      ],
+      "median_arrow_peak_mb": 286.85272216796875,
+      "best_arrow_peak_mb": 286.85272216796875,
+      "worst_arrow_peak_mb": 286.85272216796875,
+      "arrow_peak_runs": [
+        286.85272216796875
+      ]
+    },
+    {
+      "query": "range_hop_wildcard_projection_order_limit",
+      "median_seconds": 3.062920957803726,
+      "best_seconds": 3.062920957803726,
+      "worst_seconds": 3.062920957803726,
+      "runs": [
+        3.062920957803726
+      ],
+      "row_count": 282,
+      "checksum": "61fca501669781095e875d0736a475c2d2d99f40f45581f143f2939462e2ba89",
+      "median_rss_delta_mb": 360.296875,
+      "best_rss_delta_mb": 360.296875,
+      "worst_rss_delta_mb": 360.296875,
+      "rss_delta_runs": [
+        360.296875
+      ],
+      "median_arrow_peak_mb": 290.24365234375,
+      "best_arrow_peak_mb": 290.24365234375,
+      "worst_arrow_peak_mb": 290.24365234375,
+      "arrow_peak_runs": [
+        290.24365234375
+      ]
+    },
+    {
+      "query": "unwind_parameter_pipeline",
+      "median_seconds": 0.00903737498447299,
+      "best_seconds": 0.00903737498447299,
+      "worst_seconds": 0.00903737498447299,
+      "runs": [
+        0.00903737498447299
+      ],
+      "row_count": 500,
+      "checksum": "dc79e2f7ed68e3dcf815dba92473735f05a056394890a1fee746b120767a0eb1",
+      "median_rss_delta_mb": 3.3125,
+      "best_rss_delta_mb": 3.3125,
+      "worst_rss_delta_mb": 3.3125,
+      "rss_delta_runs": [
+        3.3125
+      ],
+      "median_arrow_peak_mb": 0.027099609375,
+      "best_arrow_peak_mb": 0.027099609375,
+      "worst_arrow_peak_mb": 0.027099609375,
+      "arrow_peak_runs": [
+        0.027099609375
+      ]
+    }
+  ]
+}

@@ -15,6 +15,7 @@ authors = [
 dependencies = [
   "antlr4-python3-runtime>=4.13.2",
   "fastapi>=0.135.2",
+  "orjson>=3.11.9",
   "pandas>=3.0.2",
   "pyarrow>=20.0.0",
   "pydantic>=2.12.5",

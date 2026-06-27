@@ -2,7 +2,7 @@ UV ?= uv
 PACKAGE ?= grapharrow
 SRC_DIRS := src tests
 
-.PHONY: help sync sync-dev lint format format-check typecheck test test-unit test-integration test-integration-live coverage check cli-help server-help bolt-help db-init db-show-catalog db-show-snapshot db-verify db-recover-dry-run db-bulk-add-nodes db-bulk-add-edges db-import-nodes db-import-edges serve benchmark-backends benchmark-cypher-engine clean
+.PHONY: help sync sync-dev lint format format-check typecheck test test-unit test-integration test-integration-live coverage check cli-help server-help bolt-help db-init db-show-catalog db-show-snapshot db-verify db-recover-dry-run db-bulk-add-nodes db-bulk-add-edges db-import-nodes db-import-edges serve bolt benchmark-backends benchmark-cypher-engine benchmark-tabular-json clean
 
 help:
 	@printf "Available targets:\n"
@@ -31,8 +31,10 @@ help:
 	@printf "  make db-import-nodes DB=path FILE=input.csv [DEFAULT_LABEL=Label]\n"
 	@printf "  make db-import-edges DB=path FILE=input.parquet [SOURCE_LABEL=Label SOURCE_KEY=key TARGET_LABEL=Label TARGET_KEY=key]\n"
 	@printf "  make serve DB=path               Run the REST server for a database path\n"
+	@printf "  make bolt DB=path [HOST=127.0.0.1 PORT=18080] Run the Bolt server\n"
 	@printf "  make benchmark-backends          Run the backend comparison benchmark\n"
 	@printf "  make benchmark-cypher-engine     Run the Cypher engine benchmark\n"
+	@printf "  make benchmark-tabular-json      Compare json vs orjson tabular serialization\n"
 	@printf "  make clean        Remove local tool caches\n"
 
 sync:
@@ -109,11 +111,17 @@ db-import-edges:
 serve:
 	$(UV) run grapharrow-server --path $(DB)
 
+bolt:
+	$(UV) run grapharrow-bolt --path $(DB) --host $(or $(HOST),127.0.0.1) --port $(or $(PORT),18080) $(BOLT_ARGS)
+
 benchmark-backends:
 	$(UV) run python scripts/benchmark_backends.py
 
 benchmark-cypher-engine:
 	$(UV) run python scripts/benchmark_cypher_engine.py
+
+benchmark-tabular-json:
+	$(UV) run python scripts/benchmark_tabular_json.py
 
 clean:
 	rm -rf .pytest_cache .mypy_cache .ruff_cache

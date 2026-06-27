@@ -454,20 +454,6 @@ class CypherQueryUseCase:
         if ddl_result is not None:
             return ddl_result
 
-        show_result = _execute_show_compatibility_statement(
-            normalized,
-            self._graph_service.load_state(),
-        )
-        if show_result is not None:
-            return show_result
-
-        schema_result = _execute_schema_compatibility_procedure(
-            normalized,
-            self._graph_service.load_state(),
-        )
-        if schema_result is not None:
-            return schema_result
-
         compatibility_result = _execute_neo4j_compatibility_procedure(normalized)
         if compatibility_result is not None:
             return compatibility_result
@@ -475,6 +461,23 @@ class CypherQueryUseCase:
         standalone_return = _execute_standalone_return(normalized, parameters)
         if standalone_return is not None:
             return standalone_return
+
+        compatibility_lower = _normalize_compatibility_statement(normalized).lower()
+        if compatibility_lower.startswith("show "):
+            show_result = _execute_show_compatibility_statement(
+                normalized,
+                self._graph_service.load_state(),
+            )
+            if show_result is not None:
+                return show_result
+
+        if _is_schema_compatibility_procedure(compatibility_lower):
+            schema_result = _execute_schema_compatibility_procedure(
+                normalized,
+                self._graph_service.load_state(),
+            )
+            if schema_result is not None:
+                return schema_result
 
         parse_tree = parse_cypher(query)
         compiled = _compile_query(parse_tree, parameters)
@@ -2096,6 +2099,21 @@ def _execute_schema_compatibility_procedure(
     )
 
 
+def _is_schema_compatibility_procedure(normalized_lower_query: str) -> bool:
+    """Return true when a compatibility procedure needs graph schema state."""
+    return normalized_lower_query.startswith(
+        (
+            "call db.labels",
+            "call db.relationshiptypes",
+            "call db.propertykeys",
+            "call db.schema.nodetypeproperties",
+            "call db.schema.reltypeproperties",
+            "call db.schema.relationshiptypeproperties",
+            "call db.schema.visualization",
+        )
+    )
+
+
 def _schema_node_type_property_rows(state: GraphState) -> tuple[dict[str, Any], ...]:
     """Build Neo4j-compatible node property metadata rows."""
     labels = sorted({label for node in state.nodes for label in node.labels})
@@ -2765,24 +2783,28 @@ def _compile_multi_match_query(
 ) -> CompiledMatchQuery:
     """Compile multiple connected MATCH clauses into one joined match pipeline."""
     patterns: list[CompiledPattern] = []
+    where_predicates: list[WherePredicate] = []
     for reading_clause in reading_clauses:
         match_ctx = reading_clause.oC_Match()
         if match_ctx is None:
             raise QueryError("Only MATCH clauses are supported in multi-MATCH queries.")
         if match_ctx.OPTIONAL() is not None:
             raise QueryError("OPTIONAL MATCH is supported only as MATCH ... OPTIONAL MATCH.")
-        if match_ctx.oC_Where() is not None:
-            raise QueryError("WHERE after multiple MATCH clauses is not supported yet.")
         patterns.extend(_compile_match_patterns(match_ctx.oC_Pattern(), params, state))
+        if match_ctx.oC_Where() is not None:
+            where_predicates.append(
+                _compile_where(match_ctx.oC_Where(), params, _scope_from_patterns(tuple(patterns)))
+            )
 
-    compiled_patterns = tuple(patterns)
+    compiled_patterns = _fuse_linear_match_patterns(tuple(patterns))
     scope = _scope_from_patterns(compiled_patterns)
+    where_predicate = _combine_and_predicates(tuple(where_predicates))
     projection_body = return_ctx.oC_ProjectionBody()
     return_items, distinct = _compile_return_items(projection_body, scope=scope)
     _validate_return_items(return_items)
     return CompiledMatchQuery(
         patterns=compiled_patterns,
-        where_predicate=None,
+        where_predicate=where_predicate,
         return_items=return_items,
         distinct=distinct,
         order_by=_compile_order_by(
@@ -2793,6 +2815,113 @@ def _compile_multi_match_query(
         skip=_compile_optional_int(projection_body.oC_Skip(), params),
         limit=_compile_optional_int(projection_body.oC_Limit(), params),
     )
+
+
+def _fuse_linear_match_patterns(
+    patterns: tuple[CompiledPattern, ...],
+) -> tuple[CompiledPattern, ...]:
+    """Fuse connected multi-MATCH path fragments into one path when semantics are unchanged."""
+    if len(patterns) <= 1:
+        return patterns
+
+    node_constraints = {
+        pattern.variable: pattern for pattern in patterns if isinstance(pattern, NodePattern)
+    }
+    constrained_patterns: list[CompiledPattern] = []
+    consumed_node_constraints: set[str] = set()
+    for pattern in patterns:
+        if isinstance(pattern, NodePattern):
+            continue
+        constrained, consumed = _path_with_node_constraints(pattern, node_constraints)
+        consumed_node_constraints.update(consumed)
+        constrained_patterns.append(constrained)
+
+    for pattern in patterns:
+        if isinstance(pattern, NodePattern) and pattern.variable not in consumed_node_constraints:
+            constrained_patterns.append(pattern)
+
+    if not constrained_patterns:
+        return patterns
+
+    fused: list[CompiledPattern] = []
+    for pattern in constrained_patterns:
+        if not fused:
+            fused.append(pattern)
+            continue
+        previous = fused[-1]
+        merged = _try_append_path_pattern(previous, pattern)
+        if merged is None:
+            fused.append(pattern)
+            continue
+        fused[-1] = merged
+    return tuple(fused)
+
+
+def _path_with_node_constraints(
+    pattern: PathPattern,
+    node_constraints: Mapping[str, NodePattern],
+) -> tuple[PathPattern, set[str]]:
+    """Apply standalone MATCH node constraints to a connected path fragment."""
+    consumed: set[str] = set()
+    start, start_consumed = _merge_optional_node_constraint(
+        pattern.start,
+        node_constraints.get(pattern.start.variable),
+    )
+    if start_consumed:
+        consumed.add(pattern.start.variable)
+    steps: list[RelationshipStep] = []
+    for step in pattern.steps:
+        node, node_consumed = _merge_optional_node_constraint(
+            step.node,
+            node_constraints.get(step.node.variable),
+        )
+        if node_consumed:
+            consumed.add(step.node.variable)
+        steps.append(replace(step, node=node))
+    return replace(pattern, start=start, steps=tuple(steps)), consumed
+
+
+def _merge_optional_node_constraint(
+    node: NodePattern,
+    constraint: NodePattern | None,
+) -> tuple[NodePattern, bool]:
+    """Merge compatible labels and inline properties for the same node variable."""
+    if constraint is None:
+        return node, False
+    merged = _merge_node_patterns(node, constraint)
+    return (node, False) if merged is None else (merged, True)
+
+
+def _try_append_path_pattern(
+    left: CompiledPattern,
+    right: CompiledPattern,
+) -> PathPattern | None:
+    """Append ``right`` to ``left`` when they form one linear path."""
+    if not isinstance(left, PathPattern) or not isinstance(right, PathPattern):
+        return None
+    if not left.steps:
+        return None
+    left_tail = left.steps[-1].node
+    if left_tail.variable != right.start.variable:
+        return None
+    merged_tail = _merge_node_patterns(left_tail, right.start)
+    if merged_tail is None:
+        return None
+    left_steps = [*left.steps[:-1], replace(left.steps[-1], node=merged_tail)]
+    return PathPattern(start=left.start, steps=tuple([*left_steps, *right.steps]))
+
+
+def _merge_node_patterns(left: NodePattern, right: NodePattern) -> NodePattern | None:
+    """Merge constraints for the same node variable, or return None on conflicts."""
+    if left.variable != right.variable:
+        return None
+    labels = tuple(dict.fromkeys((*left.labels, *right.labels)))
+    properties = dict(left.properties)
+    for key, value in right.properties.items():
+        if key in properties and properties[key] != value:
+            return None
+        properties[key] = value
+    return replace(left, labels=labels, properties=properties)
 
 
 def _compile_optional_match_query(
@@ -9893,10 +10022,17 @@ def _label_membership_mask(
     value: str,
 ) -> pa.Array:
     """Support the current Cypher compilation or execution step."""
-    return pa.array(
-        [value in _decode_labels(labels) for labels in column.to_pylist()],
-        type=pa.bool_(),
-    )
+    normalized_value = _cypher_name(value)
+    encoded_candidates = {
+        json.dumps(normalized_value),
+        json.dumps(f"`{normalized_value}`"),
+        json.dumps(value),
+    }
+    masks = [
+        pc.fill_null(pc.match_substring(column, encoded_candidate), False)
+        for encoded_candidate in encoded_candidates
+    ]
+    return _combine_masks(masks, operator="or")
 
 
 def _exists_mask(column: pa.ChunkedArray) -> pa.Array:
