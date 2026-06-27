@@ -88,6 +88,29 @@ def test_match_logical_plan_uses_nested_expands_for_multi_hop_path() -> None:
     assert isinstance(plan.root.input.input.input.input, NodeScanPlan)
 
 
+def test_multi_match_logical_plan_fuses_linear_path_with_where() -> None:
+    compiled = _compile_query(
+        parse_cypher(
+            "MATCH (a:Person) WHERE a.anchor = true "
+            "MATCH (a)-[:KNOWS]->(b:Person) WHERE b.active = true "
+            "MATCH (b)-[:KNOWS]->(c:Person) WHERE c.country IN ['IT', 'DE'] "
+            "RETURN count(c) AS total"
+        ),
+        {},
+    )
+
+    assert isinstance(compiled, CompiledMatchQuery)
+    assert len(compiled.patterns) == 1
+    plan = _build_match_logical_plan(compiled)
+
+    assert plan is not None
+    assert isinstance(plan.root, AggregateCountPlan)
+    assert isinstance(plan.root.input, FilterPlan)
+    assert isinstance(plan.root.input.input, ExpandPlan)
+    assert isinstance(plan.root.input.input.input, ExpandPlan)
+    assert isinstance(plan.root.input.input.input.input, NodeScanPlan)
+
+
 def test_match_logical_plan_falls_back_for_reused_path_variable() -> None:
     compiled = _compile_query(
         parse_cypher(
@@ -1584,6 +1607,23 @@ def test_unwind_supports_literal_lists(tmp_path: Path) -> None:
     )
 
 
+def test_unwind_does_not_load_graph_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    def fail_load_state() -> object:
+        raise AssertionError("UNWIND should not load graph state")
+
+    monkeypatch.setattr(database._app.use_cases.graph, "load_state", fail_load_state)
+
+    with database.read_transaction() as session:
+        result = session.query("UNWIND [1, 2] AS value RETURN value ORDER BY value ASC")
+
+    assert result.rows == ({"value": 1}, {"value": 2})
+
+
 def test_unwind_supports_list_parameters(tmp_path: Path) -> None:
     database = Database(tmp_path / "example-db")
 
@@ -2482,6 +2522,62 @@ def test_memgraph_got_victim_death_location_visual_query_supports_multi_match(
     assert result.rows[0]["victim_to_death"]["type"] == "VICTIM_IN"
     assert result.rows[0]["death"]["properties"]["order"] == 1
     assert result.rows[0]["death_to_location"]["type"] == "HAPPENED_IN"
+    assert result.rows[0]["location"]["properties"]["name"] == "Beyond the Wall"
+
+
+def test_multi_match_supports_where_on_later_match_binding(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query(
+            "CREATE (jon:Character {name: 'Jon Snow'})-[:KILLED]->"
+            "(orell:Character {name: 'Orell'}) RETURN jon"
+        )
+        session.query(
+            "MATCH (jon:Character {name: 'Jon Snow'}), (orell:Character {name: 'Orell'}) "
+            "CREATE (jon)-[:KILLER_IN]->(death:Death {order: 1}) RETURN death"
+        )
+        session.query(
+            "MATCH (death:Death {order: 1}), (orell:Character {name: 'Orell'}) "
+            "CREATE (orell)-[:VICTIM_IN]->(death) RETURN death"
+        )
+        session.query(
+            "MATCH (death:Death {order: 1}) "
+            "CREATE (death)-[:HAPPENED_IN]->(location:Location {name: 'Beyond the Wall'}) "
+            "RETURN location"
+        )
+        session.query(
+            "MATCH (jon:Character {name: 'Jon Snow'}) "
+            "CREATE (jon)-[:KILLED]->(victim:Character {name: 'Qhorin Halfhand'}) RETURN victim"
+        )
+        session.query(
+            "MATCH (jon:Character {name: 'Jon Snow'}), "
+            "(victim:Character {name: 'Qhorin Halfhand'}) "
+            "CREATE (jon)-[:KILLER_IN]->(death:Death {order: 2}) RETURN death"
+        )
+        session.query(
+            "MATCH (death:Death {order: 2}), (victim:Character {name: 'Qhorin Halfhand'}) "
+            "CREATE (victim)-[:VICTIM_IN]->(death) RETURN death"
+        )
+        session.query(
+            "MATCH (death:Death {order: 2}) "
+            "CREATE (death)-[:HAPPENED_IN]->(location:Location {name: 'Frostfangs'}) "
+            "RETURN location"
+        )
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (jon:Character {name: 'Jon Snow'})-[:KILLED]->(victim:Character) "
+            "MATCH (jon)-[:KILLER_IN]->(death:Death)<-[victim_to_death:VICTIM_IN]-(victim) "
+            "MATCH (death)-[death_to_location:HAPPENED_IN]->(location:Location) "
+            "WHERE location.name = 'Beyond the Wall' "
+            "RETURN victim,victim_to_death,death,death_to_location,location"
+        )
+
+    assert len(result.rows) == 1
+    assert result.rows[0]["victim"]["properties"]["name"] == "Orell"
     assert result.rows[0]["location"]["properties"]["name"] == "Beyond the Wall"
 
 

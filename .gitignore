@@ -23,5 +23,11 @@ dist/
 .vscode/
 
 docs/*
+!docs/agent-first-graph-database.md
+!docs/benchmarks/
+!docs/benchmarks/cypher-engine-benchmark-current-with-multimatch.json
+!docs/benchmarks/cypher-engine-benchmark-current-with-multimatch.md
 scripts/*
+!scripts/benchmark_cypher_engine.py
+!scripts/benchmark_tabular_json.py
 tests/integration/.runtime/
