@@ -28,6 +28,8 @@ class GraphArrowSettings(BaseSettings):
     bolt_host: str = Field(default="127.0.0.1")
     bolt_port: int = Field(default=7687)
     bolt_auth_token: str | None = Field(default=None)
+    bolt_server_agent: str = Field(default="Neo4j/5.26.0")
+    bolt_log_queries: bool = Field(default=True)
 
     s3_access_key: str | None = Field(default=None)
     s3_secret_key: str | None = Field(default=None)

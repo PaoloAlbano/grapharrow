@@ -45,8 +45,12 @@ from grapharrow.use_cases.graph import (
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _INTERNAL_VARIABLE_PREFIX = "__varhop_"
 _FUNCTION_FIELD_PREFIX = "__fn__:"
+_ENTITY_ID_FIELD = "__entity_id"
+_NODE_ID_FIELD = "__id"
+_JOIN_JSON_PREFIX = "__grapharrow_join_json__:"
 _FULL_ENTITY_FIELDS = "*"
 _DISABLE_PLANNER_ENV = "GRAPHARROW_DISABLE_CYPHER_PLANNER"
+_UNRESOLVED_REFERENCE = object()
 NodeBindingSource: TypeAlias = tuple[NodeRecord, ...] | pa.Table
 EdgeBindingSource: TypeAlias = tuple[EdgeRecord, ...] | pa.Table
 
@@ -64,6 +68,7 @@ class RelationshipStep:
     rel_type: str | None
     properties: dict[str, object]
     node: NodePattern
+    direction: str = "outgoing"
     min_hops: int = 1
     max_hops: int = 1
 
@@ -81,7 +86,13 @@ ScopeBindingKind = Literal["entity", "scalar"]
 @dataclass(frozen=True, slots=True)
 class CreateRelationshipPattern:
     left_variable: str
+    left_bound: bool
+    left_labels: tuple[str, ...]
+    left_properties: dict[str, object]
     right_variable: str
+    right_bound: bool
+    right_labels: tuple[str, ...]
+    right_properties: dict[str, object]
     rel_type: str
     properties: dict[str, object]
 
@@ -109,6 +120,12 @@ class MergeRelationshipPattern:
 
 
 @dataclass(frozen=True, slots=True)
+class PropertyReferenceValue:
+    variable: str
+    field: str
+
+
+@dataclass(frozen=True, slots=True)
 class SetPropertyItem:
     variable: str
     field: str
@@ -119,6 +136,30 @@ class SetPropertyItem:
 class SetMapMergeItem:
     variable: str
     properties: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class SetMapReferenceMergeItem:
+    variable: str
+    source: PropertyReferenceValue
+
+
+SetItem: TypeAlias = SetPropertyItem | SetMapMergeItem | SetMapReferenceMergeItem
+
+
+@dataclass(frozen=True, slots=True)
+class RemovePropertyItem:
+    variable: str
+    field: str
+
+
+@dataclass(frozen=True, slots=True)
+class RemoveLabelItem:
+    variable: str
+    label: str
+
+
+RemoveItem: TypeAlias = RemovePropertyItem | RemoveLabelItem
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,8 +268,8 @@ class CompiledCreateQuery:
 @dataclass(frozen=True, slots=True)
 class CompiledMergeQuery:
     pattern: MergeNodePattern
-    on_create_set_items: tuple[SetPropertyItem | SetMapMergeItem, ...]
-    on_match_set_items: tuple[SetPropertyItem | SetMapMergeItem, ...]
+    on_create_set_items: tuple[SetItem, ...]
+    on_match_set_items: tuple[SetItem, ...]
     return_items: tuple[ReturnItem, ...]
     distinct: bool
 
@@ -295,8 +336,8 @@ class CompiledMatchMergeQuery:
     match_patterns: tuple[CompiledPattern, ...]
     where_predicate: WherePredicate | None
     merge_pattern: MergeRelationshipPattern
-    on_create_set_items: tuple[SetPropertyItem | SetMapMergeItem, ...]
-    on_match_set_items: tuple[SetPropertyItem | SetMapMergeItem, ...]
+    on_create_set_items: tuple[SetItem, ...]
+    on_match_set_items: tuple[SetItem, ...]
     return_items: tuple[ReturnItem, ...]
     distinct: bool
     order_by: tuple[OrderByItem, ...] | None
@@ -308,7 +349,7 @@ class CompiledMatchMergeQuery:
 class CompiledMatchSetQuery:
     match_patterns: tuple[CompiledPattern, ...]
     where_predicate: WherePredicate | None
-    set_items: tuple[SetPropertyItem | SetMapMergeItem, ...]
+    set_items: tuple[SetItem, ...]
     return_items: tuple[ReturnItem, ...]
     distinct: bool
     order_by: tuple[OrderByItem, ...] | None
@@ -335,10 +376,23 @@ class CompiledMatchDeleteQuery:
 
 
 @dataclass(frozen=True, slots=True)
+class CompiledMatchRemoveQuery:
+    match_patterns: tuple[CompiledPattern, ...]
+    where_predicate: WherePredicate | None
+    remove_items: tuple[RemoveItem, ...]
+    return_items: tuple[ReturnItem, ...]
+    distinct: bool
+    order_by: tuple[OrderByItem, ...] | None
+    skip: int | None
+    limit: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class CompiledMatchWithQuery:
     match_patterns: tuple[CompiledPattern, ...]
     match_where_predicate: WherePredicate | None
     match_optional: bool
+    pre_with_unwind: CompiledUnwind | None
     with_items: tuple[WithItem, ...]
     with_aggregate_items: tuple[ReturnItem, ...]
     with_where_predicate: WherePredicate | None
@@ -350,6 +404,15 @@ class CompiledMatchWithQuery:
     post_with_match_where_predicate: WherePredicate | None
     post_with_match_optional: bool
     post_with_unwind: CompiledUnwind | None
+    post_with_create_patterns: tuple[CompiledPattern, ...]
+    post_with_create_relationship_patterns: tuple[CreateRelationshipPattern, ...]
+    post_with_merge_node_pattern: MergeNodePattern | None
+    post_with_merge_relationship_pattern: MergeRelationshipPattern | None
+    post_with_merge_on_create_set_items: tuple[SetItem, ...]
+    post_with_merge_on_match_set_items: tuple[SetItem, ...]
+    post_with_set_items: tuple[SetItem, ...]
+    post_with_delete_detach: bool
+    post_with_delete_items: tuple[DeleteItem, ...]
     return_items: tuple[ReturnItem, ...]
     return_distinct: bool
     return_order_by: tuple[OrderByItem, ...] | None
@@ -387,6 +450,32 @@ class CypherQueryUseCase:
             raise QueryError("Query string cannot be empty.")
 
         parameters = params or {}
+        ddl_result = _execute_ddl_compatibility_statement(normalized)
+        if ddl_result is not None:
+            return ddl_result
+
+        show_result = _execute_show_compatibility_statement(
+            normalized,
+            self._graph_service.load_state(),
+        )
+        if show_result is not None:
+            return show_result
+
+        schema_result = _execute_schema_compatibility_procedure(
+            normalized,
+            self._graph_service.load_state(),
+        )
+        if schema_result is not None:
+            return schema_result
+
+        compatibility_result = _execute_neo4j_compatibility_procedure(normalized)
+        if compatibility_result is not None:
+            return compatibility_result
+
+        standalone_return = _execute_standalone_return(normalized, parameters)
+        if standalone_return is not None:
+            return standalone_return
+
         parse_tree = parse_cypher(query)
         compiled = _compile_query(parse_tree, parameters)
 
@@ -408,6 +497,8 @@ class CypherQueryUseCase:
             return self._execute_match_set(compiled)
         if isinstance(compiled, CompiledMatchDeleteQuery):
             return self._execute_match_delete(compiled)
+        if isinstance(compiled, CompiledMatchRemoveQuery):
+            return self._execute_match_remove(compiled)
         if isinstance(compiled, CompiledMatchWithQuery):
             return self._execute_match_with(compiled)
         return self._execute_match(compiled)
@@ -429,6 +520,11 @@ class CypherQueryUseCase:
                     snapshot=state.snapshot,
                     rel_type=rel_type,
                 )
+                if table.num_rows == 0:
+                    table = self._graph_service.load_adjacency_by_source_table(
+                        snapshot=state.snapshot,
+                        rel_type=f"`{rel_type}`",
+                    )
                 cache[rel_type] = table
             return table
 
@@ -451,6 +547,11 @@ class CypherQueryUseCase:
                     snapshot=state.snapshot,
                     label=label,
                 )
+                if table.num_rows == 0:
+                    table = self._graph_service.load_node_property_table(
+                        snapshot=state.snapshot,
+                        label=f"`{label}`",
+                    )
                 cache[label] = table
             return table
 
@@ -473,6 +574,11 @@ class CypherQueryUseCase:
                     snapshot=state.snapshot,
                     rel_type=rel_type,
                 )
+                if table.num_rows == 0:
+                    table = self._graph_service.load_edge_property_table(
+                        snapshot=state.snapshot,
+                        rel_type=f"`{rel_type}`",
+                    )
                 cache[rel_type] = table
             return table
 
@@ -589,7 +695,7 @@ class CypherQueryUseCase:
             query.patterns,
             query.where_predicate,
             return_items=query.return_items,
-            order_by=query.order_by,
+            order_by=None if _contains_aggregates(query.return_items) else query.order_by,
         )
         return self._finalize_table_query_result(
             query.return_items,
@@ -694,8 +800,13 @@ class CypherQueryUseCase:
             matched = self._tabular.inner_join(
                 input_table,
                 edge_table,
-                left_keys=_binding_column_name(plan.start_variable, "id"),
+                left_keys=_binding_column_name(plan.start_variable, _NODE_ID_FIELD),
                 right_keys=f"{plan.edge_variable}.source",
+            )
+            matched = _ensure_edge_source_column(
+                matched,
+                edge_prefix=plan.edge_variable,
+                source_variable=plan.start_variable,
             )
             if matched.num_rows == 0:
                 return matched
@@ -985,21 +1096,44 @@ class CypherQueryUseCase:
 
     def _execute_match_create(self, query: CompiledMatchCreateQuery) -> QueryResult:
         """Execute this query shape and return the result needed by the caller."""
+        state = self._graph_service.load_state()
         matched_rows = self._match_rows(
             query.match_patterns,
             query.where_predicate,
             return_items=query.return_items,
             order_by=query.order_by,
+            extra_required_fields=_required_fields_for_create_bound_variables(
+                query.create_patterns
+            ),
         )
 
-        edges_to_create = _materialize_create_edges_from_matches(
+        new_nodes, new_edges, node_bindings = _materialize_match_create_records_from_matches(
+            state,
             matched_rows,
             query.create_patterns,
         )
-        self._graph_service.create_edges_batch(edges_to_create=edges_to_create)
+        self._graph_service.publish_records(
+            previous_state=state,
+            new_nodes=new_nodes,
+            new_edges=new_edges,
+        )
+        if not query.return_items:
+            return QueryResult(columns=(), rows=())
+        required_fields: dict[str, set[str]] = {}
+        _collect_required_fields_from_return_items(query.return_items, required_fields)
+        _collect_required_fields_from_order_by(query.order_by, required_fields)
+        result_rows = matched_rows
+        for variable, records in node_bindings.items():
+            result_rows = _append_node_binding_columns(
+                result_rows,
+                variable=variable,
+                node_records=records,
+                requested_fields=_requested_fields_for_variable(required_fields, variable),
+                context="CREATE node",
+            )
         return self._finalize_table_query_result(
             query.return_items,
-            matched_rows,
+            result_rows,
             distinct=query.distinct,
             order_by=query.order_by,
             skip=query.skip,
@@ -1112,6 +1246,8 @@ class CypherQueryUseCase:
                 )
             else:
                 result_rows = indexed_rows
+        if not query.return_items:
+            return QueryResult(columns=(), rows=())
         return self._finalize_table_query_result(
             query.return_items,
             result_rows,
@@ -1220,6 +1356,8 @@ class CypherQueryUseCase:
             else:
                 result_rows = indexed_rows
 
+        if not query.return_items:
+            return QueryResult(columns=(), rows=())
         return self._finalize_table_query_result(
             query.return_items,
             result_rows,
@@ -1249,6 +1387,8 @@ class CypherQueryUseCase:
             node_updates=node_updates,
             edge_updates=edge_updates,
         )
+        if not query.return_items:
+            return QueryResult(columns=(), rows=())
         result_rows = _apply_set_items_to_table(matched_rows, query.set_items)
         return self._finalize_table_query_result(
             query.return_items,
@@ -1282,9 +1422,45 @@ class CypherQueryUseCase:
                 edges=self._graph_service.load_state().edges,
             )
         self._graph_service.delete_entities_batch(node_ids=node_ids, edge_ids=edge_ids)
+        if not query.return_items:
+            return QueryResult(columns=(), rows=())
         return self._finalize_table_query_result(
             query.return_items,
             matched_rows,
+            distinct=query.distinct,
+            order_by=query.order_by,
+            skip=query.skip,
+            limit=query.limit,
+        )
+
+    def _execute_match_remove(self, query: CompiledMatchRemoveQuery) -> QueryResult:
+        """Execute MATCH ... REMOVE by deleting matched properties from graph entities."""
+        matched_rows = self._match_rows(
+            query.match_patterns,
+            query.where_predicate,
+            return_items=query.return_items,
+            order_by=query.order_by,
+            extra_required_fields=_required_fields_for_entity_variables(
+                item.variable for item in query.remove_items
+            ),
+        )
+
+        (
+            node_removals,
+            edge_removals,
+            node_label_removals,
+        ) = _materialize_remove_targets_from_matches(matched_rows, query.remove_items)
+        self._graph_service.remove_properties_batch(
+            node_removals=node_removals,
+            edge_removals=edge_removals,
+        )
+        self._graph_service.remove_labels_batch(node_label_removals=node_label_removals)
+        if not query.return_items:
+            return QueryResult(columns=(), rows=())
+        result_rows = _apply_remove_items_to_table(matched_rows, query.remove_items)
+        return self._finalize_table_query_result(
+            query.return_items,
+            result_rows,
             distinct=query.distinct,
             order_by=query.order_by,
             skip=query.skip,
@@ -1311,7 +1487,12 @@ class CypherQueryUseCase:
         adjacency_loader = self._adjacency_loader_for_state(state)
         node_property_loader = self._node_property_loader_for_state(state)
         edge_property_loader = self._edge_property_loader_for_state(state)
-        if query.match_optional:
+        if query.pre_with_unwind is not None:
+            matched_rows = _apply_unwind_to_input_table(
+                _single_row_table(),
+                query.pre_with_unwind,
+            )
+        elif query.match_optional:
             matched_rows = _match_patterns_table(
                 state.node_table,
                 state.edge_table,
@@ -1357,7 +1538,17 @@ class CypherQueryUseCase:
             with_rows = with_rows.slice(0, query.with_limit)
 
         result_input_rows = with_rows
-        if query.post_with_unwind is not None:
+        if query.post_with_create_patterns:
+            result_input_rows = _materialize_create_patterns_from_input_rows(
+                self._graph_service,
+                with_rows,
+                query.post_with_create_patterns,
+                return_items=query.return_items,
+                order_by=query.return_order_by,
+            )
+            if not query.return_items and not query.post_with_set_items:
+                return QueryResult(columns=(), rows=())
+        elif query.post_with_unwind is not None:
             result_input_rows = _apply_unwind_to_input_table(with_rows, query.post_with_unwind)
         elif query.post_with_match_patterns:
             if query.post_with_match_optional:
@@ -1379,26 +1570,114 @@ class CypherQueryUseCase:
                     edge_property_loader=edge_property_loader,
                 )
             else:
-                result_input_rows = _match_patterns_from_input_table(
-                    with_rows,
-                    state.node_table,
-                    state.edge_table,
+                required_fields = _required_fields_for_match(
                     query.post_with_match_patterns,
-                    self._tabular,
-                    required_fields=_required_fields_for_match(
-                        query.post_with_match_patterns,
-                        query.post_with_match_where_predicate,
-                        return_items=query.return_items,
-                        order_by=query.return_order_by,
-                    ),
-                    adjacency_by_source_loader=adjacency_loader,
-                    node_property_loader=node_property_loader,
-                    edge_property_loader=edge_property_loader,
+                    query.post_with_match_where_predicate,
+                    return_items=query.return_items,
+                    order_by=query.return_order_by,
                 )
+                if _can_use_input_row_node_match_fast_path(query.post_with_match_patterns):
+                    result_input_rows = _match_node_patterns_from_input_rows(
+                        with_rows,
+                        self._graph_service.load_state().nodes,
+                        query.post_with_match_patterns,
+                        required_fields=required_fields,
+                    )
+                else:
+                    result_input_rows = _match_patterns_from_input_table(
+                        with_rows,
+                        state.node_table,
+                        state.edge_table,
+                        query.post_with_match_patterns,
+                        self._tabular,
+                        required_fields=required_fields,
+                        adjacency_by_source_loader=adjacency_loader,
+                        node_property_loader=node_property_loader,
+                        edge_property_loader=edge_property_loader,
+                    )
                 result_input_rows = _apply_where_predicate_table(
                     result_input_rows,
                     query.post_with_match_where_predicate,
                 )
+
+        if query.post_with_create_relationship_patterns:
+            create_state = self._graph_service.load_state()
+            new_nodes, new_edges, node_bindings = _materialize_match_create_records_from_matches(
+                create_state,
+                result_input_rows,
+                query.post_with_create_relationship_patterns,
+            )
+            self._graph_service.publish_records(
+                previous_state=create_state,
+                new_nodes=new_nodes,
+                new_edges=new_edges,
+            )
+            if not query.return_items and not query.post_with_set_items:
+                return QueryResult(columns=(), rows=())
+            create_required_fields: dict[str, set[str]] = {}
+            _collect_required_fields_from_return_items(query.return_items, create_required_fields)
+            _collect_required_fields_from_order_by(query.return_order_by, create_required_fields)
+            for variable, records in node_bindings.items():
+                result_input_rows = _append_node_binding_columns(
+                    result_input_rows,
+                    variable=variable,
+                    node_records=records,
+                    requested_fields=_requested_fields_for_variable(
+                        create_required_fields,
+                        variable,
+                    ),
+                    context="CREATE node",
+                )
+
+        if query.post_with_merge_node_pattern is not None:
+            result_input_rows = _materialize_merge_node_from_input_rows(
+                self._graph_service,
+                result_input_rows,
+                query.post_with_merge_node_pattern,
+                on_create_set_items=query.post_with_merge_on_create_set_items,
+                on_match_set_items=query.post_with_merge_on_match_set_items,
+                return_items=query.return_items,
+                order_by=query.return_order_by,
+            )
+            if not query.return_items and not query.post_with_set_items:
+                return QueryResult(columns=(), rows=())
+
+        if query.post_with_merge_relationship_pattern is not None:
+            result_input_rows = _materialize_merge_relationship_from_input_rows(
+                self._graph_service,
+                result_input_rows,
+                query.post_with_merge_relationship_pattern,
+                on_create_set_items=query.post_with_merge_on_create_set_items,
+                on_match_set_items=query.post_with_merge_on_match_set_items,
+                return_items=query.return_items,
+                order_by=query.return_order_by,
+            )
+            if not query.return_items and not query.post_with_set_items:
+                return QueryResult(columns=(), rows=())
+
+        if query.post_with_set_items:
+            result_input_rows = _materialize_set_from_input_rows(
+                self._graph_service,
+                result_input_rows,
+                query.post_with_set_items,
+            )
+            if not query.return_items:
+                return QueryResult(columns=(), rows=())
+
+        if query.post_with_delete_items:
+            node_ids, edge_ids = _materialize_delete_targets_from_matches(
+                result_input_rows,
+                query.post_with_delete_items,
+            )
+            if query.post_with_delete_detach:
+                edge_ids = _with_incident_edge_ids(
+                    node_ids=node_ids,
+                    edge_ids=edge_ids,
+                    edges=self._graph_service.load_state().edges,
+                )
+            self._graph_service.delete_entities_batch(node_ids=node_ids, edge_ids=edge_ids)
+            if not query.return_items:
+                return QueryResult(columns=(), rows=())
 
         return self._finalize_table_query_result(
             query.return_items,
@@ -1459,17 +1738,29 @@ class CypherQueryUseCase:
         skip: int | None,
         limit: int | None,
     ) -> QueryResult:
-        # Aggregate projections currently follow a narrower execution path than plain row returns:
-        # they do not yet support DISTINCT or result windowing after the aggregation step.
+        # Aggregate projections first collapse the matched rows into an Arrow table, then apply
+        # ordering/windowing to that aggregate result instead of to the pre-aggregate matches.
         """Support the current Cypher compilation or execution step."""
         if _contains_aggregates(return_items):
-            if distinct:
-                raise QueryError("DISTINCT with aggregate RETURN items is not supported yet.")
-            if order_by is not None or skip is not None or limit is not None:
-                raise QueryError(
-                    "ORDER BY, SKIP, and LIMIT are not supported yet with aggregate RETURN items."
+            aggregate_items = _aggregate_return_items(return_items)
+            grouping_items = _grouping_items_for_aggregate_return(return_items)
+            if grouping_items or order_by is not None or skip is not None or limit is not None:
+                aggregate_table = _build_aggregate_table_from_table(
+                    grouping_items,
+                    aggregate_items,
+                    rows,
                 )
-            return _build_aggregate_query_result_from_table(return_items, rows)
+                if distinct:
+                    aggregate_table = _apply_distinct_to_table(aggregate_table)
+                result_rows = self._apply_result_window(
+                    aggregate_table,
+                    order_by=order_by,
+                    skip=skip,
+                    limit=limit,
+                )
+                return _build_grouped_aggregate_query_result(return_items, result_rows)
+            result = _build_aggregate_query_result_from_table(aggregate_items, rows)
+            return _apply_distinct_to_query_result(result) if distinct else result
 
         result_rows = self._apply_result_window(rows, order_by=order_by, skip=skip, limit=limit)
         result = _build_query_result_from_table(return_items, result_rows)
@@ -1516,6 +1807,434 @@ class CypherQueryUseCase:
         return self._tabular.sort_table(sorted_table, sort_keys)
 
 
+def _execute_ddl_compatibility_statement(query: str) -> QueryResult | None:
+    """Accept Neo4j/Memgraph DDL statements that GraphArrow treats as no-ops for now."""
+    normalized = _normalize_compatibility_statement(query)
+    lower = normalized.lower()
+    if re.fullmatch(r"create\s+index\s+on\s+.+", lower):
+        return QueryResult(columns=(), rows=())
+    if re.fullmatch(r"drop\s+index\s+.+", lower):
+        return QueryResult(columns=(), rows=())
+    return None
+
+
+def _normalize_compatibility_statement(query: str) -> str:
+    """Normalize client metadata statements that live outside the openCypher parser."""
+    return " ".join(query.strip().rstrip(";").split())
+
+
+def _execute_neo4j_compatibility_procedure(query: str) -> QueryResult | None:
+    """Return static metadata for Neo4j client discovery procedures."""
+    normalized = _normalize_compatibility_statement(query)
+    lower = normalized.lower()
+    if lower.startswith("call db.ping"):
+        return QueryResult(columns=(), rows=())
+
+    if not lower.startswith("call dbms."):
+        return None
+
+    if lower.startswith("call dbms.components"):
+        row: dict[str, Any] = {
+            "name": "Neo4j Kernel",
+            "versions": ["5.26.0"],
+            "version": "5.26.0",
+            "edition": "community",
+        }
+        return _compatibility_query_result(
+            query,
+            row,
+            default_columns=("name", "versions", "edition"),
+        )
+
+    if lower.startswith("call dbms.protocols"):
+        row = {
+            "name": "bolt",
+            "address": "0.0.0.0:7687",
+            "versions": ["5.8"],
+        }
+        return _compatibility_query_result(
+            query,
+            row,
+            default_columns=("name", "address", "versions"),
+        )
+
+    if lower.startswith("call dbms.showcurrentuser"):
+        row = {
+            "username": "neo4j",
+            "roles": ["PUBLIC"],
+            "flags": [],
+        }
+        return _compatibility_query_result(
+            query,
+            row,
+            default_columns=("username", "roles", "flags"),
+        )
+
+    if lower.startswith("call dbms.procedures"):
+        return QueryResult(
+            columns=("name", "signature", "description", "mode"),
+            rows=(
+                {
+                    "name": "db.labels",
+                    "signature": "db.labels() :: (label :: STRING)",
+                    "description": "Lists node labels.",
+                    "mode": "READ",
+                },
+                {
+                    "name": "db.relationshipTypes",
+                    "signature": "db.relationshipTypes() :: (relationshipType :: STRING)",
+                    "description": "Lists relationship types.",
+                    "mode": "READ",
+                },
+                {
+                    "name": "db.propertyKeys",
+                    "signature": "db.propertyKeys() :: (propertyKey :: STRING)",
+                    "description": "Lists property keys.",
+                    "mode": "READ",
+                },
+                {
+                    "name": "db.schema.nodeTypeProperties",
+                    "signature": (
+                        "db.schema.nodeTypeProperties() :: "
+                        "(nodeType :: STRING, nodeLabels :: LIST, "
+                        "propertyName :: STRING, propertyTypes :: LIST, mandatory :: BOOLEAN)"
+                    ),
+                    "description": "Lists node label property metadata.",
+                    "mode": "READ",
+                },
+                {
+                    "name": "db.schema.relTypeProperties",
+                    "signature": (
+                        "db.schema.relTypeProperties() :: "
+                        "(relType :: STRING, propertyName :: STRING, "
+                        "propertyTypes :: LIST, mandatory :: BOOLEAN)"
+                    ),
+                    "description": "Lists relationship type property metadata.",
+                    "mode": "READ",
+                },
+                {
+                    "name": "db.schema.visualization",
+                    "signature": (
+                        "db.schema.visualization() :: "
+                        "(nodes :: LIST, relationships :: LIST)"
+                    ),
+                    "description": "Returns a lightweight graph schema visualization.",
+                    "mode": "READ",
+                },
+            ),
+        )
+
+    return None
+
+
+def _execute_show_compatibility_statement(
+    query: str,
+    state: GraphState,
+) -> QueryResult | None:
+    """Return lightweight Memgraph SHOW metadata used by Memgraph Lab."""
+    normalized = _normalize_compatibility_statement(query)
+    lower = normalized.lower()
+    if not lower.startswith("show "):
+        return None
+
+    if lower in {"show storage info", "show storage info on current database"}:
+        return QueryResult(
+            columns=("name", "value"),
+            rows=(
+                {"name": "vertex_count", "value": len(state.nodes)},
+                {"name": "edge_count", "value": len(state.edges)},
+                {"name": "database_name", "value": "grapharrow"},
+            ),
+        )
+
+    if lower == "show replication role":
+        return QueryResult(columns=("role",), rows=({"role": "main"},))
+
+    if lower == "show license info":
+        return QueryResult(
+            columns=("license_type", "organization_name", "valid_until"),
+            rows=(
+                {
+                    "license_type": "community",
+                    "organization_name": "GraphArrow",
+                    "valid_until": None,
+                },
+            ),
+        )
+
+    if lower == "show index info":
+        return QueryResult(
+            columns=("index_type", "label", "property", "count", "identifier"),
+            rows=(),
+        )
+
+    if lower == "show constraint info":
+        return QueryResult(
+            columns=("constraint_type", "label", "properties"),
+            rows=(),
+        )
+
+    if lower == "show triggers":
+        return QueryResult(
+            columns=("name", "event_type", "phase", "statement", "owner"),
+            rows=(),
+        )
+
+    if lower == "show schema info":
+        return QueryResult(
+            columns=("nodes", "relationships"),
+            rows=(),
+        )
+
+    return None
+
+
+def _execute_schema_compatibility_procedure(
+    query: str,
+    state: GraphState,
+) -> QueryResult | None:
+    """Return schema metadata used by graph exploration clients."""
+    normalized = _normalize_compatibility_statement(query)
+    lower = normalized.lower()
+    if lower.startswith("call db.labels"):
+        labels = sorted({label for node in state.nodes for label in node.labels})
+        return _compatibility_rows_query_result(
+            query,
+            ({"label": label} for label in labels),
+            default_columns=("label",),
+        )
+
+    if lower.startswith("call db.relationshiptypes"):
+        relationship_types = sorted({edge.rel_type for edge in state.edges})
+        return _compatibility_rows_query_result(
+            query,
+            ({"relationshipType": rel_type} for rel_type in relationship_types),
+            default_columns=("relationshipType",),
+        )
+
+    if lower.startswith("call db.propertykeys"):
+        property_keys: set[str] = set()
+        for node in state.nodes:
+            property_keys.update(
+                key for key, value in node.properties.items() if value is not None
+            )
+        for edge in state.edges:
+            property_keys.update(
+                key for key, value in edge.properties.items() if value is not None
+            )
+        return _compatibility_rows_query_result(
+            query,
+            ({"propertyKey": key} for key in sorted(property_keys)),
+            default_columns=("propertyKey",),
+        )
+
+    if lower.startswith("call db.schema.nodetypeproperties"):
+        return _compatibility_rows_query_result(
+            query,
+            _schema_node_type_property_rows(state),
+            default_columns=(
+                "nodeType",
+                "nodeLabels",
+                "propertyName",
+                "propertyTypes",
+                "mandatory",
+            ),
+        )
+
+    if lower.startswith("call db.schema.reltypeproperties") or lower.startswith(
+        "call db.schema.relationshiptypeproperties"
+    ):
+        return _compatibility_rows_query_result(
+            query,
+            _schema_relationship_type_property_rows(state),
+            default_columns=("relType", "propertyName", "propertyTypes", "mandatory"),
+        )
+
+    if not lower.startswith("call db.schema.visualization"):
+        return None
+
+    labels = sorted({label for node in state.nodes for label in node.labels})
+    label_node_ids = {label: index for index, label in enumerate(labels)}
+    schema_nodes = [
+        {
+            "id": node_id,
+            "labels": [label],
+            "properties": {"name": label},
+        }
+        for label, node_id in label_node_ids.items()
+    ]
+
+    nodes_by_id = {node.node_id: node for node in state.nodes}
+    schema_relationships: list[dict[str, Any]] = []
+    seen_relationships: set[tuple[str, str, str]] = set()
+    for edge in state.edges:
+        source = nodes_by_id.get(edge.src_id)
+        target = nodes_by_id.get(edge.dst_id)
+        if source is None or target is None:
+            continue
+        for source_label in source.labels:
+            for target_label in target.labels:
+                key = (source_label, edge.rel_type, target_label)
+                if key in seen_relationships:
+                    continue
+                seen_relationships.add(key)
+                schema_relationships.append(
+                    {
+                        "id": len(schema_relationships),
+                        "start": label_node_ids[source_label],
+                        "end": label_node_ids[target_label],
+                        "type": edge.rel_type,
+                        "properties": {},
+                    }
+                )
+
+    row = {"nodes": schema_nodes, "relationships": schema_relationships}
+    return _compatibility_query_result(
+        query,
+        row,
+        default_columns=("nodes", "relationships"),
+    )
+
+
+def _schema_node_type_property_rows(state: GraphState) -> tuple[dict[str, Any], ...]:
+    """Build Neo4j-compatible node property metadata rows."""
+    labels = sorted({label for node in state.nodes for label in node.labels})
+    rows: list[dict[str, Any]] = []
+    for label in labels:
+        label_nodes = [node for node in state.nodes if label in node.labels]
+        property_names = sorted({key for node in label_nodes for key in node.properties})
+        for property_name in property_names:
+            values = [node.properties.get(property_name) for node in label_nodes]
+            rows.append(
+                {
+                    "nodeType": f":`{label}`",
+                    "nodeLabels": [label],
+                    "propertyName": property_name,
+                    "propertyTypes": _schema_property_types(values),
+                    "mandatory": all(value is not None for value in values),
+                }
+            )
+    return tuple(rows)
+
+
+def _schema_relationship_type_property_rows(state: GraphState) -> tuple[dict[str, Any], ...]:
+    """Build Neo4j-compatible relationship property metadata rows."""
+    rel_types = sorted({edge.rel_type for edge in state.edges})
+    rows: list[dict[str, Any]] = []
+    for rel_type in rel_types:
+        rel_edges = [edge for edge in state.edges if edge.rel_type == rel_type]
+        property_names = sorted({key for edge in rel_edges for key in edge.properties})
+        for property_name in property_names:
+            values = [edge.properties.get(property_name) for edge in rel_edges]
+            rows.append(
+                {
+                    "relType": f":`{rel_type}`",
+                    "propertyName": property_name,
+                    "propertyTypes": _schema_property_types(values),
+                    "mandatory": all(value is not None for value in values),
+                }
+            )
+    return tuple(rows)
+
+
+def _schema_property_types(values: Iterable[object]) -> list[str]:
+    """Return coarse Neo4j-style property type names for schema metadata."""
+    type_names = {_schema_property_type_name(value) for value in values if value is not None}
+    return sorted(type_names) or ["NULL"]
+
+
+def _schema_property_type_name(value: object) -> str:
+    """Map Python property values to coarse Neo4j-style schema type names."""
+    if isinstance(value, bool):
+        return "Boolean"
+    if isinstance(value, int):
+        return "Integer"
+    if isinstance(value, float):
+        return "Float"
+    if isinstance(value, str):
+        return "String"
+    if isinstance(value, list):
+        return "List"
+    if isinstance(value, Mapping):
+        return "Map"
+    return type(value).__name__
+
+
+def _compatibility_query_result(
+    query: str,
+    row: Mapping[str, Any],
+    *,
+    default_columns: tuple[str, ...],
+) -> QueryResult:
+    """Project a static compatibility row through a simple RETURN list when present."""
+    columns = _compatibility_return_columns(query) or default_columns
+    return QueryResult(
+        columns=columns,
+        rows=(dict(zip(columns, (row.get(column) for column in columns), strict=True)),),
+    )
+
+
+def _compatibility_rows_query_result(
+    query: str,
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    default_columns: tuple[str, ...],
+) -> QueryResult:
+    """Project multiple compatibility metadata rows through a simple RETURN list."""
+    columns = _compatibility_return_columns(query) or default_columns
+    return QueryResult(
+        columns=columns,
+        rows=tuple({column: row.get(column) for column in columns} for row in rows),
+    )
+
+
+def _compatibility_return_columns(query: str) -> tuple[str, ...]:
+    """Extract simple identifiers from a RETURN list used by client metadata probes."""
+    match = re.search(
+        r"(?is)\bRETURN\b\s+(.+?)(?:\s+\bORDER\s+BY\b|\s+\bSKIP\b|\s+\bLIMIT\b|$)",
+        query,
+    )
+    if match is None:
+        return ()
+
+    columns: list[str] = []
+    for raw_item in match.group(1).split(","):
+        item = raw_item.strip()
+        alias_match = re.search(r"(?is)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)$", item)
+        if alias_match is not None:
+            columns.append(alias_match.group(1))
+            continue
+        item = re.sub(r"(?is)^.*\s+AS\s+", "", item).strip()
+        if _IDENTIFIER_RE.fullmatch(item):
+            columns.append(item)
+    return tuple(columns)
+
+
+def _execute_standalone_return(
+    query: str,
+    params: dict[str, object],
+) -> QueryResult | None:
+    """Evaluate simple literal RETURN clauses used by clients as connectivity probes."""
+    match = re.fullmatch(r"(?is)RETURN\s+(.+)", query)
+    if match is None:
+        return None
+
+    columns: list[str] = []
+    row: dict[str, Any] = {}
+    for raw_item in match.group(1).split(","):
+        item = raw_item.strip()
+        alias_match = re.fullmatch(
+            r"(?is)(.+?)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)",
+            item,
+        )
+        expression = alias_match.group(1).strip() if alias_match is not None else item
+        column = alias_match.group(2) if alias_match is not None else expression
+        value = _parse_value(expression, params)
+        columns.append(column)
+        row[column] = value
+    return QueryResult(columns=tuple(columns), rows=(row,))
+
+
 def _compile_query(
     tree: CypherParser.OC_CypherContext,
     params: dict[str, object],
@@ -1530,6 +2249,7 @@ def _compile_query(
     | CompiledMatchMergeQuery
     | CompiledMatchSetQuery
     | CompiledMatchDeleteQuery
+    | CompiledMatchRemoveQuery
     | CompiledMatchWithQuery
 ):
     """Compile this Cypher fragment into the internal structures used later."""
@@ -1584,20 +2304,24 @@ def _compile_query(
         merge_ctx = updating_clause.oC_Merge()
         set_ctx = updating_clause.oC_Set()
         delete_ctx = updating_clause.oC_Delete()
-        if create_ctx is None and merge_ctx is None and set_ctx is None and delete_ctx is None:
+        remove_ctx = updating_clause.oC_Remove()
+        if (
+            create_ctx is None
+            and merge_ctx is None
+            and set_ctx is None
+            and delete_ctx is None
+            and remove_ctx is None
+        ):
             raise QueryError(
-                "Only CREATE, MERGE, SET, DELETE, and MATCH are supported by the bootstrap engine."
+                "Only CREATE, MERGE, SET, DELETE, REMOVE, and MATCH are supported by the "
+                "bootstrap engine."
             )
         if reading_clauses:
             match_ctx = reading_clauses[0].oC_Match()
             if match_ctx is None:
                 raise QueryError(
-                    "Only MATCH with CREATE, MERGE, SET, or DELETE is supported in mixed queries."
-                )
-            if return_ctx is None:
-                raise QueryError(
-                    "MATCH ... CREATE, MATCH ... MERGE, MATCH ... SET, and MATCH ... DELETE "
-                    "queries require a RETURN clause."
+                    "Only MATCH with CREATE, MERGE, SET, DELETE, or REMOVE is supported in "
+                    "mixed queries."
                 )
             if create_ctx is not None:
                 return _compile_match_create_query(
@@ -1631,9 +2355,17 @@ def _compile_query(
                     params,
                     compiler_state,
                 )
+            if remove_ctx is not None:
+                return _compile_match_remove_query(
+                    match_ctx,
+                    remove_ctx,
+                    return_ctx,
+                    params,
+                    compiler_state,
+                )
             raise QueryError("Unsupported updating clause.")
-        if set_ctx is not None or delete_ctx is not None:
-            raise QueryError("SET and DELETE currently require a MATCH clause.")
+        if set_ctx is not None or delete_ctx is not None or remove_ctx is not None:
+            raise QueryError("SET, DELETE, and REMOVE currently require a MATCH clause.")
         if merge_ctx is not None:
             return _compile_merge_query(merge_ctx, return_ctx, params, compiler_state)
         return _compile_create_query(create_ctx, return_ctx, params, compiler_state)
@@ -1656,7 +2388,7 @@ def _compile_query(
             if unwind_ctx is not None:
                 return _compile_unwind_query(unwind_ctx, return_ctx, params)
             raise QueryError(
-                "Only CREATE, MERGE, SET, DELETE, MATCH, and UNWIND are supported by the "
+                "Only CREATE, MERGE, SET, DELETE, REMOVE, MATCH, and UNWIND are supported by the "
                 "bootstrap engine."
             )
         if len(reading_clauses) == 2:
@@ -1675,10 +2407,15 @@ def _compile_query(
                 params,
                 compiler_state,
             )
-        raise QueryError("Only one MATCH or MATCH ... OPTIONAL MATCH is supported for now.")
+        return _compile_multi_match_query(
+            reading_clauses,
+            return_ctx,
+            params,
+            compiler_state,
+        )
 
     raise QueryError(
-        "Only CREATE, MERGE, SET, DELETE, and MATCH are supported by the bootstrap engine."
+        "Only CREATE, MERGE, SET, DELETE, REMOVE, and MATCH are supported by the bootstrap engine."
     )
 
 
@@ -1749,16 +2486,21 @@ def _compile_multi_part_query(
         multi_part_ctx.oC_ReadingClause(),
     )
     if len(reading_clauses) != 1:
-        raise QueryError("A single MATCH clause is required before WITH for now.")
+        raise QueryError("A single MATCH or UNWIND clause is required before WITH for now.")
     match_ctx = reading_clauses[0].oC_Match()
-    if match_ctx is None:
-        raise QueryError("Only MATCH ... WITH ... RETURN is supported for now.")
+    pre_with_unwind_ctx = reading_clauses[0].oC_Unwind()
+    if match_ctx is None and pre_with_unwind_ctx is None:
+        raise QueryError("Only MATCH/UNWIND ... WITH ... RETURN is supported for now.")
 
     single_part = multi_part_ctx.oC_SinglePartQuery()
     if single_part is None:
         raise QueryError("A final RETURN clause is required after WITH.")
-    if single_part.oC_UpdatingClause():
-        raise QueryError("Updating clauses after WITH are not supported yet.")
+    final_updating_clauses = cast(
+        list[CypherParser.OC_UpdatingClauseContext],
+        single_part.oC_UpdatingClause(),
+    )
+    if len(final_updating_clauses) > 2:
+        raise QueryError("Only up to two updating clauses are supported after WITH for now.")
     final_reading_clauses = cast(
         list[CypherParser.OC_ReadingClauseContext],
         single_part.oC_ReadingClause(),
@@ -1769,20 +2511,37 @@ def _compile_multi_part_query(
     post_with_match_where_predicate: WherePredicate | None = None
     post_with_match_optional = False
     post_with_unwind: CompiledUnwind | None = None
+    post_with_create_patterns: tuple[CompiledPattern, ...] = ()
+    post_with_create_relationship_patterns: tuple[CreateRelationshipPattern, ...] = ()
+    post_with_merge_node_pattern: MergeNodePattern | None = None
+    post_with_merge_relationship_pattern: MergeRelationshipPattern | None = None
+    post_with_merge_on_create_set_items: tuple[SetItem, ...] = ()
+    post_with_merge_on_match_set_items: tuple[SetItem, ...] = ()
+    post_with_set_items: tuple[SetItem, ...] = ()
+    post_with_delete_detach = False
+    post_with_delete_items: tuple[DeleteItem, ...] = ()
     return_ctx = single_part.oC_Return()
-    if return_ctx is None:
+    if return_ctx is None and not final_updating_clauses:
         raise QueryError("A final RETURN clause is required after WITH.")
 
     compiler_state = _CompilerState()
-    match_optional = match_ctx.OPTIONAL() is not None
-
-    match_patterns = _compile_match_patterns(match_ctx.oC_Pattern(), params, compiler_state)
-    input_scope = _scope_from_patterns(match_patterns)
-    match_where_predicate = (
-        _compile_where(match_ctx.oC_Where(), params, input_scope)
-        if match_ctx.oC_Where() is not None
-        else None
-    )
+    match_patterns: tuple[CompiledPattern, ...] = ()
+    match_where_predicate: WherePredicate | None = None
+    match_optional = False
+    pre_with_unwind: CompiledUnwind | None = None
+    if match_ctx is not None:
+        match_optional = match_ctx.OPTIONAL() is not None
+        match_patterns = _compile_match_patterns(match_ctx.oC_Pattern(), params, compiler_state)
+        input_scope = _scope_from_patterns(match_patterns)
+        match_where_predicate = (
+            _compile_where(match_ctx.oC_Where(), params, input_scope)
+            if match_ctx.oC_Where() is not None
+            else None
+        )
+    else:
+        assert pre_with_unwind_ctx is not None
+        pre_with_unwind = _compile_unwind(pre_with_unwind_ctx, params, scope=None)
+        input_scope = {pre_with_unwind.output_name: "scalar"}
 
     with_ctx = with_clauses[0]
     with_projection_body = with_ctx.oC_ProjectionBody()
@@ -1822,13 +2581,119 @@ def _compile_multi_part_query(
             post_with_unwind = _compile_unwind(final_unwind_ctx, params, scope=with_scope)
             final_scope = dict(with_scope)
             final_scope[post_with_unwind.output_name] = "scalar"
-    return_projection_body = return_ctx.oC_ProjectionBody()
-    return_items, return_distinct = _compile_return_items(return_projection_body, scope=final_scope)
-    _validate_return_items(return_items)
+    if final_updating_clauses:
+        create_ctx = final_updating_clauses[0].oC_Create()
+        merge_ctx = final_updating_clauses[0].oC_Merge()
+        set_ctx = final_updating_clauses[0].oC_Set()
+        delete_ctx = final_updating_clauses[0].oC_Delete()
+        if create_ctx is not None:
+            if final_reading_clauses:
+                post_with_create_relationship_patterns = _compile_create_relationship_patterns(
+                    create_ctx.oC_Pattern(),
+                    params,
+                    compiler_state,
+                    bound_variables=set(final_scope),
+                )
+                final_scope = _extend_scope_with_create_patterns(
+                    final_scope,
+                    post_with_create_relationship_patterns,
+                )
+            else:
+                post_with_create_patterns = _compile_create_patterns(
+                    create_ctx.oC_Pattern(),
+                    params,
+                    compiler_state,
+                )
+                final_scope = _extend_scope_with_patterns(final_scope, post_with_create_patterns)
+        elif merge_ctx is not None:
+            if final_reading_clauses:
+                post_with_merge_relationship_pattern = _compile_merge_relationship_pattern(
+                    merge_ctx,
+                    params,
+                    compiler_state,
+                    bound_variables=set(final_scope),
+                )
+                merge_action_bound_variables = set(final_scope)
+                if post_with_merge_relationship_pattern.variable is not None:
+                    merge_action_bound_variables.add(post_with_merge_relationship_pattern.variable)
+                    final_scope[post_with_merge_relationship_pattern.variable] = "entity"
+                post_with_merge_on_create_set_items, post_with_merge_on_match_set_items = (
+                    _compile_merge_actions(
+                        merge_ctx,
+                        params,
+                        bound_variables=merge_action_bound_variables,
+                    )
+                )
+            else:
+                post_with_merge_node_pattern = _compile_merge_node_pattern(
+                    merge_ctx,
+                    params,
+                    compiler_state,
+                )
+                final_scope[post_with_merge_node_pattern.variable] = "entity"
+                post_with_merge_on_create_set_items, post_with_merge_on_match_set_items = (
+                    _compile_merge_actions(
+                        merge_ctx,
+                        params,
+                        bound_variables={post_with_merge_node_pattern.variable},
+                    )
+                )
+        elif set_ctx is not None:
+            post_with_set_items = _compile_set_items(
+                set_ctx,
+                params,
+                bound_variables={
+                    variable
+                    for variable, kind in final_scope.items()
+                    if kind == "entity"
+                },
+            )
+        elif delete_ctx is not None:
+            post_with_delete_detach, post_with_delete_items = _compile_delete_items(
+                delete_ctx,
+                bound_variables={
+                    variable
+                    for variable, kind in final_scope.items()
+                    if kind == "entity"
+                },
+            )
+        else:
+            clause_name = _updating_clause_name(final_updating_clauses[0])
+            raise QueryError(
+                "Only CREATE, MERGE, SET, and DELETE are supported after WITH for now. "
+                f"Got {clause_name}."
+            )
+        if len(final_updating_clauses) == 2:
+            trailing_set_ctx = final_updating_clauses[1].oC_Set()
+            if trailing_set_ctx is None:
+                raise QueryError("Only trailing SET is supported after CREATE/MERGE for now.")
+            post_with_set_items = _compile_set_items(
+                trailing_set_ctx,
+                params,
+                bound_variables={
+                    variable
+                    for variable, kind in final_scope.items()
+                    if kind == "entity"
+                },
+            )
+    if return_ctx is not None:
+        return_projection_body = return_ctx.oC_ProjectionBody()
+        return_items, return_distinct = _compile_return_items(
+            return_projection_body,
+            scope=final_scope,
+        )
+        _validate_return_items(return_items)
+        return_order_by = _compile_order_by(return_projection_body.oC_Order(), scope=final_scope)
+        return_skip = _compile_optional_int(return_projection_body.oC_Skip(), params)
+        return_limit = _compile_optional_int(return_projection_body.oC_Limit(), params)
+    else:
+        return_items, return_distinct = (), False
+        return_order_by, return_skip, return_limit = None, None, None
     return CompiledMatchWithQuery(
         match_patterns=match_patterns,
         match_where_predicate=match_where_predicate,
         match_optional=match_optional,
+        pre_with_unwind=pre_with_unwind,
         with_items=with_items,
         with_aggregate_items=with_aggregate_items,
         with_where_predicate=with_where_predicate,
@@ -1840,11 +2705,20 @@ def _compile_multi_part_query(
         post_with_match_where_predicate=post_with_match_where_predicate,
         post_with_match_optional=post_with_match_optional,
         post_with_unwind=post_with_unwind,
+        post_with_create_patterns=post_with_create_patterns,
+        post_with_create_relationship_patterns=post_with_create_relationship_patterns,
+        post_with_merge_node_pattern=post_with_merge_node_pattern,
+        post_with_merge_relationship_pattern=post_with_merge_relationship_pattern,
+        post_with_merge_on_create_set_items=post_with_merge_on_create_set_items,
+        post_with_merge_on_match_set_items=post_with_merge_on_match_set_items,
+        post_with_set_items=post_with_set_items,
+        post_with_delete_detach=post_with_delete_detach,
+        post_with_delete_items=post_with_delete_items,
         return_items=return_items,
         return_distinct=return_distinct,
-        return_order_by=_compile_order_by(return_projection_body.oC_Order(), scope=final_scope),
-        return_skip=_compile_optional_int(return_projection_body.oC_Skip(), params),
-        return_limit=_compile_optional_int(return_projection_body.oC_Limit(), params),
+        return_order_by=return_order_by,
+        return_skip=return_skip,
+        return_limit=return_limit,
     )
 
 
@@ -1873,7 +2747,49 @@ def _compile_match_query(
         where_predicate=where_predicate,
         return_items=return_items,
         distinct=distinct,
-        order_by=_compile_order_by(projection_body.oC_Order(), scope=scope),
+        order_by=_compile_order_by(
+            projection_body.oC_Order(),
+            scope=scope,
+            return_items=return_items,
+        ),
+        skip=_compile_optional_int(projection_body.oC_Skip(), params),
+        limit=_compile_optional_int(projection_body.oC_Limit(), params),
+    )
+
+
+def _compile_multi_match_query(
+    reading_clauses: list[CypherParser.OC_ReadingClauseContext],
+    return_ctx: CypherParser.OC_ReturnContext,
+    params: dict[str, object],
+    state: _CompilerState,
+) -> CompiledMatchQuery:
+    """Compile multiple connected MATCH clauses into one joined match pipeline."""
+    patterns: list[CompiledPattern] = []
+    for reading_clause in reading_clauses:
+        match_ctx = reading_clause.oC_Match()
+        if match_ctx is None:
+            raise QueryError("Only MATCH clauses are supported in multi-MATCH queries.")
+        if match_ctx.OPTIONAL() is not None:
+            raise QueryError("OPTIONAL MATCH is supported only as MATCH ... OPTIONAL MATCH.")
+        if match_ctx.oC_Where() is not None:
+            raise QueryError("WHERE after multiple MATCH clauses is not supported yet.")
+        patterns.extend(_compile_match_patterns(match_ctx.oC_Pattern(), params, state))
+
+    compiled_patterns = tuple(patterns)
+    scope = _scope_from_patterns(compiled_patterns)
+    projection_body = return_ctx.oC_ProjectionBody()
+    return_items, distinct = _compile_return_items(projection_body, scope=scope)
+    _validate_return_items(return_items)
+    return CompiledMatchQuery(
+        patterns=compiled_patterns,
+        where_predicate=None,
+        return_items=return_items,
+        distinct=distinct,
+        order_by=_compile_order_by(
+            projection_body.oC_Order(),
+            scope=scope,
+            return_items=return_items,
+        ),
         skip=_compile_optional_int(projection_body.oC_Skip(), params),
         limit=_compile_optional_int(projection_body.oC_Limit(), params),
     )
@@ -1971,7 +2887,7 @@ def _compile_match_optional_query(
 def _compile_match_create_query(
     match_ctx: CypherParser.OC_MatchContext,
     create_ctx: CypherParser.OC_CreateContext,
-    return_ctx: CypherParser.OC_ReturnContext,
+    return_ctx: CypherParser.OC_ReturnContext | None,
     params: dict[str, object],
     state: _CompilerState,
 ) -> CompiledMatchCreateQuery:
@@ -1995,8 +2911,12 @@ def _compile_match_create_query(
         if match_ctx.oC_Where() is not None
         else None
     )
-    projection_body = return_ctx.oC_ProjectionBody()
-    return_items, distinct = _compile_return_items(projection_body, scope=scope)
+    projection_scope = _extend_scope_with_create_patterns(scope, create_patterns)
+    return_items, distinct, order_by, skip, limit = _compile_optional_return_projection(
+        return_ctx,
+        params,
+        scope=projection_scope,
+    )
     _validate_return_items(return_items)
     return CompiledMatchCreateQuery(
         match_patterns=match_patterns,
@@ -2004,16 +2924,16 @@ def _compile_match_create_query(
         create_patterns=create_patterns,
         return_items=return_items,
         distinct=distinct,
-        order_by=_compile_order_by(projection_body.oC_Order(), scope=scope),
-        skip=_compile_optional_int(projection_body.oC_Skip(), params),
-        limit=_compile_optional_int(projection_body.oC_Limit(), params),
+        order_by=order_by,
+        skip=skip,
+        limit=limit,
     )
 
 
 def _compile_match_merge_query(
     match_ctx: CypherParser.OC_MatchContext,
     merge_ctx: CypherParser.OC_MergeContext,
-    return_ctx: CypherParser.OC_ReturnContext,
+    return_ctx: CypherParser.OC_ReturnContext | None,
     params: dict[str, object],
     state: _CompilerState,
 ) -> CompiledMatchMergeQuery:
@@ -2053,8 +2973,11 @@ def _compile_match_merge_query(
         if match_ctx.oC_Where() is not None
         else None
     )
-    projection_body = return_ctx.oC_ProjectionBody()
-    return_items, distinct = _compile_return_items(projection_body, scope=merge_scope)
+    return_items, distinct, order_by, skip, limit = _compile_optional_return_projection(
+        return_ctx,
+        params,
+        scope=merge_scope,
+    )
     _validate_return_items(return_items)
     return CompiledMatchMergeQuery(
         match_patterns=match_patterns,
@@ -2064,16 +2987,16 @@ def _compile_match_merge_query(
         on_match_set_items=on_match_set_items,
         return_items=return_items,
         distinct=distinct,
-        order_by=_compile_order_by(projection_body.oC_Order(), scope=merge_scope),
-        skip=_compile_optional_int(projection_body.oC_Skip(), params),
-        limit=_compile_optional_int(projection_body.oC_Limit(), params),
+        order_by=order_by,
+        skip=skip,
+        limit=limit,
     )
 
 
 def _compile_match_set_query(
     match_ctx: CypherParser.OC_MatchContext,
     set_ctx: CypherParser.OC_SetContext,
-    return_ctx: CypherParser.OC_ReturnContext,
+    return_ctx: CypherParser.OC_ReturnContext | None,
     params: dict[str, object],
     state: _CompilerState,
 ) -> CompiledMatchSetQuery:
@@ -2092,8 +3015,11 @@ def _compile_match_set_query(
         if match_ctx.oC_Where() is not None
         else None
     )
-    projection_body = return_ctx.oC_ProjectionBody()
-    return_items, distinct = _compile_return_items(projection_body, scope=scope)
+    return_items, distinct, order_by, skip, limit = _compile_optional_return_projection(
+        return_ctx,
+        params,
+        scope=scope,
+    )
     _validate_return_items(return_items)
     return CompiledMatchSetQuery(
         match_patterns=match_patterns,
@@ -2101,16 +3027,16 @@ def _compile_match_set_query(
         set_items=set_items,
         return_items=return_items,
         distinct=distinct,
-        order_by=_compile_order_by(projection_body.oC_Order(), scope=scope),
-        skip=_compile_optional_int(projection_body.oC_Skip(), params),
-        limit=_compile_optional_int(projection_body.oC_Limit(), params),
+        order_by=order_by,
+        skip=skip,
+        limit=limit,
     )
 
 
 def _compile_match_delete_query(
     match_ctx: CypherParser.OC_MatchContext,
     delete_ctx: CypherParser.OC_DeleteContext,
-    return_ctx: CypherParser.OC_ReturnContext,
+    return_ctx: CypherParser.OC_ReturnContext | None,
     params: dict[str, object],
     state: _CompilerState,
 ) -> CompiledMatchDeleteQuery:
@@ -2129,8 +3055,11 @@ def _compile_match_delete_query(
         if match_ctx.oC_Where() is not None
         else None
     )
-    projection_body = return_ctx.oC_ProjectionBody()
-    return_items, distinct = _compile_return_items(projection_body, scope=scope)
+    return_items, distinct, order_by, skip, limit = _compile_optional_return_projection(
+        return_ctx,
+        params,
+        scope=scope,
+    )
     _validate_return_items(return_items)
     return CompiledMatchDeleteQuery(
         match_patterns=match_patterns,
@@ -2139,9 +3068,75 @@ def _compile_match_delete_query(
         delete_items=delete_items,
         return_items=return_items,
         distinct=distinct,
-        order_by=_compile_order_by(projection_body.oC_Order(), scope=scope),
-        skip=_compile_optional_int(projection_body.oC_Skip(), params),
-        limit=_compile_optional_int(projection_body.oC_Limit(), params),
+        order_by=order_by,
+        skip=skip,
+        limit=limit,
+    )
+
+
+def _compile_match_remove_query(
+    match_ctx: CypherParser.OC_MatchContext,
+    remove_ctx: CypherParser.OC_RemoveContext,
+    return_ctx: CypherParser.OC_ReturnContext | None,
+    params: dict[str, object],
+    state: _CompilerState,
+) -> CompiledMatchRemoveQuery:
+    """Compile MATCH ... REMOVE for dataset loaders and simple write workflows."""
+    if match_ctx.OPTIONAL() is not None:
+        raise QueryError("OPTIONAL MATCH is not supported yet.")
+
+    match_patterns = _compile_match_patterns(match_ctx.oC_Pattern(), params, state)
+    bound_variables = {
+        variable for pattern in match_patterns for variable in _pattern_public_variables(pattern)
+    }
+    scope = _scope_from_patterns(match_patterns)
+    remove_items = _compile_remove_items(remove_ctx, bound_variables=bound_variables)
+    where_predicate = (
+        _compile_where(match_ctx.oC_Where(), params, scope)
+        if match_ctx.oC_Where() is not None
+        else None
+    )
+    return_items, distinct, order_by, skip, limit = _compile_optional_return_projection(
+        return_ctx,
+        params,
+        scope=scope,
+    )
+    _validate_return_items(return_items)
+    return CompiledMatchRemoveQuery(
+        match_patterns=match_patterns,
+        where_predicate=where_predicate,
+        remove_items=remove_items,
+        return_items=return_items,
+        distinct=distinct,
+        order_by=order_by,
+        skip=skip,
+        limit=limit,
+    )
+
+
+def _compile_optional_return_projection(
+    return_ctx: CypherParser.OC_ReturnContext | None,
+    params: dict[str, object],
+    *,
+    scope: Mapping[str, ScopeBindingKind],
+) -> tuple[
+    tuple[ReturnItem, ...],
+    bool,
+    tuple[OrderByItem, ...] | None,
+    int | None,
+    int | None,
+]:
+    """Compile RETURN metadata, or an empty projection for write-only queries."""
+    if return_ctx is None:
+        return (), False, None, None, None
+    projection_body = return_ctx.oC_ProjectionBody()
+    return_items, distinct = _compile_return_items(projection_body, scope=scope)
+    return (
+        return_items,
+        distinct,
+        _compile_order_by(projection_body.oC_Order(), scope=scope),
+        _compile_optional_int(projection_body.oC_Skip(), params),
+        _compile_optional_int(projection_body.oC_Limit(), params),
     )
 
 
@@ -2276,12 +3271,20 @@ def _compile_create_relationship_patterns(
             raise QueryError("Variable-length relationships are not supported yet in CREATE.")
         if step.rel_type is None:
             raise QueryError("MATCH ... CREATE requires an explicit relationship type.")
-        _validate_bound_create_node(compiled.start, bound_variables)
-        _validate_bound_create_node(step.node, bound_variables)
+        left_bound = _classify_create_node_binding(compiled.start, bound_variables)
+        right_bound = _classify_create_node_binding(step.node, bound_variables)
+        if not left_bound and not right_bound:
+            raise QueryError("MATCH ... CREATE currently supports at least one node already bound.")
         create_patterns.append(
             CreateRelationshipPattern(
                 left_variable=compiled.start.variable,
+                left_bound=left_bound,
+                left_labels=compiled.start.labels,
+                left_properties=compiled.start.properties,
                 right_variable=step.node.variable,
+                right_bound=right_bound,
+                right_labels=step.node.labels,
+                right_properties=step.node.properties,
                 rel_type=step.rel_type,
                 properties=step.properties,
             )
@@ -2378,16 +3381,13 @@ def _compile_merge_actions(
     params: dict[str, object],
     *,
     bound_variables: set[str],
-) -> tuple[
-    tuple[SetPropertyItem | SetMapMergeItem, ...],
-    tuple[SetPropertyItem | SetMapMergeItem, ...],
-]:
+) -> tuple[tuple[SetItem, ...], tuple[SetItem, ...]]:
     """Compile this Cypher fragment into the internal structures used later."""
     if merge_ctx is None:
         raise QueryError("MERGE clause is required.")
 
-    on_create_items: list[SetPropertyItem | SetMapMergeItem] = []
-    on_match_items: list[SetPropertyItem | SetMapMergeItem] = []
+    on_create_items: list[SetItem] = []
+    on_match_items: list[SetItem] = []
     for action_ctx in cast(list[CypherParser.OC_MergeActionContext], merge_ctx.oC_MergeAction()):
         set_ctx = action_ctx.oC_Set()
         compiled_items = _compile_set_items(set_ctx, params, bound_variables=bound_variables)
@@ -2426,10 +3426,12 @@ def _compile_pattern_element(
     for chain_ctx in chains:
         relationship_pattern = chain_ctx.oC_RelationshipPattern()
         next_node = _compile_node_pattern(chain_ctx.oC_NodePattern(), params, state)
-        variable, rel_type, properties, min_hops, max_hops = _compile_relationship_pattern(
-            relationship_pattern,
-            params,
-            allow_variable=allow_relationship_variables,
+        variable, rel_type, properties, direction, min_hops, max_hops = (
+            _compile_relationship_pattern(
+                relationship_pattern,
+                params,
+                allow_variable=allow_relationship_variables,
+            )
         )
         steps.append(
             RelationshipStep(
@@ -2437,6 +3439,7 @@ def _compile_pattern_element(
                 rel_type=rel_type,
                 properties=properties,
                 node=next_node,
+                direction=direction,
                 min_hops=min_hops,
                 max_hops=max_hops,
             )
@@ -2461,20 +3464,23 @@ def _compile_node_pattern(
     return NodePattern(variable=variable, labels=labels, properties=properties)
 
 
-def _validate_bound_create_node(pattern: NodePattern, bound_variables: set[str]) -> None:
+def _classify_create_node_binding(pattern: NodePattern, bound_variables: set[str]) -> bool:
     """Support the current Cypher compilation or execution step."""
+    if pattern.variable not in bound_variables:
+        if pattern.variable.startswith("_anon_"):
+            raise QueryError(
+                "MATCH ... CREATE requires unbound inline nodes to use an explicit variable."
+            )
+        if not pattern.labels and not pattern.properties:
+            raise QueryError(
+                "MATCH ... CREATE requires unbound nodes to specify at least one label or property."
+            )
+        return False
     if pattern.labels or pattern.properties:
         raise QueryError(
             "MATCH ... CREATE does not support inline labels or properties on bound nodes yet."
         )
-    if pattern.variable.startswith("_anon_"):
-        raise QueryError(
-            "MATCH ... CREATE requires node variables already bound by the MATCH clause."
-        )
-    if pattern.variable not in bound_variables:
-        raise QueryError(
-            f"MATCH ... CREATE references an unbound node variable: {pattern.variable}"
-        )
+    return True
 
 
 def _classify_merge_node_binding(pattern: NodePattern, bound_variables: set[str]) -> bool:
@@ -2494,7 +3500,10 @@ def _compile_node_labels(
     """Compile this Cypher fragment into the internal structures used later."""
     if labels_ctx is None:
         return ()
-    return tuple(label_ctx.oC_LabelName().getText() for label_ctx in labels_ctx.oC_NodeLabel())
+    return tuple(
+        _cypher_name(label_ctx.oC_LabelName().getText())
+        for label_ctx in labels_ctx.oC_NodeLabel()
+    )
 
 
 def _compile_relationship_pattern(
@@ -2502,19 +3511,21 @@ def _compile_relationship_pattern(
     params: dict[str, object],
     *,
     allow_variable: bool,
-) -> tuple[str | None, str | None, dict[str, object], int, int]:
+) -> tuple[str | None, str | None, dict[str, object], str, int, int]:
     """Compile this Cypher fragment into the internal structures used later."""
     if relationship_ctx is None:
         raise QueryError("Relationship pattern is required.")
-    if (
-        relationship_ctx.oC_LeftArrowHead() is not None
-        or relationship_ctx.oC_RightArrowHead() is None
-    ):
-        raise QueryError("Only outgoing relationship patterns are supported for now.")
+    has_left_arrow = relationship_ctx.oC_LeftArrowHead() is not None
+    has_right_arrow = relationship_ctx.oC_RightArrowHead() is not None
+    if has_left_arrow and has_right_arrow:
+        raise QueryError("Bidirectional relationship arrows are not supported.")
+    if not has_left_arrow and not has_right_arrow:
+        raise QueryError("Undirected relationship patterns are not supported yet.")
+    direction = "incoming" if has_left_arrow else "outgoing"
 
     detail = relationship_ctx.oC_RelationshipDetail()
     if detail is None:
-        return None, None, {}, 1, 1
+        return None, None, {}, direction, 1, 1
     variable_ctx = detail.oC_Variable()
     variable = variable_ctx.getText() if variable_ctx is not None else None
     if variable is not None and not allow_variable:
@@ -2529,13 +3540,13 @@ def _compile_relationship_pattern(
         )
         if len(rel_type_names) != 1:
             raise QueryError("Only a single relationship type is supported per hop.")
-        rel_type = rel_type_names[0].getText()
+        rel_type = _cypher_name(rel_type_names[0].getText())
 
     properties = _compile_properties(detail.oC_Properties(), params)
     min_hops, max_hops = _compile_range_literal(detail.oC_RangeLiteral())
     if variable is not None and (min_hops != 1 or max_hops != 1):
         raise QueryError("Relationship variables are not supported on variable-length hops yet.")
-    return variable, rel_type, properties, min_hops, max_hops
+    return variable, rel_type, properties, direction, min_hops, max_hops
 
 
 def _compile_range_literal(
@@ -2594,7 +3605,7 @@ def _compile_properties(
     keys = cast(list[CypherParser.OC_PropertyKeyNameContext], map_ctx.oC_PropertyKeyName())
     expressions = cast(list[CypherParser.OC_ExpressionContext], map_ctx.oC_Expression())
     return {
-        key_ctx.getText(): _compile_value_expression(expression_ctx, params)
+        _cypher_name(key_ctx.getText()): _compile_value_expression(expression_ctx, params)
         for key_ctx, expression_ctx in zip(keys, expressions, strict=True)
     }
 
@@ -2604,12 +3615,12 @@ def _compile_set_items(
     params: dict[str, object],
     *,
     bound_variables: set[str],
-) -> tuple[SetPropertyItem | SetMapMergeItem, ...]:
+) -> tuple[SetItem, ...]:
     """Compile this Cypher fragment into the internal structures used later."""
     if set_ctx is None:
         raise QueryError("SET clause is required.")
 
-    compiled_items: list[SetPropertyItem | SetMapMergeItem] = []
+    compiled_items: list[SetItem] = []
     for item_ctx in cast(list[CypherParser.OC_SetItemContext], set_ctx.oC_SetItem()):
         property_expression = item_ctx.oC_PropertyExpression()
         if property_expression is not None:
@@ -2638,6 +3649,11 @@ def _compile_set_items(
             if variable not in bound_variables:
                 raise QueryError(f"SET references an unbound variable: {variable}")
             compiled_value = _compile_value_expression(item_ctx.oC_Expression(), params)
+            if isinstance(compiled_value, PropertyReferenceValue):
+                compiled_items.append(
+                    SetMapReferenceMergeItem(variable=variable, source=compiled_value)
+                )
+                continue
             if not isinstance(compiled_value, dict):
                 raise QueryError("SET += requires a map value.")
             if not all(isinstance(key, str) for key in compiled_value):
@@ -2678,6 +3694,54 @@ def _compile_delete_items(
     if not compiled_items:
         raise QueryError("DELETE clause cannot be empty.")
     return detach, tuple(compiled_items)
+
+
+def _compile_remove_items(
+    remove_ctx: CypherParser.OC_RemoveContext,
+    *,
+    bound_variables: set[str],
+) -> tuple[RemoveItem, ...]:
+    """Compile REMOVE targets, accepting property deletion and label cleanup shims."""
+    compiled_items: list[RemoveItem] = []
+    for item_ctx in cast(list[CypherParser.OC_RemoveItemContext], remove_ctx.oC_RemoveItem()):
+        property_expression = item_ctx.oC_PropertyExpression()
+        if property_expression is not None:
+            variable, field = _parse_property_reference(property_expression.getText())
+            if variable not in bound_variables:
+                raise QueryError(f"REMOVE references an unbound variable: {variable}")
+            if field in {"id", "labels", "type", "source", "target", "__join_id"}:
+                raise QueryError(f"REMOVE cannot update reserved field '{field}'.")
+            compiled_items.append(RemovePropertyItem(variable=variable, field=field))
+            continue
+
+        variable_ctx = item_ctx.oC_Variable()
+        labels_ctx = item_ctx.oC_NodeLabels()
+        if variable_ctx is None or labels_ctx is None:
+            raise QueryError("Unsupported REMOVE item.")
+        variable = variable_ctx.getText()
+        if variable not in bound_variables:
+            raise QueryError(f"REMOVE references an unbound variable: {variable}")
+        for label in _compile_node_labels(labels_ctx):
+            compiled_items.append(RemoveLabelItem(variable=variable, label=label))
+
+    if not compiled_items:
+        raise QueryError("REMOVE clause cannot be empty.")
+    return tuple(compiled_items)
+
+
+def _updating_clause_name(clause: CypherParser.OC_UpdatingClauseContext) -> str:
+    """Return a readable name for unsupported updating clauses."""
+    if clause.oC_Create() is not None:
+        return "CREATE"
+    if clause.oC_Merge() is not None:
+        return "MERGE"
+    if clause.oC_Set() is not None:
+        return "SET"
+    if clause.oC_Delete() is not None:
+        return "DELETE"
+    if clause.oC_Remove() is not None:
+        return "REMOVE"
+    return "UNKNOWN"
 
 
 def _compile_with_items(
@@ -2741,7 +3805,11 @@ def _compile_with_items(
                 input_scope,
             )
             alias_ctx = item_ctx.oC_Variable()
-            if source_kind == "scalar" and alias_ctx is None:
+            if (
+                source_kind == "scalar"
+                and alias_ctx is None
+                and not _IDENTIFIER_RE.fullmatch(expression_text)
+            ):
                 raise QueryError("WITH scalar expressions currently require an explicit alias.")
 
             output_name = alias_ctx.getText() if alias_ctx is not None else source_variable
@@ -2773,7 +3841,11 @@ def _compile_with_items(
                 input_scope,
             )
             alias_ctx = item_ctx.oC_Variable()
-            if source_kind == "scalar" and alias_ctx is None:
+            if (
+                source_kind == "scalar"
+                and alias_ctx is None
+                and not _IDENTIFIER_RE.fullmatch(expression_text)
+            ):
                 raise QueryError("WITH scalar expressions currently require an explicit alias.")
 
             output_name = alias_ctx.getText() if alias_ctx is not None else source_variable
@@ -2969,8 +4041,6 @@ def _validate_return_items(return_items: tuple[ReturnItem, ...]) -> None:
     aggregate_items = [item for item in return_items if item.aggregate is not None]
     if not aggregate_items:
         return
-    if len(aggregate_items) != len(return_items):
-        raise QueryError("Mixing aggregate and non-aggregate RETURN items is not supported yet.")
     unsupported = [item for item in aggregate_items if item.aggregate != "count"]
     if unsupported:
         raise QueryError("Only COUNT aggregate RETURN items are supported.")
@@ -2980,6 +4050,7 @@ def _compile_order_by(
     order_ctx: CypherParser.OC_OrderContext | None,
     *,
     scope: Mapping[str, ScopeBindingKind] | None = None,
+    return_items: tuple[ReturnItem, ...] = (),
 ) -> tuple[OrderByItem, ...] | None:
     """Compile this Cypher fragment into the internal structures used later."""
     if order_ctx is None:
@@ -2988,13 +4059,31 @@ def _compile_order_by(
     sort_items = cast(list[CypherParser.OC_SortItemContext], order_ctx.oC_SortItem())
     compiled_items: list[OrderByItem] = []
     for sort_item in sort_items:
-        variable, field = _compile_order_expression(
-            sort_item.oC_Expression().getText(),
-            scope=scope,
-        )
+        expression_text = sort_item.oC_Expression().getText()
+        return_order = _compile_return_item_order_expression(expression_text, return_items)
+        if return_order is None:
+            variable, field = _compile_order_expression(expression_text, scope=scope)
+        else:
+            variable, field = return_order
         descending = sort_item.DESC() is not None or sort_item.DESCENDING() is not None
         compiled_items.append(OrderByItem(variable=variable, field=field, descending=descending))
     return tuple(compiled_items)
+
+
+def _compile_return_item_order_expression(
+    expression_text: str,
+    return_items: tuple[ReturnItem, ...],
+) -> tuple[str, str] | None:
+    """Resolve ORDER BY references to aggregate RETURN output columns."""
+    has_aggregate = _contains_aggregates(return_items)
+    for item in return_items:
+        if item.expression == expression_text:
+            if has_aggregate:
+                return item.expression, "value"
+            if item.field is None:
+                return item.variable, _ENTITY_ID_FIELD
+            return item.variable, item.field
+    return None
 
 
 def _compile_projection_expression(
@@ -3084,7 +4173,10 @@ def _compile_function_binding(
     scope: Mapping[str, ScopeBindingKind] | None = None,
 ) -> tuple[str, str] | None:
     """Compile this Cypher fragment into the internal structures used later."""
-    match = re.fullmatch(r"(?i)(id|labels|type|tolower|toupper|size)\(([^)]+)\)", expression_text)
+    match = re.fullmatch(
+        r"(?i)(id|keys|labels|type|tolower|toupper|size)\(([^)]+)\)",
+        expression_text,
+    )
     if match is None:
         return None
 
@@ -3093,11 +4185,15 @@ def _compile_function_binding(
     if function_name == "id":
         if not _IDENTIFIER_RE.fullmatch(operand):
             raise QueryError(f"Unsupported function operand: {expression_text}")
-        return operand, "id"
+        return operand, _ENTITY_ID_FIELD
     if function_name == "labels":
         if not _IDENTIFIER_RE.fullmatch(operand):
             raise QueryError(f"Unsupported function operand: {expression_text}")
         return operand, "labels"
+    if function_name == "keys":
+        if not _IDENTIFIER_RE.fullmatch(operand):
+            raise QueryError(f"Unsupported function operand: {expression_text}")
+        return operand, "keys"
     if function_name == "type":
         if not _IDENTIFIER_RE.fullmatch(operand):
             raise QueryError(f"Unsupported function operand: {expression_text}")
@@ -3450,6 +4546,7 @@ def _match_patterns_table(
         edge_property_loader=edge_property_loader,
     )
     bound_variables = set(_pattern_variables(patterns[0]))
+    allow_disconnected_cross_join = _is_bounded_node_lookup_pattern(patterns[0])
 
     for pattern in patterns[1:]:
         next_table = _match_single_pattern_table(
@@ -3465,7 +4562,14 @@ def _match_patterns_table(
         pattern_variables = set(_pattern_variables(pattern))
         shared_variables = tuple(sorted(bound_variables & pattern_variables))
         if not shared_variables:
-            raise QueryError("Disconnected pattern parts are not supported yet.")
+            if not allow_disconnected_cross_join or not _is_bounded_node_lookup_pattern(pattern):
+                raise QueryError("Disconnected pattern parts are not supported yet.")
+            matched = _cross_join_tables(matched, next_table, tabular)
+            bound_variables.update(pattern_variables)
+            allow_disconnected_cross_join = (
+                allow_disconnected_cross_join and _is_bounded_node_lookup_pattern(pattern)
+            )
+            continue
 
         # The executor only supports connected pattern parts for now, so every
         # additional pattern is joined back on the already-bound node ids.
@@ -3484,6 +4588,11 @@ def _match_patterns_table(
         bound_variables.update(pattern_variables)
 
     return matched
+
+
+def _is_bounded_node_lookup_pattern(pattern: CompiledPattern) -> bool:
+    """Return true for disconnected node lookups that are safe to cross join."""
+    return isinstance(pattern, NodePattern) and bool(pattern.properties)
 
 
 def _match_patterns_from_input_table(
@@ -3518,20 +4627,26 @@ def _match_patterns_from_input_table(
         pattern_variables = set(_pattern_variables(pattern))
         shared_variables = tuple(sorted(bound_variables & pattern_variables))
         if not shared_variables:
-            raise QueryError("MATCH after WITH requires a pattern connected to the WITH scope.")
-
-        next_table = _project_joinable_pattern_table(
-            next_table,
-            pattern_variables=pattern_variables,
-            shared_variables=set(shared_variables),
-        )
-        join_keys = [_binding_column_name(variable, "__join_id") for variable in shared_variables]
-        matched = tabular.inner_join(
-            matched,
-            next_table,
-            left_keys=join_keys,
-            right_keys=join_keys,
-        )
+            if not _pattern_has_property_reference_values(pattern):
+                raise QueryError("MATCH after WITH requires a pattern connected to the WITH scope.")
+            matched = _cross_join_tables(matched, next_table, tabular)
+            matched = _apply_deferred_pattern_reference_filters(matched, pattern)
+        else:
+            next_table = _project_joinable_pattern_table(
+                next_table,
+                pattern_variables=pattern_variables,
+                shared_variables=set(shared_variables),
+            )
+            join_keys = [
+                _binding_column_name(variable, "__join_id")
+                for variable in shared_variables
+            ]
+            matched = tabular.inner_join(
+                matched,
+                next_table,
+                left_keys=join_keys,
+                right_keys=join_keys,
+            )
         bound_variables.update(pattern_variables)
 
     return matched
@@ -3664,8 +4779,14 @@ def _optional_match_single_path_from_input_table(
         matched = tabular.left_join(
             matched,
             edge_table,
-            left_keys=_binding_column_name(current_variable, "id"),
+            left_keys=_binding_column_name(current_variable, _NODE_ID_FIELD),
             right_keys=f"{edge_prefix}.source",
+        )
+        matched = _ensure_edge_source_column(
+            matched,
+            edge_prefix=edge_prefix,
+            source_variable=current_variable,
+            endpoint="source" if step.direction == "outgoing" else "target",
         )
 
         next_nodes = _match_nodes_table(
@@ -3794,6 +4915,11 @@ def _empty_unwind_result(input_table: pa.Table, output_column: str) -> pa.Table:
     return pa.table(columns)
 
 
+def _single_row_table() -> pa.Table:
+    """Build the one-row seed table used by standalone UNWIND pipelines."""
+    return pa.Table.from_pylist([{}])
+
+
 def _match_single_pattern_table(
     nodes: NodeBindingSource,
     edges: EdgeBindingSource,
@@ -3876,6 +5002,15 @@ def _match_fixed_path_table(
 
     for index, step in enumerate(pattern.steps):
         edge_prefix = step.variable or f"_edge_{index}"
+        current_variable = (
+            pattern.start.variable if index == 0 else pattern.steps[index - 1].node.variable
+        )
+        current_edge_key = (
+            f"{edge_prefix}.source" if step.direction == "outgoing" else f"{edge_prefix}.target"
+        )
+        next_edge_key = (
+            f"{edge_prefix}.target" if step.direction == "outgoing" else f"{edge_prefix}.source"
+        )
         edge_requested_fields = _requested_fields_for_edge_step(required_fields, edge_prefix, step)
         edge_table = _edge_match_table(
             edges,
@@ -3888,22 +5023,25 @@ def _match_fixed_path_table(
         matched = tabular.inner_join(
             matched,
             edge_table,
-            left_keys=_binding_column_name(
-                pattern.start.variable if index == 0 else pattern.steps[index - 1].node.variable,
-                "id",
-            ),
-            right_keys=f"{edge_prefix}.source",
+            left_keys=_binding_column_name(current_variable, _NODE_ID_FIELD),
+            right_keys=current_edge_key,
+        )
+        matched = _ensure_edge_source_column(
+            matched,
+            edge_prefix=edge_prefix,
+            source_variable=current_variable,
+            endpoint="source" if step.direction == "outgoing" else "target",
         )
         if not _uses_typed_adjacency_path(step, edge_requested_fields):
             matched = _apply_edge_pattern_filter(matched, edge_prefix, step)
         if matched.num_rows == 0:
             return _project_public_pattern_columns(matched, pattern)
 
-        target_id_column = _binding_column_name(step.node.variable, "id")
+        target_id_column = _binding_column_name(step.node.variable, _NODE_ID_FIELD)
         if target_id_column in matched.column_names:
             matched = _apply_existing_binding_filter(
                 matched,
-                edge_target_column=f"{edge_prefix}.target",
+                edge_target_column=next_edge_key,
                 pattern=step.node,
             )
             continue
@@ -3918,7 +5056,7 @@ def _match_fixed_path_table(
         matched = tabular.inner_join(
             matched,
             next_nodes,
-            left_keys=f"{edge_prefix}.target",
+            left_keys=next_edge_key,
             right_keys=_binding_column_name(step.node.variable, "__join_id"),
         )
         matched = _apply_node_pattern_filter(matched, step.node)
@@ -3991,7 +5129,9 @@ def _match_single_variable_length_path_table(
     frontier = pa.table(
         {
             **{column_name: start_table[column_name] for column_name in start_columns},
-            current_id_column: start_table[_binding_column_name(pattern.start.variable, "id")],
+            current_id_column: start_table[
+                _binding_column_name(pattern.start.variable, _NODE_ID_FIELD)
+            ],
         }
     )
 
@@ -4053,7 +5193,9 @@ def _match_single_variable_length_path_table(
         frontier = pa.table(
             {
                 **{column_name: joined_nodes[column_name] for column_name in start_columns},
-                current_id_column: joined_nodes[_binding_column_name(step.node.variable, "id")],
+                current_id_column: joined_nodes[
+                    _binding_column_name(step.node.variable, _NODE_ID_FIELD)
+                ],
             }
         )
 
@@ -4163,6 +5305,7 @@ def _expand_relationship_step_variants(
                     rel_type=step.rel_type,
                     properties=step.properties,
                     node=node,
+                    direction=step.direction,
                     min_hops=1,
                     max_hops=1,
                 )
@@ -4256,20 +5399,80 @@ def _build_aggregate_query_result_from_table(
             row[item.expression] = bindings.num_rows
             continue
 
-        if item.field is None:
-            column_name = _binding_column_name(item.variable, "id")
-        else:
-            column_name = _binding_column_name(item.variable, item.field)
-        if column_name not in bindings.column_names:
+        field = _ENTITY_ID_FIELD if item.field is None else item.field
+        column = _resolve_table_field_array(bindings, variable=item.variable, field=field)
+        if column is None:
+            column_name = _binding_column_name(item.variable, field)
             raise QueryError(f"COUNT references an unknown binding: {column_name}")
         if item.aggregate_distinct:
-            row[item.expression] = _count_distinct_non_null(bindings[column_name])
+            row[item.expression] = _count_distinct_non_null(column)
             continue
-        row[item.expression] = int(pc.sum(pc.is_valid(bindings[column_name])).as_py() or 0)
+        row[item.expression] = int(pc.sum(pc.is_valid(column)).as_py() or 0)
     return QueryResult(
         columns=tuple(item.expression for item in return_items),
         rows=(row,),
     )
+
+
+def _build_grouped_aggregate_query_result(
+    return_items: tuple[ReturnItem, ...],
+    bindings: pa.Table,
+) -> QueryResult:
+    """Project grouped aggregate tables back into public Cypher result rows."""
+    source_rows = bindings.to_pylist()
+    rows: list[dict[str, Any]] = []
+    for record in source_rows:
+        row: dict[str, Any] = {}
+        for item in return_items:
+            if item.aggregate is not None:
+                row[item.expression] = _resolve_record_field_value(
+                    record,
+                    variable=item.expression,
+                    field="value",
+                )
+                continue
+            if item.field is None:
+                row[item.expression] = _project_bound_entity_from_row(record, item.expression)
+                continue
+            value = _resolve_record_field_value(
+                record,
+                variable=item.expression,
+                field="value",
+            )
+            row[item.expression] = (
+                None if value is None else _decode_labels(value)
+                if item.field == "labels"
+                else _decode_join_json_value(value)
+            )
+        rows.append(row)
+    return QueryResult(
+        columns=tuple(item.expression for item in return_items),
+        rows=tuple(rows),
+    )
+
+
+def _aggregate_return_items(return_items: tuple[ReturnItem, ...]) -> tuple[ReturnItem, ...]:
+    """Return only aggregate projections from a RETURN item list."""
+    return tuple(item for item in return_items if item.aggregate is not None)
+
+
+def _grouping_items_for_aggregate_return(
+    return_items: tuple[ReturnItem, ...],
+) -> tuple[WithItem, ...]:
+    """Convert non-aggregate RETURN items into implicit grouping keys."""
+    grouping_items: list[WithItem] = []
+    for item in return_items:
+        if item.aggregate is not None:
+            continue
+        grouping_items.append(
+            WithItem(
+                output_name=item.expression,
+                source_variable=item.variable,
+                source_field=item.field,
+                source_kind="entity" if item.field is None else "scalar",
+            )
+        )
+    return tuple(grouping_items)
 
 
 def _build_aggregate_table_from_table(
@@ -4288,7 +5491,13 @@ def _build_aggregate_table_from_table(
             }
         )
 
-    grouping_projection = _project_with_items_table(bindings, grouping_items)
+    if bindings.num_rows == 0:
+        grouping_projection = _empty_grouping_projection_table(grouping_items)
+        return _empty_grouped_aggregate_table(grouping_projection, return_items)
+
+    grouping_projection = _encode_nested_grouping_columns(
+        _project_with_items_table(bindings, grouping_items)
+    )
     if grouping_projection.num_rows == 0:
         return _empty_grouped_aggregate_table(grouping_projection, return_items)
     aggregate_input_columns: dict[str, pa.ChunkedArray | pa.Array] = {
@@ -4320,8 +5529,10 @@ def _build_aggregate_table_from_table(
                 field=source_column,
             )
         if resolved is None:
-            column_name = _binding_column_name(item.variable, source_column)
-            raise QueryError(f"COUNT references an unknown binding: {column_name}")
+            resolved = _null_array_for_missing_bound_field(bindings, item.variable)
+            if resolved is None:
+                column_name = _binding_column_name(item.variable, source_column)
+                raise QueryError(f"COUNT references an unknown binding: {column_name}")
         resolved_arrays[source_column] = resolved
         temp_name = f"__agg__.{index}"
         aggregate_input_columns[temp_name] = resolved
@@ -4341,6 +5552,28 @@ def _build_aggregate_table_from_table(
     return pa.table(output_columns)
 
 
+def _encode_nested_grouping_columns(table: pa.Table) -> pa.Table:
+    """Encode nested grouping keys into stable strings before Arrow group_by."""
+    updated = table
+    for index, field in enumerate(table.schema):
+        if not (
+            pa.types.is_list(field.type)
+            or pa.types.is_large_list(field.type)
+            or pa.types.is_struct(field.type)
+            or pa.types.is_map(field.type)
+        ):
+            continue
+        encoded = pa.array(
+            [
+                None if value is None else f"{_JOIN_JSON_PREFIX}{json.dumps(value)}"
+                for value in table[field.name].to_pylist()
+            ],
+            type=pa.string(),
+        )
+        updated = updated.set_column(index, field.name, encoded)
+    return updated
+
+
 def _empty_grouped_aggregate_table(
     grouping_projection: pa.Table,
     aggregate_items: tuple[ReturnItem, ...],
@@ -4351,6 +5584,16 @@ def _empty_grouped_aggregate_table(
         columns[column_name] = pa.array([], type=grouping_projection[column_name].type)
     for item in aggregate_items:
         columns[_binding_column_name(item.expression, "value")] = pa.array([], type=pa.int64())
+    return pa.table(columns)
+
+
+def _empty_grouping_projection_table(grouping_items: tuple[WithItem, ...]) -> pa.Table:
+    """Build the grouping schema for grouped aggregates over an empty match result."""
+    columns: dict[str, pa.Array] = {}
+    for item in grouping_items:
+        if item.source_kind == "entity":
+            continue
+        columns[_binding_column_name(item.output_name, "value")] = pa.array([], type=pa.null())
     return pa.table(columns)
 
 
@@ -4385,6 +5628,8 @@ def _build_match_logical_plan(query: CompiledMatchQuery) -> MatchLogicalPlan | N
         root = FilterPlan(input=root, predicate=residual_predicate)
 
     if _contains_aggregates(query.return_items):
+        if _grouping_items_for_aggregate_return(query.return_items):
+            return None
         if (
             query.distinct
             or query.order_by is not None
@@ -4432,8 +5677,15 @@ def _build_match_with_logical_plan(query: CompiledMatchWithQuery) -> MatchLogica
     """Build the intermediate plan, table, or result used by later stages."""
     if (
         query.match_optional
+        or query.pre_with_unwind is not None
         or query.post_with_match_patterns
         or query.post_with_unwind is not None
+        or query.post_with_create_patterns
+        or query.post_with_create_relationship_patterns
+        or query.post_with_merge_node_pattern is not None
+        or query.post_with_merge_relationship_pattern is not None
+        or query.post_with_set_items
+        or query.post_with_delete_items
         or len(query.match_patterns) != 1
     ):
         return None
@@ -4726,6 +5978,8 @@ def _build_match_scan_plan(
     for index, step in enumerate(pattern.steps):
         if step.min_hops != 1 or step.max_hops != 1:
             return None
+        if step.direction != "outgoing":
+            return None
         edge_variable = step.variable or f"_edge_{index}"
         if edge_variable in seen_variables or step.node.variable in seen_variables:
             return None
@@ -4805,8 +6059,15 @@ def _project_columns_for_required_fields(
     """Project bindings into the columns or values needed by the next step."""
     if requested_fields is None:
         return ()
-    reserved = {"id", "__join_id", "labels"} if is_node else {"id", "type", "source", "target"}
-    columns = [_binding_column_name(variable, "id")]
+    reserved = (
+        {_NODE_ID_FIELD, _ENTITY_ID_FIELD, "__join_id", "labels"}
+        if is_node
+        else {"id", _ENTITY_ID_FIELD, _NODE_ID_FIELD, "type", "source", "target"}
+    )
+    id_field = _NODE_ID_FIELD if is_node else "id"
+    columns = [_binding_column_name(variable, id_field)]
+    if _ENTITY_ID_FIELD in requested_fields and _ENTITY_ID_FIELD != id_field:
+        columns.append(_binding_column_name(variable, _ENTITY_ID_FIELD))
     if is_node:
         columns.append(_binding_column_name(variable, "labels"))
     else:
@@ -4838,10 +6099,15 @@ def _project_columns_for_with_stage_input(
     for aggregate_item in aggregate_items:
         if aggregate_item.aggregate != "count" or aggregate_item.count_all:
             continue
+        source_column = _aggregate_source_column_name(aggregate_item)
+        if source_column == _ENTITY_ID_FIELD:
+            columns.append(_binding_column_name(aggregate_item.variable, _NODE_ID_FIELD))
+            columns.append(_binding_column_name(aggregate_item.variable, "id"))
+            continue
         columns.append(
             _binding_column_name(
                 aggregate_item.variable,
-                _aggregate_source_column_name(aggregate_item),
+                source_column,
             )
         )
     if not columns:
@@ -4985,6 +6251,11 @@ def _required_fields_for_match(
         _collect_required_fields_from_pattern(pattern, required)
     _collect_required_fields_from_predicate(where_predicate, required)
     _collect_required_fields_from_return_items(return_items, required)
+    if _contains_aggregates(return_items):
+        _collect_required_fields_from_with_items(
+            _grouping_items_for_aggregate_return(return_items),
+            required,
+        )
     _collect_required_fields_from_order_by(order_by, required)
     return required
 
@@ -5023,8 +6294,22 @@ def _required_fields_for_entity_variables(
     """Compute the fields or identifiers needed by downstream execution."""
     required: dict[str, set[str]] = {}
     for variable in variables:
+        _add_required_field(required, variable, _NODE_ID_FIELD)
         _add_required_field(required, variable, "id")
     return required
+
+
+def _required_fields_for_create_bound_variables(
+    create_patterns: tuple[CreateRelationshipPattern, ...],
+) -> dict[str, set[str]]:
+    """Require ids for the already-bound endpoints used by MATCH ... CREATE."""
+    variables: list[str] = []
+    for pattern in create_patterns:
+        if pattern.left_bound:
+            variables.append(pattern.left_variable)
+        if pattern.right_bound:
+            variables.append(pattern.right_variable)
+    return _required_fields_for_entity_variables(variables)
 
 
 def _merge_required_fields(
@@ -5097,6 +6382,9 @@ def _collect_required_fields_from_return_items(
         if item.field is None:
             _mark_requires_full_entity(required, item.variable)
             continue
+        if item.field == "keys":
+            _mark_requires_full_entity(required, item.variable)
+            continue
         _add_required_field(required, item.variable, item.field)
 
 
@@ -5141,6 +6429,8 @@ def _collect_required_fields_from_with_items(
             continue
         if item.source_field is None:
             continue
+        _add_required_field(required, item.source_variable, _NODE_ID_FIELD)
+        _add_required_field(required, item.source_variable, "id")
         _add_required_field(required, item.source_variable, item.source_field)
 
 
@@ -5195,7 +6485,7 @@ def _add_required_field(
 def _aggregate_source_column_name(item: ReturnItem) -> str:
     """Support the current Cypher compilation or execution step."""
     if item.field is None:
-        return "id"
+        return _ENTITY_ID_FIELD
     return item.field
 
 
@@ -5253,6 +6543,99 @@ def _materialize_create_edges_from_matches(
         for source_id, target_id in zip(source_ids, target_ids, strict=True):
             edge_specs.append((source_id, target_id, pattern.rel_type, dict(pattern.properties)))
     return tuple(edge_specs)
+
+
+def _materialize_match_create_records_from_matches(
+    state: GraphState,
+    matched_rows: pa.Table,
+    create_patterns: tuple[CreateRelationshipPattern, ...],
+) -> tuple[
+    tuple[NodeRecord, ...],
+    tuple[EdgeRecord, ...],
+    dict[str, tuple[NodeRecord, ...]],
+]:
+    """Materialize nodes and edges produced by MATCH ... CREATE for one snapshot publish."""
+    new_nodes: list[NodeRecord] = []
+    new_edges: list[EdgeRecord] = []
+    created_by_row: dict[tuple[str, int], NodeRecord] = {}
+    bindings: dict[str, list[NodeRecord | None]] = {}
+    source_rows = matched_rows.to_pylist()
+    next_node_id = max((node.node_id for node in state.nodes), default=0) + 1
+    next_edge_id = max((edge.edge_id for edge in state.edges), default=0) + 1
+
+    def allocate_node(
+        pattern: CreateRelationshipPattern,
+        *,
+        side: Literal["left", "right"],
+        row: int,
+    ) -> NodeRecord:
+        """Create or reuse the inline node bound to one MATCH row."""
+        nonlocal next_node_id
+        variable = pattern.left_variable if side == "left" else pattern.right_variable
+        labels = pattern.left_labels if side == "left" else pattern.right_labels
+        properties = pattern.left_properties if side == "left" else pattern.right_properties
+        key = (variable, row)
+        existing = created_by_row.get(key)
+        if existing is not None:
+            if existing.labels != labels or existing.properties != properties:
+                raise QueryError(
+                    f"CREATE cannot redefine variable '{variable}' with different inline data."
+                )
+            return existing
+
+        node = NodeRecord(
+            node_id=next_node_id,
+            labels=labels,
+            properties=dict(properties),
+        )
+        next_node_id += 1
+        created_by_row[key] = node
+        new_nodes.append(node)
+        bindings.setdefault(variable, [None] * matched_rows.num_rows)[row] = node
+        return node
+
+    for pattern in create_patterns:
+        left_ids = (
+            _required_node_id_values_from_table(matched_rows, pattern.left_variable)
+            if pattern.left_bound
+            else ()
+        )
+        right_ids = (
+            _required_node_id_values_from_table(matched_rows, pattern.right_variable)
+            if pattern.right_bound
+            else ()
+        )
+        for row_index in range(matched_rows.num_rows):
+            source_id = (
+                left_ids[row_index]
+                if pattern.left_bound
+                else allocate_node(pattern, side="left", row=row_index).node_id
+            )
+            target_id = (
+                right_ids[row_index]
+                if pattern.right_bound
+                else allocate_node(pattern, side="right", row=row_index).node_id
+            )
+            new_edges.append(
+                EdgeRecord(
+                    edge_id=next_edge_id,
+                    rel_type=pattern.rel_type,
+                    src_id=source_id,
+                    dst_id=target_id,
+                    properties=_resolve_input_create_properties(
+                        pattern.properties,
+                        source_row=source_rows[row_index],
+                    ),
+                )
+            )
+            next_edge_id += 1
+
+    aligned_bindings: dict[str, tuple[NodeRecord, ...]] = {}
+    for variable, records in bindings.items():
+        if any(record is None for record in records):
+            raise QueryError(f"CREATE node bindings for '{variable}' could not be aligned.")
+        aligned_bindings[variable] = tuple(cast(NodeRecord, record) for record in records)
+    return tuple(new_nodes), tuple(new_edges), aligned_bindings
 
 
 def _materialize_merge_edges_from_matches(
@@ -5542,7 +6925,7 @@ def _apply_merge_set_items_to_properties(
     base_properties: Mapping[str, object],
     *,
     variable: str,
-    set_items: tuple[SetPropertyItem | SetMapMergeItem, ...],
+    set_items: tuple[SetItem, ...],
 ) -> dict[str, object]:
     """Apply this transformation or predicate inside the Cypher pipeline."""
     properties = dict(base_properties)
@@ -5552,7 +6935,10 @@ def _apply_merge_set_items_to_properties(
         if isinstance(item, SetPropertyItem):
             properties[item.field] = item.value
             continue
-        properties.update(item.properties)
+        if isinstance(item, SetMapMergeItem):
+            properties.update(item.properties)
+            continue
+        raise QueryError("MERGE SET += row references are supported only after WITH.")
     return properties
 
 
@@ -5561,6 +6947,58 @@ def _append_row_index_column(table: pa.Table, column_name: str) -> pa.Table:
     if column_name in table.column_names:
         return table
     return table.append_column(column_name, pa.array(range(table.num_rows), type=pa.int64()))
+
+
+def _cross_join_tables(
+    left: pa.Table,
+    right: pa.Table,
+    tabular: PyArrowTabularAdapter,
+) -> pa.Table:
+    """Cross-join two binding tables through a temporary constant join key."""
+    join_key = "__grapharrow_cross_join"
+    left_joinable = left.append_column(join_key, pa.array([0] * left.num_rows, type=pa.int8()))
+    right_joinable = right.append_column(join_key, pa.array([0] * right.num_rows, type=pa.int8()))
+    joined = tabular.inner_join(
+        left_joinable,
+        right_joinable,
+        left_keys=join_key,
+        right_keys=join_key,
+    )
+    return joined.drop([join_key])
+
+
+def _pattern_has_property_reference_values(pattern: CompiledPattern) -> bool:
+    """Return true when a pattern property reads from an existing row binding."""
+    if isinstance(pattern, NodePattern):
+        return any(
+            isinstance(value, PropertyReferenceValue)
+            for value in pattern.properties.values()
+        )
+    if any(
+        isinstance(value, PropertyReferenceValue)
+        for value in pattern.start.properties.values()
+    ):
+        return True
+    return any(
+        any(isinstance(value, PropertyReferenceValue) for value in step.properties.values())
+        or any(isinstance(value, PropertyReferenceValue) for value in step.node.properties.values())
+        for step in pattern.steps
+    )
+
+
+def _apply_deferred_pattern_reference_filters(
+    table: pa.Table,
+    pattern: CompiledPattern,
+) -> pa.Table:
+    """Apply dynamic row-reference filters after input rows have been joined in."""
+    if isinstance(pattern, NodePattern):
+        return _apply_node_pattern_filter(table, pattern)
+    filtered = _apply_node_pattern_filter(table, pattern.start)
+    for index, step in enumerate(pattern.steps):
+        prefix = f"{step.variable or f'_rel_{index}'}"
+        filtered = _apply_edge_pattern_filter(filtered, prefix, step)
+        filtered = _apply_node_pattern_filter(filtered, step.node)
+    return filtered
 
 
 def _filter_table_with_mask(table: pa.Table, keep_mask: Iterable[bool]) -> pa.Table:
@@ -5673,13 +7111,31 @@ def _append_merge_node_binding_columns(
     requested_fields: set[str] | None,
 ) -> pa.Table:
     """Append aligned data needed by the current write or plan helper."""
+    return _append_node_binding_columns(
+        table,
+        variable=variable,
+        node_records=node_records,
+        requested_fields=requested_fields,
+        context="MERGE node",
+    )
+
+
+def _append_node_binding_columns(
+    table: pa.Table,
+    *,
+    variable: str,
+    node_records: tuple[NodeRecord, ...],
+    requested_fields: set[str] | None,
+    context: str,
+) -> pa.Table:
+    """Append node binding columns aligned one-to-one with the input rows."""
     node_table = _node_binding_table(
         node_records,
         variable,
         requested_fields=requested_fields,
     )
     if node_table.num_rows != table.num_rows:
-        raise QueryError("MERGE node bindings could not be aligned with match rows.")
+        raise QueryError(f"{context} bindings could not be aligned with match rows.")
     updated = table
     for column_name in node_table.column_names:
         if column_name in updated.column_names:
@@ -5719,7 +7175,7 @@ def _apply_bound_merge_node_filters(
 
 def _materialize_set_updates_from_matches(
     matched_rows: pa.Table,
-    set_items: tuple[SetPropertyItem | SetMapMergeItem, ...],
+    set_items: tuple[SetItem, ...],
 ) -> tuple[tuple[tuple[int, str, object], ...], tuple[tuple[int, str, object], ...]]:
     """Materialize write-side operations from matched rows for the graph service."""
     node_updates: list[tuple[int, str, object]] = []
@@ -5733,11 +7189,7 @@ def _materialize_set_updates_from_matches(
             item.variable,
             context="SET",
         )
-        property_updates = (
-            ((item.field, item.value),)
-            if isinstance(item, SetPropertyItem)
-            else tuple(item.properties.items())
-        )
+        property_updates = _static_set_item_property_updates(item)
 
         if _is_node_binding_table(matched_rows, item.variable):
             for entity_id in entity_ids:
@@ -5760,6 +7212,117 @@ def _materialize_set_updates_from_matches(
         raise QueryError(f"SET variable '{item.variable}' is not a supported node or relationship.")
 
     return tuple(node_updates), tuple(edge_updates)
+
+
+def _static_set_item_property_updates(item: SetItem) -> tuple[tuple[str, object], ...]:
+    """Return compile-time SET updates or reject row-dependent map updates."""
+    if isinstance(item, SetPropertyItem):
+        return ((item.field, item.value),)
+    if isinstance(item, SetMapMergeItem):
+        return tuple(item.properties.items())
+    raise QueryError("SET += row references are supported only after WITH.")
+
+
+def _materialize_set_from_input_rows(
+    graph_service: GraphStateUseCase,
+    input_rows: pa.Table,
+    set_items: tuple[SetItem, ...],
+) -> pa.Table:
+    """Materialize row-driven SET clauses after WITH."""
+    source_rows = input_rows.to_pylist()
+    node_updates: list[tuple[int, str, object]] = []
+    edge_updates: list[tuple[int, str, object]] = []
+    output_rows: list[dict[str, Any]] = []
+
+    for source_row in source_rows:
+        output_row = dict(source_row)
+        for item in set_items:
+            entity_id = _required_entity_id_value_from_row(source_row, item.variable)
+            property_updates = _resolve_input_set_property_updates(item, source_row=source_row)
+            if _is_node_binding_row(source_row, item.variable):
+                for key, value in property_updates:
+                    node_updates.append((entity_id, key, value))
+                    output_row[_binding_column_name(item.variable, key)] = value
+                continue
+            if _is_edge_binding_row(source_row, item.variable):
+                for key, value in property_updates:
+                    edge_updates.append((entity_id, key, value))
+                    output_row[_binding_column_name(item.variable, key)] = value
+                continue
+            raise QueryError(
+                f"SET variable '{item.variable}' is not a supported node or relationship."
+            )
+        output_rows.append(output_row)
+
+    if node_updates or edge_updates:
+        graph_service.update_properties_batch(
+            node_updates=tuple(node_updates),
+            edge_updates=tuple(edge_updates),
+        )
+    if not output_rows:
+        return input_rows
+    return pa.Table.from_pylist(output_rows)
+
+
+def _resolve_input_set_property_updates(
+    item: SetItem,
+    *,
+    source_row: Mapping[str, Any],
+) -> tuple[tuple[str, object], ...]:
+    """Resolve one SET item against the current WITH row."""
+    if isinstance(item, SetPropertyItem):
+        return (
+            (
+                item.field,
+                _resolve_input_set_value(item.value, source_row=source_row),
+            ),
+        )
+    if isinstance(item, SetMapMergeItem):
+        return tuple(
+            (key, _resolve_input_set_value(value, source_row=source_row))
+            for key, value in item.properties.items()
+        )
+    resolved = _resolve_input_set_value(item.source, source_row=source_row)
+    if not isinstance(resolved, Mapping):
+        raise QueryError("SET += row requires the row reference to resolve to a map.")
+    reserved_fields = {"id", "labels", "type", "source", "target", "__join_id"}
+    return tuple(
+        (str(key), value)
+        for key, value in resolved.items()
+        if isinstance(key, str) and key not in reserved_fields
+    )
+
+
+def _resolve_input_set_value(
+    value: object,
+    *,
+    source_row: Mapping[str, Any],
+) -> object:
+    """Resolve row references used by SET after WITH."""
+    if isinstance(value, PropertyReferenceValue):
+        return _resolve_input_create_value(value, source_row=source_row)
+    return value
+
+
+def _required_entity_id_value_from_row(row: Mapping[str, Any], variable: str) -> int:
+    """Read one bound entity id from a row."""
+    value = row.get(_binding_column_name(variable, _ENTITY_ID_FIELD))
+    if isinstance(value, int):
+        return value
+    raise QueryError(f"SET variable '{variable}' does not resolve to an entity id.")
+
+
+def _is_node_binding_row(row: Mapping[str, Any], variable: str) -> bool:
+    """Return whether one row contains a node binding for this variable."""
+    return (
+        _binding_column_name(variable, _NODE_ID_FIELD) in row
+        or _binding_column_name(variable, "labels") in row
+    ) and _binding_column_name(variable, "type") not in row
+
+
+def _is_edge_binding_row(row: Mapping[str, Any], variable: str) -> bool:
+    """Return whether one row contains an edge binding for this variable."""
+    return _binding_column_name(variable, "type") in row
 
 
 def _materialize_delete_targets_from_matches(
@@ -5797,6 +7360,66 @@ def _materialize_delete_targets_from_matches(
     return tuple(node_ids), tuple(edge_ids)
 
 
+def _materialize_remove_targets_from_matches(
+    matched_rows: pa.Table,
+    remove_items: tuple[RemoveItem, ...],
+) -> tuple[
+    tuple[tuple[int, str], ...],
+    tuple[tuple[int, str], ...],
+    tuple[tuple[int, str], ...],
+]:
+    """Materialize property removals from matched rows for the graph service."""
+    node_removals: list[tuple[int, str]] = []
+    edge_removals: list[tuple[int, str]] = []
+    node_label_removals: list[tuple[int, str]] = []
+    seen_node_removals: set[tuple[int, str]] = set()
+    seen_edge_removals: set[tuple[int, str]] = set()
+    seen_node_label_removals: set[tuple[int, str]] = set()
+
+    for item in remove_items:
+        if isinstance(item, RemoveLabelItem):
+            entity_ids = _required_entity_id_values_from_table(
+                matched_rows,
+                item.variable,
+                context="REMOVE",
+            )
+            if not _is_node_binding_table(matched_rows, item.variable):
+                raise QueryError(f"REMOVE label target '{item.variable}' is not a node.")
+            for entity_id in entity_ids:
+                removal_key = (entity_id, item.label)
+                if removal_key in seen_node_label_removals:
+                    continue
+                seen_node_label_removals.add(removal_key)
+                node_label_removals.append(removal_key)
+            continue
+        entity_ids = _required_entity_id_values_from_table(
+            matched_rows,
+            item.variable,
+            context="REMOVE",
+        )
+        if _is_node_binding_table(matched_rows, item.variable):
+            for entity_id in entity_ids:
+                removal_key = (entity_id, item.field)
+                if removal_key in seen_node_removals:
+                    continue
+                seen_node_removals.add(removal_key)
+                node_removals.append(removal_key)
+            continue
+        if _is_edge_binding_table(matched_rows, item.variable):
+            for entity_id in entity_ids:
+                removal_key = (entity_id, item.field)
+                if removal_key in seen_edge_removals:
+                    continue
+                seen_edge_removals.add(removal_key)
+                edge_removals.append(removal_key)
+            continue
+        raise QueryError(
+            f"REMOVE variable '{item.variable}' is not a supported node or relationship."
+        )
+
+    return tuple(node_removals), tuple(edge_removals), tuple(node_label_removals)
+
+
 def _with_incident_edge_ids(
     *,
     node_ids: tuple[int, ...],
@@ -5821,7 +7444,10 @@ def _with_incident_edge_ids(
 
 def _required_node_id_values_from_table(table: pa.Table, variable: str) -> tuple[int, ...]:
     """Compute the fields or identifiers needed by downstream execution."""
-    if not _is_node_binding_table(table, variable):
+    if (
+        not _is_node_binding_table(table, variable)
+        and _resolve_table_field_array(table, variable=variable, field=_ENTITY_ID_FIELD) is None
+    ):
         raise QueryError(f"Bound variable '{variable}' does not resolve to a node id.")
     return _required_entity_id_values_from_table(table, variable, context="Bound")
 
@@ -5833,10 +7459,10 @@ def _required_entity_id_values_from_table(
     context: str,
 ) -> tuple[int, ...]:
     """Compute the fields or identifiers needed by downstream execution."""
-    column_name = _binding_column_name(variable, "id")
-    if column_name not in table.column_names:
+    column = _resolve_table_field_array(table, variable=variable, field=_ENTITY_ID_FIELD)
+    if column is None:
         raise QueryError(f"{context} variable '{variable}' does not resolve to an entity id.")
-    values = table[column_name].to_pylist()
+    values = column.to_pylist()
     entity_ids: list[int] = []
     for value in values:
         if not isinstance(value, int):
@@ -5857,19 +7483,17 @@ def _is_edge_binding_table(table: pa.Table, variable: str) -> bool:
 
 def _apply_set_items_to_table(
     table: pa.Table,
-    set_items: tuple[SetPropertyItem | SetMapMergeItem, ...],
+    set_items: tuple[SetItem, ...],
 ) -> pa.Table:
     """Apply this transformation or predicate inside the Cypher pipeline."""
     updated = table
     for item in set_items:
-        entity_id_column = _binding_column_name(item.variable, "id")
-        if entity_id_column not in updated.column_names:
+        if (
+            _resolve_table_field_array(updated, variable=item.variable, field=_ENTITY_ID_FIELD)
+            is None
+        ):
             raise QueryError(f"SET references an unknown binding: {item.variable}")
-        property_updates = (
-            ((item.field, item.value),)
-            if isinstance(item, SetPropertyItem)
-            else tuple(item.properties.items())
-        )
+        property_updates = _static_set_item_property_updates(item)
         for field, value in property_updates:
             value_column = pa.array([value] * updated.num_rows)
             target_column = _binding_column_name(item.variable, field)
@@ -5878,6 +7502,50 @@ def _apply_set_items_to_table(
                 updated = updated.set_column(column_index, target_column, value_column)
             else:
                 updated = updated.append_column(target_column, value_column)
+    return updated
+
+
+def _apply_remove_items_to_table(
+    table: pa.Table,
+    remove_items: tuple[RemoveItem, ...],
+) -> pa.Table:
+    """Reflect property removals in rows returned by MATCH ... REMOVE ... RETURN."""
+    updated = table
+    for item in remove_items:
+        if isinstance(item, RemoveLabelItem):
+            labels_array = _resolve_table_field_array(
+                updated,
+                variable=item.variable,
+                field="labels",
+            )
+            if labels_array is None:
+                raise QueryError(f"REMOVE label target '{item.variable}' is not a node.")
+            target_column = _binding_column_name(item.variable, "labels")
+            updated_labels = [
+                [label for label in _decode_labels(labels) if label != item.label]
+                for labels in labels_array.to_pylist()
+            ]
+            column_index = updated.column_names.index(target_column)
+            updated = updated.set_column(
+                column_index,
+                target_column,
+                pa.array(updated_labels),
+            )
+            continue
+        if (
+            _resolve_table_field_array(updated, variable=item.variable, field=_ENTITY_ID_FIELD)
+            is None
+        ):
+            raise QueryError(f"REMOVE references an unknown binding: {item.variable}")
+        target_column = _binding_column_name(item.variable, item.field)
+        if target_column not in updated.column_names:
+            continue
+        column_index = updated.column_names.index(target_column)
+        updated = updated.set_column(
+            column_index,
+            target_column,
+            pa.nulls(updated.num_rows),
+        )
     return updated
 
 
@@ -5953,6 +7621,559 @@ def _materialize_create_patterns(
     return tuple(new_nodes), tuple(new_edges), bindings
 
 
+def _materialize_create_patterns_from_input_rows(
+    graph_service: GraphStateUseCase,
+    input_rows: pa.Table,
+    patterns: tuple[CompiledPattern, ...],
+    *,
+    return_items: tuple[ReturnItem, ...],
+    order_by: tuple[OrderByItem, ...] | None,
+) -> pa.Table:
+    """Materialize CREATE after WITH while preserving row-aligned bindings."""
+    state = graph_service.load_state()
+    source_rows = input_rows.to_pylist()
+    new_nodes: list[NodeRecord] = []
+    new_edges: list[EdgeRecord] = []
+    binding_rows: list[dict[str, Any]] = []
+    next_node_id = max((node.node_id for node in state.nodes), default=0) + 1
+    next_edge_id = max((edge.edge_id for edge in state.edges), default=0) + 1
+
+    def allocate_node_id() -> int:
+        """Allocate the next node identifier for row-driven CREATE."""
+        nonlocal next_node_id
+        current = next_node_id
+        next_node_id += 1
+        return current
+
+    def allocate_edge_id() -> int:
+        """Allocate the next edge identifier for row-driven CREATE."""
+        nonlocal next_edge_id
+        current = next_edge_id
+        next_edge_id += 1
+        return current
+
+    requested_fields: dict[str, set[str]] = {}
+    _collect_required_fields_from_return_items(return_items, requested_fields)
+    _collect_required_fields_from_order_by(order_by, requested_fields)
+
+    for source_row in source_rows:
+        row_bindings: dict[str, NodeRecord] = {}
+        for pattern in patterns:
+            if isinstance(pattern, NodePattern):
+                _resolve_or_create_input_create_node(
+                    pattern,
+                    source_row=source_row,
+                    bindings=row_bindings,
+                    next_node_id=allocate_node_id,
+                    new_nodes=new_nodes,
+                )
+                continue
+
+            if len(pattern.steps) != 1:
+                raise QueryError("CREATE after WITH currently supports only one relationship hop.")
+            step = pattern.steps[0]
+            if step.min_hops != 1 or step.max_hops != 1:
+                raise QueryError("Variable-length relationships are not supported yet in CREATE.")
+            if step.rel_type is None:
+                raise QueryError("CREATE requires an explicit relationship type.")
+
+            left_node = _resolve_or_create_input_create_node(
+                pattern.start,
+                source_row=source_row,
+                bindings=row_bindings,
+                next_node_id=allocate_node_id,
+                new_nodes=new_nodes,
+            )
+            right_node = _resolve_or_create_input_create_node(
+                step.node,
+                source_row=source_row,
+                bindings=row_bindings,
+                next_node_id=allocate_node_id,
+                new_nodes=new_nodes,
+            )
+            new_edges.append(
+                EdgeRecord(
+                    edge_id=allocate_edge_id(),
+                    rel_type=step.rel_type,
+                    src_id=left_node.node_id,
+                    dst_id=right_node.node_id,
+                    properties=_resolve_input_create_properties(
+                        step.properties,
+                        source_row=source_row,
+                    ),
+                )
+            )
+        binding_rows.append(dict(source_row) | _node_binding_values(row_bindings, requested_fields))
+
+    graph_service.publish_records(
+        previous_state=state,
+        new_nodes=tuple(new_nodes),
+        new_edges=tuple(new_edges),
+    )
+    if not binding_rows:
+        return input_rows
+    return pa.Table.from_pylist(binding_rows)
+
+
+def _materialize_merge_node_from_input_rows(
+    graph_service: GraphStateUseCase,
+    input_rows: pa.Table,
+    pattern: MergeNodePattern,
+    *,
+    on_create_set_items: tuple[SetItem, ...],
+    on_match_set_items: tuple[SetItem, ...],
+    return_items: tuple[ReturnItem, ...],
+    order_by: tuple[OrderByItem, ...] | None,
+) -> pa.Table:
+    """Materialize row-driven MERGE node imports after WITH."""
+    state = graph_service.load_state()
+    source_rows = input_rows.to_pylist()
+    new_nodes: list[NodeRecord] = []
+    node_updates: list[tuple[int, str, object]] = []
+    binding_rows: list[dict[str, Any]] = []
+    next_node_id = max((node.node_id for node in state.nodes), default=0) + 1
+
+    requested_fields: dict[str, set[str]] = {}
+    _collect_required_fields_from_return_items(return_items, requested_fields)
+    _collect_required_fields_from_order_by(order_by, requested_fields)
+    _merge_required_fields(
+        requested_fields,
+        _required_fields_for_entity_variables(
+            item.variable for item in (*on_create_set_items, *on_match_set_items)
+        ),
+    )
+
+    for source_row in source_rows:
+        resolved_pattern = MergeNodePattern(
+            variable=pattern.variable,
+            labels=pattern.labels,
+            properties=_resolve_input_create_properties(
+                pattern.properties,
+                source_row=source_row,
+            ),
+        )
+        node = _find_input_merge_node(state.nodes, tuple(new_nodes), resolved_pattern)
+        created = node is None
+        if node is None:
+            node = NodeRecord(
+                node_id=next_node_id,
+                labels=resolved_pattern.labels,
+                properties=_resolve_input_merge_set_properties(
+                    resolved_pattern.properties,
+                    variable=pattern.variable,
+                    set_items=on_create_set_items,
+                    source_row=source_row,
+                ),
+            )
+            next_node_id += 1
+            new_nodes.append(node)
+        elif on_match_set_items:
+            updated_properties = _resolve_input_merge_set_properties(
+                node.properties,
+                variable=pattern.variable,
+                set_items=on_match_set_items,
+                source_row=source_row,
+            )
+            for key, value in updated_properties.items():
+                if node.properties.get(key) != value:
+                    node_updates.append((node.node_id, key, value))
+            node = NodeRecord(
+                node_id=node.node_id,
+                labels=node.labels,
+                properties=updated_properties,
+            )
+        row_binding = _node_binding_values(
+            {pattern.variable: node},
+            requested_fields,
+        )
+        binding_rows.append(dict(source_row) | row_binding)
+        if created and on_match_set_items:
+            continue
+
+    if new_nodes:
+        graph_service.publish_records(
+            previous_state=state,
+            new_nodes=tuple(new_nodes),
+            new_edges=(),
+        )
+    if node_updates:
+        graph_service.update_properties_batch(
+            node_updates=tuple(node_updates),
+            edge_updates=(),
+        )
+    if not binding_rows:
+        return input_rows
+    return pa.Table.from_pylist(binding_rows)
+
+
+def _find_input_merge_node(
+    existing_nodes: tuple[NodeRecord, ...],
+    planned_nodes: tuple[NodeRecord, ...],
+    pattern: MergeNodePattern,
+) -> NodeRecord | None:
+    """Find an existing or same-batch node for row-driven MERGE."""
+    for node in (*existing_nodes, *planned_nodes):
+        if _node_matches_merge_pattern(node, pattern):
+            return node
+    return None
+
+
+def _materialize_merge_relationship_from_input_rows(
+    graph_service: GraphStateUseCase,
+    input_rows: pa.Table,
+    pattern: MergeRelationshipPattern,
+    *,
+    on_create_set_items: tuple[SetItem, ...],
+    on_match_set_items: tuple[SetItem, ...],
+    return_items: tuple[ReturnItem, ...],
+    order_by: tuple[OrderByItem, ...] | None,
+) -> pa.Table:
+    """Materialize row-driven MERGE relationship imports after WITH."""
+    if not pattern.left_bound or not pattern.right_bound:
+        raise QueryError("MERGE after WITH currently requires both relationship endpoints bound.")
+
+    state = graph_service.load_state()
+    source_rows = input_rows.to_pylist()
+    new_edges: list[EdgeRecord] = []
+    edge_updates: list[tuple[int, str, object]] = []
+    binding_rows: list[dict[str, Any]] = []
+    next_edge_id = max((edge.edge_id for edge in state.edges), default=0) + 1
+
+    requested_fields: dict[str, set[str]] = {}
+    _collect_required_fields_from_return_items(return_items, requested_fields)
+    _collect_required_fields_from_order_by(order_by, requested_fields)
+    _merge_required_fields(
+        requested_fields,
+        _required_fields_for_entity_variables(
+            item.variable for item in (*on_create_set_items, *on_match_set_items)
+        ),
+    )
+
+    for source_row in source_rows:
+        source_id = _required_node_id_value_from_row(source_row, pattern.left_variable)
+        target_id = _required_node_id_value_from_row(source_row, pattern.right_variable)
+        rel_properties = _resolve_input_create_properties(
+            pattern.properties,
+            source_row=source_row,
+        )
+        edge = _find_input_merge_edge(
+            existing_edges=state.edges,
+            planned_edges=tuple(new_edges),
+            source_id=source_id,
+            target_id=target_id,
+            rel_type=pattern.rel_type,
+            properties=rel_properties,
+        )
+        if edge is None:
+            edge = EdgeRecord(
+                edge_id=next_edge_id,
+                rel_type=pattern.rel_type,
+                src_id=source_id,
+                dst_id=target_id,
+                properties=_resolve_input_merge_set_properties(
+                    rel_properties,
+                    variable=pattern.variable or "",
+                    set_items=on_create_set_items,
+                    source_row=source_row,
+                )
+                if pattern.variable is not None
+                else rel_properties,
+            )
+            next_edge_id += 1
+            new_edges.append(edge)
+        elif pattern.variable is not None and on_match_set_items:
+            updated_properties = _resolve_input_merge_set_properties(
+                edge.properties,
+                variable=pattern.variable,
+                set_items=on_match_set_items,
+                source_row=source_row,
+            )
+            for key, value in updated_properties.items():
+                if edge.properties.get(key) != value:
+                    edge_updates.append((edge.edge_id, key, value))
+            edge = EdgeRecord(
+                edge_id=edge.edge_id,
+                rel_type=edge.rel_type,
+                src_id=edge.src_id,
+                dst_id=edge.dst_id,
+                properties=updated_properties,
+            )
+        row = dict(source_row)
+        if pattern.variable is not None:
+            row |= _edge_binding_values(
+                pattern.variable,
+                edge,
+                requested_fields,
+            )
+        binding_rows.append(row)
+
+    if new_edges:
+        graph_service.publish_records(
+            previous_state=state,
+            new_nodes=(),
+            new_edges=tuple(new_edges),
+        )
+    if edge_updates:
+        graph_service.update_properties_batch(
+            node_updates=(),
+            edge_updates=tuple(edge_updates),
+        )
+    if not binding_rows:
+        return input_rows
+    return pa.Table.from_pylist(binding_rows)
+
+
+def _find_input_merge_edge(
+    *,
+    existing_edges: tuple[EdgeRecord, ...],
+    planned_edges: tuple[EdgeRecord, ...],
+    source_id: int,
+    target_id: int,
+    rel_type: str,
+    properties: Mapping[str, object],
+) -> EdgeRecord | None:
+    """Find an existing or same-batch relationship for row-driven MERGE."""
+    for edge in (*existing_edges, *planned_edges):
+        if edge.src_id != source_id or edge.dst_id != target_id or edge.rel_type != rel_type:
+            continue
+        if _properties_match(edge.properties, dict(properties)):
+            return edge
+    return None
+
+
+def _required_node_id_value_from_row(row: Mapping[str, Any], variable: str) -> int:
+    """Read one node id binding from a row produced by MATCH after WITH."""
+    for field in (_ENTITY_ID_FIELD, _NODE_ID_FIELD):
+        value = row.get(_binding_column_name(variable, field))
+        if isinstance(value, int):
+            return value
+    raise QueryError(f"Bound variable '{variable}' does not resolve to a node id.")
+
+
+def _edge_binding_values(
+    variable: str,
+    edge: EdgeRecord,
+    requested_fields: Mapping[str, set[str]],
+) -> dict[str, Any]:
+    """Convert a merged relationship into row columns consumed by RETURN/ORDER BY."""
+    fields = requested_fields.get(variable)
+    row: dict[str, Any] = {
+        _binding_column_name(variable, _ENTITY_ID_FIELD): edge.edge_id,
+        _binding_column_name(variable, "id"): edge.edge_id,
+    }
+    if fields is None or "type" in fields or _FULL_ENTITY_FIELDS in fields:
+        row[_binding_column_name(variable, "type")] = edge.rel_type
+    if fields is None or "source" in fields or _FULL_ENTITY_FIELDS in fields:
+        row[_binding_column_name(variable, "source")] = edge.src_id
+    if fields is None or "target" in fields or _FULL_ENTITY_FIELDS in fields:
+        row[_binding_column_name(variable, "target")] = edge.dst_id
+    property_fields = edge.properties.keys() if fields is None else fields
+    for field in property_fields:
+        if field in {_ENTITY_ID_FIELD, "id", "type", "source", "target", _FULL_ENTITY_FIELDS}:
+            continue
+        row[_binding_column_name(variable, field)] = edge.properties.get(field)
+    return row
+
+
+def _resolve_input_merge_set_properties(
+    base_properties: Mapping[str, object],
+    *,
+    variable: str,
+    set_items: tuple[SetItem, ...],
+    source_row: Mapping[str, Any],
+) -> dict[str, object]:
+    """Apply MERGE action properties while resolving row references."""
+    properties = dict(base_properties)
+    for item in set_items:
+        if item.variable != variable:
+            raise QueryError(f"MERGE action references an unexpected variable: {item.variable}")
+        if isinstance(item, SetPropertyItem):
+            properties[item.field] = _resolve_input_merge_set_value(
+                item.value,
+                source_row=source_row,
+            )
+            continue
+        if isinstance(item, SetMapMergeItem):
+            properties.update(
+                {
+                    key: _resolve_input_merge_set_value(value, source_row=source_row)
+                    for key, value in item.properties.items()
+                }
+            )
+            continue
+        resolved = _resolve_input_merge_set_value(item.source, source_row=source_row)
+        if not isinstance(resolved, Mapping):
+            raise QueryError("MERGE SET += row requires the row reference to resolve to a map.")
+        properties.update(
+            {
+                key: value
+                for key, value in resolved.items()
+                if isinstance(key, str)
+                and key not in {"id", "labels", "type", "source", "target", "__join_id"}
+            }
+        )
+    return properties
+
+
+def _resolve_input_merge_set_value(
+    value: object,
+    *,
+    source_row: Mapping[str, Any],
+) -> object:
+    """Resolve one MERGE action value against the current WITH row."""
+    if isinstance(value, PropertyReferenceValue):
+        return _resolve_input_create_value(value, source_row=source_row)
+    return value
+
+
+def _can_use_input_row_node_match_fast_path(patterns: tuple[CompiledPattern, ...]) -> bool:
+    """Use a simple row-wise matcher for CSV-style WITH row MATCH node lookups."""
+    return all(isinstance(pattern, NodePattern) for pattern in patterns) and any(
+        _pattern_has_property_reference_values(pattern) for pattern in patterns
+    )
+
+
+def _match_node_patterns_from_input_rows(
+    input_rows: pa.Table,
+    nodes: tuple[NodeRecord, ...],
+    patterns: tuple[CompiledPattern, ...],
+    *,
+    required_fields: Mapping[str, set[str]],
+) -> pa.Table:
+    """Match node patterns whose inline properties reference WITH-row values."""
+    rows: list[dict[str, Any]] = [dict(row) for row in input_rows.to_pylist()]
+    for pattern in patterns:
+        assert isinstance(pattern, NodePattern)
+        expanded_rows: list[dict[str, Any]] = []
+        for row in rows:
+            for node in nodes:
+                if _node_matches_input_row_pattern(node, pattern, row):
+                    expanded_rows.append(
+                        row
+                        | _node_binding_values(
+                            {pattern.variable: node},
+                            required_fields,
+                        )
+                    )
+        rows = expanded_rows
+        if not rows:
+            break
+    if not rows:
+        return input_rows.slice(0, 0)
+    return pa.Table.from_pylist(rows)
+
+
+def _node_matches_input_row_pattern(
+    node: NodeRecord,
+    pattern: NodePattern,
+    row: Mapping[str, Any],
+) -> bool:
+    """Match one node against a pattern that may reference row values."""
+    if pattern.labels and not all(label in node.labels for label in pattern.labels):
+        return False
+    for key, expected in pattern.properties.items():
+        expected_value = (
+            _resolve_input_create_value(expected, source_row=row)
+            if isinstance(expected, PropertyReferenceValue)
+            else expected
+        )
+        if node.properties.get(key) != expected_value:
+            return False
+    return True
+
+
+def _resolve_or_create_input_create_node(
+    pattern: NodePattern,
+    *,
+    source_row: Mapping[str, Any],
+    bindings: dict[str, NodeRecord],
+    next_node_id: Callable[[], int],
+    new_nodes: list[NodeRecord],
+) -> NodeRecord:
+    """Resolve a CREATE node for one row produced by WITH."""
+    existing = bindings.get(pattern.variable)
+    if existing is not None:
+        if pattern.labels or pattern.properties:
+            raise QueryError(
+                "CREATE cannot redefine variable "
+                f"'{pattern.variable}' with inline labels or properties."
+            )
+        return existing
+
+    node = NodeRecord(
+        node_id=next_node_id(),
+        labels=pattern.labels,
+        properties=_resolve_input_create_properties(pattern.properties, source_row=source_row),
+    )
+    bindings[pattern.variable] = node
+    new_nodes.append(node)
+    return node
+
+
+def _resolve_input_create_properties(
+    properties: Mapping[str, object],
+    *,
+    source_row: Mapping[str, Any],
+) -> dict[str, object]:
+    """Resolve inline CREATE properties against one WITH row."""
+    return {
+        key: _resolve_input_create_value(value, source_row=source_row)
+        for key, value in properties.items()
+    }
+
+
+def _resolve_input_create_value(
+    value: object,
+    *,
+    source_row: Mapping[str, Any],
+) -> object:
+    """Resolve a literal or row property reference for CREATE after WITH."""
+    if not isinstance(value, PropertyReferenceValue):
+        return value
+    column = _binding_column_name(value.variable, value.field)
+    if column in source_row:
+        return source_row[column]
+    if value.field == "value" and value.variable in source_row:
+        return source_row[value.variable]
+    scalar_column = _binding_column_name(value.variable, "value")
+    scalar_value = _decode_join_json_value(source_row.get(scalar_column))
+    if isinstance(scalar_value, Mapping):
+        return scalar_value.get(value.field)
+    raise QueryError(f"CREATE references an unknown binding: {value.variable}.{value.field}")
+
+
+def _try_resolve_input_reference_value(
+    value: PropertyReferenceValue,
+    *,
+    source_row: Mapping[str, Any],
+) -> object:
+    """Resolve a row reference, or mark it unresolved until input rows are joined."""
+    try:
+        return _resolve_input_create_value(value, source_row=source_row)
+    except QueryError:
+        return _UNRESOLVED_REFERENCE
+
+
+def _node_binding_values(
+    bindings: Mapping[str, NodeRecord],
+    requested_fields: Mapping[str, set[str]],
+) -> dict[str, Any]:
+    """Convert created nodes into row columns consumed by RETURN/ORDER BY."""
+    row: dict[str, Any] = {}
+    for variable, node in bindings.items():
+        fields = requested_fields.get(variable)
+        row[_binding_column_name(variable, _ENTITY_ID_FIELD)] = node.node_id
+        row[_binding_column_name(variable, _NODE_ID_FIELD)] = node.node_id
+        if fields is None or "labels" in fields or _FULL_ENTITY_FIELDS in fields:
+            row[_binding_column_name(variable, "labels")] = list(node.labels)
+        property_fields = node.properties.keys() if fields is None else fields
+        for field in property_fields:
+            if field in {_ENTITY_ID_FIELD, _NODE_ID_FIELD, "labels", _FULL_ENTITY_FIELDS}:
+                continue
+            row[_binding_column_name(variable, field)] = node.properties.get(field)
+    return row
+
+
 def _resolve_or_create_create_node(
     pattern: NodePattern,
     *,
@@ -6003,7 +8224,7 @@ def _project_value(value: object, field: str | None) -> Any:
                 "labels": list(value.labels),
                 "properties": dict(value.properties),
             }
-        if field == "id":
+        if field in {_ENTITY_ID_FIELD, _NODE_ID_FIELD}:
             return value.node_id
         return value.properties.get(field)
 
@@ -6016,7 +8237,7 @@ def _project_value(value: object, field: str | None) -> Any:
                 "target": value.dst_id,
                 "properties": dict(value.properties),
             }
-        if field == "id":
+        if field in {"id", _ENTITY_ID_FIELD}:
             return value.edge_id
         if field == "type":
             return value.rel_type
@@ -6032,16 +8253,22 @@ def _project_value(value: object, field: str | None) -> Any:
 def _project_node_from_row(record: Mapping[str, Any], variable: str) -> dict[str, Any] | None:
     """Project bindings into the columns or values needed by the next step."""
     prefix = f"{variable}."
-    node_id = record.get(f"{prefix}id")
+    node_id = record.get(_binding_column_name(variable, _NODE_ID_FIELD))
     if node_id is None:
         return None
     labels_value = record.get(f"{prefix}labels")
     labels = _decode_labels(labels_value)
     properties = {
-        column.removeprefix(prefix): value
+        column.removeprefix(prefix): _decode_join_json_value(value)
         for column, value in record.items()
         if column.startswith(prefix)
-        and column not in {f"{prefix}id", f"{prefix}labels", f"{prefix}__join_id"}
+        and column
+        not in {
+            _binding_column_name(variable, _ENTITY_ID_FIELD),
+            _binding_column_name(variable, _NODE_ID_FIELD),
+            f"{prefix}labels",
+            f"{prefix}__join_id",
+        }
         and value is not None
     }
     return {
@@ -6058,7 +8285,7 @@ def _project_edge_from_row(record: Mapping[str, Any], variable: str) -> dict[str
     if edge_id is None:
         return None
     properties = {
-        column.removeprefix(prefix): value
+        column.removeprefix(prefix): _decode_join_json_value(value)
         for column, value in record.items()
         if column.startswith(prefix)
         and column
@@ -6127,7 +8354,7 @@ def _project_bound_field_from_row(record: Mapping[str, Any], variable: str, fiel
         if value is None:
             return None
         return _decode_labels(value)
-    return value
+    return _decode_join_json_value(value)
 
 
 def _project_bound_field_values_from_table(
@@ -6145,7 +8372,7 @@ def _project_bound_field_values_from_table(
     values = cast(list[Any], column.to_pylist())
     if field == "labels":
         return [None if value is None else _decode_labels(value) for value in values]
-    return values
+    return [_decode_join_json_value(value) for value in values]
 
 
 def _project_with_items_table(table: pa.Table, with_items: tuple[WithItem, ...]) -> pa.Table:
@@ -6172,13 +8399,29 @@ def _project_with_items_table(table: pa.Table, with_items: tuple[WithItem, ...])
             field=item.source_field,
         )
         if source_array is None:
-            source_column = _binding_column_name(item.source_variable, item.source_field)
-            raise QueryError(f"WITH references an unknown scalar binding: {source_column}")
+            if _has_bound_variable_columns(table, item.source_variable):
+                source_array = pa.nulls(table.num_rows)
+            else:
+                source_column = _binding_column_name(item.source_variable, item.source_field)
+                raise QueryError(f"WITH references an unknown scalar binding: {source_column}")
         columns[_binding_column_name(item.output_name, "value")] = source_array
 
     if columns:
         return pa.table(columns)
     return table.slice(0, 0)
+
+
+def _has_bound_variable_columns(table: pa.Table, variable: str) -> bool:
+    """Return true when the table still carries any binding for this variable."""
+    prefix = f"{variable}."
+    return any(column_name.startswith(prefix) for column_name in table.column_names)
+
+
+def _null_array_for_missing_bound_field(table: pa.Table, variable: str) -> pa.Array | None:
+    """Return nulls for a missing property on an existing binding, else none."""
+    if not _has_bound_variable_columns(table, variable):
+        return None
+    return pa.nulls(table.num_rows)
 
 
 def _build_optional_null_table(column_names: list[str]) -> pa.Table:
@@ -6238,7 +8481,7 @@ def _pattern_null_columns(patterns: tuple[CompiledPattern, ...]) -> list[str]:
 def _node_null_columns(variable: str) -> list[str]:
     """Handle node-specific matching, projection, or lookup logic for Cypher."""
     return [
-        _binding_column_name(variable, "id"),
+        _binding_column_name(variable, _NODE_ID_FIELD),
         _binding_column_name(variable, "__join_id"),
         _binding_column_name(variable, "labels"),
     ]
@@ -6259,8 +8502,82 @@ def _decode_labels(value: object) -> list[str]:
     if value is None:
         return []
     if isinstance(value, str):
-        return cast(list[str], json.loads(value))
-    return list(cast(list[str], value))
+        labels = cast(list[str], json.loads(value))
+    else:
+        labels = list(cast(list[str], value))
+    return [_cypher_name(label) for label in labels]
+
+
+def _decode_join_json_value(value: object) -> object:
+    """Decode nested values temporarily stringified before Arrow joins."""
+    if isinstance(value, str) and value.startswith(_JOIN_JSON_PREFIX):
+        return json.loads(value.removeprefix(_JOIN_JSON_PREFIX))
+    return value
+
+
+def _normalize_property_map(properties: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize escaped Cypher property keys loaded from existing graph files."""
+    return {_cypher_name(str(key)): value for key, value in properties.items()}
+
+
+def _property_keys_from_record(record: Mapping[str, Any], variable: str) -> list[str]:
+    """Return non-null property names for a bound node or relationship row."""
+    prefix = f"{variable}."
+    reserved = _reserved_property_fields_for_record(record, variable)
+    return [
+        column.removeprefix(prefix)
+        for column, value in record.items()
+        if column.startswith(prefix)
+        and column.removeprefix(prefix) not in reserved
+        and value is not None
+    ]
+
+
+def _property_keys_array_from_table(table: pa.Table, variable: str) -> pa.Array:
+    """Build a list<string> array containing property names present on each row."""
+    property_columns = [
+        column_name
+        for column_name in table.column_names
+        if column_name.startswith(f"{variable}.")
+        and column_name.removeprefix(f"{variable}.")
+        not in _reserved_property_fields_for_table(table, variable)
+    ]
+    if not property_columns:
+        return pa.array([[] for _ in range(table.num_rows)], type=pa.list_(pa.string()))
+
+    source_rows = table.select(property_columns).to_pylist()
+    return pa.array(
+        [
+            [
+                column.removeprefix(f"{variable}.")
+                for column, value in row.items()
+                if value is not None
+            ]
+            for row in source_rows
+        ],
+        type=pa.list_(pa.string()),
+    )
+
+
+def _reserved_property_fields_for_record(
+    record: Mapping[str, Any],
+    variable: str,
+) -> set[str]:
+    """Return technical fields that are not user properties for this binding."""
+    if _binding_column_name(variable, "labels") in record:
+        return {_ENTITY_ID_FIELD, _NODE_ID_FIELD, "__join_id", "labels"}
+    if _binding_column_name(variable, "type") in record:
+        return {"id", "type", "source", "target"}
+    return set()
+
+
+def _reserved_property_fields_for_table(table: pa.Table, variable: str) -> set[str]:
+    """Return technical fields that are not user properties for this binding table."""
+    if _is_node_binding_table(table, variable):
+        return {_ENTITY_ID_FIELD, _NODE_ID_FIELD, "__join_id", "labels"}
+    if _is_edge_binding_table(table, variable):
+        return {"id", "type", "source", "target"}
+    return set()
 
 
 def _encode_function_field(function_name: str, source_field: str) -> str:
@@ -6286,6 +8603,15 @@ def _resolve_record_field_value(
     field: str,
 ) -> Any:
     """Resolve this reference into the concrete value or array used downstream."""
+    if field == "keys":
+        return _property_keys_from_record(record, variable)
+
+    if field == _ENTITY_ID_FIELD:
+        node_id = record.get(_binding_column_name(variable, _NODE_ID_FIELD))
+        if node_id is not None:
+            return node_id
+        return record.get(_binding_column_name(variable, "id"))
+
     function_field = _decode_function_field(field)
     if function_field is None:
         return record.get(_binding_column_name(variable, field))
@@ -6302,6 +8628,22 @@ def _resolve_table_field_array(
     field: str,
 ) -> pa.ChunkedArray | pa.Array | None:
     """Resolve this reference into the concrete value or array used downstream."""
+    if field == "keys":
+        if not _is_node_binding_table(table, variable) and not _is_edge_binding_table(
+            table, variable
+        ):
+            return None
+        return _property_keys_array_from_table(table, variable)
+
+    if field == _ENTITY_ID_FIELD:
+        node_column = _binding_column_name(variable, _NODE_ID_FIELD)
+        if node_column in table.column_names:
+            return table[node_column]
+        edge_column = _binding_column_name(variable, "id")
+        if edge_column in table.column_names:
+            return table[edge_column]
+        return None
+
     function_field = _decode_function_field(field)
     if function_field is None:
         column_name = _binding_column_name(variable, field)
@@ -6327,6 +8669,10 @@ def _ensure_order_column(
     function_field = _decode_function_field(field)
     if function_field is None:
         column_name = _binding_column_name(variable, field)
+        if field == _ENTITY_ID_FIELD and column_name not in table.column_names:
+            node_id_column = _binding_column_name(variable, _NODE_ID_FIELD)
+            if node_id_column in table.column_names:
+                return table, node_id_column
         if column_name not in table.column_names:
             raise QueryError(f"ORDER BY references an unknown binding: {column_name}")
         return table, column_name
@@ -6415,6 +8761,10 @@ def _parse_value(text: str, params: dict[str, object]) -> object:
     if text.startswith("$"):
         return _resolve_parameter(text, params)
 
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*", text):
+        variable, field = _parse_property_reference(text)
+        return PropertyReferenceValue(variable=variable, field=field)
+
     if text.startswith("{") and text.endswith("}"):
         return _parse_map_literal(text, params)
 
@@ -6429,6 +8779,9 @@ def _parse_value(text: str, params: dict[str, object]) -> object:
         return False
     if text.upper() == "NULL":
         return None
+
+    if _IDENTIFIER_RE.fullmatch(text):
+        return PropertyReferenceValue(variable=text, field="value")
 
     if re.fullmatch(r"-?\d+", text):
         return int(text)
@@ -6597,7 +8950,14 @@ def _parse_property_reference(text: str) -> tuple[str, str]:
     if "." not in text:
         raise QueryError(f"Expected property reference, got: {text}")
     variable, field = text.split(".", 1)
-    return variable.strip(), field.strip()
+    return variable.strip(), _cypher_name(field.strip())
+
+
+def _cypher_name(text: str) -> str:
+    """Normalize escaped Cypher schema/property names to their semantic value."""
+    if len(text) >= 2 and text.startswith("`") and text.endswith("`"):
+        return text[1:-1].replace("``", "`")
+    return text
 
 
 def _binding_column_name(variable: str, field: str) -> str:
@@ -6638,6 +8998,18 @@ def _extend_scope_with_patterns(
                     f"MATCH after WITH cannot reuse scalar binding '{variable}' as a graph entity."
                 )
             scope[variable] = "entity"
+    return scope
+
+
+def _extend_scope_with_create_patterns(
+    base_scope: Mapping[str, ScopeBindingKind],
+    create_patterns: tuple[CreateRelationshipPattern, ...],
+) -> dict[str, ScopeBindingKind]:
+    """Add variables introduced by MATCH ... CREATE to the RETURN/ORDER BY scope."""
+    scope = dict(base_scope)
+    for pattern in create_patterns:
+        scope[pattern.left_variable] = "entity"
+        scope[pattern.right_variable] = "entity"
     return scope
 
 
@@ -6745,7 +9117,7 @@ def _ensure_join_id_column(table: pa.Table, variable: str) -> pa.Table:
     join_column = _binding_column_name(variable, "__join_id")
     if join_column in table.column_names:
         return table
-    id_column = _binding_column_name(variable, "id")
+    id_column = _binding_column_name(variable, _NODE_ID_FIELD)
     if id_column not in table.column_names:
         return table
     return table.append_column(join_column, table[id_column])
@@ -6855,7 +9227,7 @@ def _node_binding_table(
             requested_fields=requested_fields,
         )
     node_records = cast(tuple[NodeRecord, ...], nodes)
-    reserved_fields = {"id", "__join_id", "labels"}
+    reserved_fields = {_NODE_ID_FIELD, _ENTITY_ID_FIELD, "__join_id", "labels"}
     if requested_fields is None:
         property_names = sorted({key for node in node_records for key in node.properties})
     else:
@@ -6867,7 +9239,7 @@ def _node_binding_table(
         )
     rows = [
         {
-            _binding_column_name(variable, "id"): node.node_id,
+            _binding_column_name(variable, _NODE_ID_FIELD): node.node_id,
             _binding_column_name(variable, "__join_id"): node.node_id,
             _binding_column_name(variable, "labels"): json.dumps(list(node.labels)),
             **{
@@ -6881,7 +9253,7 @@ def _node_binding_table(
         return pa.Table.from_pylist(rows)
     return pa.table(
         {
-            _binding_column_name(variable, "id"): pa.array([], type=pa.int64()),
+            _binding_column_name(variable, _NODE_ID_FIELD): pa.array([], type=pa.int64()),
             _binding_column_name(variable, "__join_id"): pa.array([], type=pa.int64()),
             _binding_column_name(variable, "labels"): pa.array([], type=pa.string()),
         }
@@ -6964,9 +9336,15 @@ def _node_binding_table_from_canonical_table(
     requested_fields: set[str] | None,
 ) -> pa.Table:
     """Handle node-specific matching, projection, or lookup logic for Cypher."""
-    labels_values = table["labels"].to_pylist()
-    properties = [json.loads(value) for value in table["properties_json"].to_pylist()]
-    reserved_fields = {"id", "__join_id", "labels"}
+    labels_values = [
+        [_cypher_name(label) for label in (labels or [])]
+        for labels in table["labels"].to_pylist()
+    ]
+    properties = [
+        _normalize_property_map(json.loads(value))
+        for value in table["properties_json"].to_pylist()
+    ]
+    reserved_fields = {_NODE_ID_FIELD, _ENTITY_ID_FIELD, "__join_id", "labels"}
     if requested_fields is None:
         property_names = sorted({key for item in properties for key in item})
     else:
@@ -6978,7 +9356,8 @@ def _node_binding_table_from_canonical_table(
         )
 
     columns: dict[str, pa.Array | pa.ChunkedArray] = {
-        _binding_column_name(variable, "id"): table["node_id"],
+        _binding_column_name(variable, _ENTITY_ID_FIELD): table["node_id"],
+        _binding_column_name(variable, _NODE_ID_FIELD): table["node_id"],
         _binding_column_name(variable, "__join_id"): table["node_id"],
         _binding_column_name(variable, "labels"): pa.array(
             [json.dumps(list(labels or [])) for labels in labels_values],
@@ -6999,8 +9378,12 @@ def _can_use_node_property_projection(
     """Check whether the optimized or semantically valid path applies here."""
     if requested_fields is None or len(pattern.labels) != 1:
         return False
+    if any(isinstance(value, PropertyReferenceValue) for value in pattern.properties.values()):
+        return False
     property_fields = {
-        field for field in requested_fields if field not in {"id", "__join_id", "labels"}
+        field
+        for field in requested_fields
+        if field not in {_NODE_ID_FIELD, _ENTITY_ID_FIELD, "__join_id", "labels"}
     }
     if pattern.properties:
         property_fields.update(pattern.properties)
@@ -7021,7 +9404,8 @@ def _node_binding_table_from_property_projection(
     if filtered.num_rows == 0:
         return pa.table(
             {
-                _binding_column_name(variable, "id"): pa.array([], type=pa.int64()),
+                _binding_column_name(variable, _ENTITY_ID_FIELD): pa.array([], type=pa.int64()),
+                _binding_column_name(variable, _NODE_ID_FIELD): pa.array([], type=pa.int64()),
                 _binding_column_name(variable, "__join_id"): pa.array([], type=pa.int64()),
                 _binding_column_name(variable, "labels"): pa.array([], type=pa.string()),
             }
@@ -7030,7 +9414,8 @@ def _node_binding_table_from_property_projection(
     labels_values = filtered["labels"].to_pylist()
     base = pa.table(
         {
-            _binding_column_name(variable, "id"): filtered["node_id"],
+            _binding_column_name(variable, _ENTITY_ID_FIELD): filtered["node_id"],
+            _binding_column_name(variable, _NODE_ID_FIELD): filtered["node_id"],
             _binding_column_name(variable, "__join_id"): filtered["node_id"],
             _binding_column_name(variable, "labels"): pa.array(
                 [json.dumps(list(labels or [])) for labels in labels_values],
@@ -7045,18 +9430,22 @@ def _node_binding_table_from_property_projection(
             "node_id": property_table["node_id"],
         }
         for field in sorted(
-            field for field in requested_fields if field not in {"id", "__join_id", "labels"}
+            field
+            for field in requested_fields
+            if field not in {_NODE_ID_FIELD, _ENTITY_ID_FIELD, "__join_id", "labels"}
         ):
             if field in property_table.column_names:
                 projection_columns[field] = property_table[field]
         projected = base.join(
             pa.table(projection_columns),
-            keys=_binding_column_name(variable, "id"),
+            keys=_binding_column_name(variable, _NODE_ID_FIELD),
             right_keys="node_id",
             join_type="left outer",
         )
     for field in sorted(
-        field for field in requested_fields if field not in {"id", "__join_id", "labels"}
+        field
+        for field in requested_fields
+        if field not in {_NODE_ID_FIELD, _ENTITY_ID_FIELD, "__join_id", "labels"}
     ):
         column_name = _binding_column_name(variable, field)
         if field in projected.column_names and column_name not in projected.column_names:
@@ -7085,11 +9474,15 @@ def _can_project_requested_node_fields(
     """Check whether the optimized or semantically valid path applies here."""
     if "node_id" not in property_table.column_names:
         return False
+    if not pa.types.is_int64(property_table["node_id"].type):
+        return False
 
     required_fields = set(pattern.properties)
     if requested_fields is not None:
         required_fields.update(
-            field for field in requested_fields if field not in {"id", "__join_id", "labels"}
+            field
+            for field in requested_fields
+            if field not in {_NODE_ID_FIELD, _ENTITY_ID_FIELD, "__join_id", "labels"}
         )
     return required_fields.issubset(set(property_table.column_names))
 
@@ -7176,14 +9569,13 @@ def _canonical_labels_contains_all_mask(
 
 def _canonical_label_membership_mask(column: pa.Array, value: str) -> pa.Array:
     """Check whether the optimized or semantically valid path applies here."""
-    parent_indices = pc.list_parent_indices(column)
-    flattened = pc.list_flatten(column)
-    matching_values = pc.equal(flattened, pa.scalar(value))
-    matching_parent_indices = pc.filter(parent_indices, matching_values)
-    matching_row_ids = pc.unique(matching_parent_indices)
-    row_ids = pa.array(range(len(column)), type=pa.int64())
-    result = pc.is_in(row_ids, value_set=matching_row_ids)
-    return pc.fill_null(result, False)
+    return pa.array(
+        [
+            any(_cypher_name(label) == value for label in (labels or []))
+            for labels in column.to_pylist()
+        ],
+        type=pa.bool_(),
+    )
 
 
 def _edge_binding_table_from_canonical_table(
@@ -7193,7 +9585,10 @@ def _edge_binding_table_from_canonical_table(
     requested_fields: set[str] | None,
 ) -> pa.Table:
     """Handle edge-specific matching, projection, or lookup logic for Cypher."""
-    properties = [json.loads(value) for value in table["properties_json"].to_pylist()]
+    properties = [
+        _normalize_property_map(json.loads(value))
+        for value in table["properties_json"].to_pylist()
+    ]
     reserved_fields = {"id", "type", "source", "target"}
     if requested_fields is None:
         property_names = sorted({key for item in properties for key in item})
@@ -7207,7 +9602,10 @@ def _edge_binding_table_from_canonical_table(
 
     columns: dict[str, pa.Array | pa.ChunkedArray] = {
         f"{prefix}.id": table["edge_id"],
-        f"{prefix}.type": table["rel_type"],
+        f"{prefix}.type": pa.array(
+            [_cypher_name(value) for value in table["rel_type"].to_pylist()],
+            type=pa.string(),
+        ),
         f"{prefix}.source": table["src_id"],
         f"{prefix}.target": table["dst_id"],
     }
@@ -7220,6 +9618,9 @@ def _edge_binding_table_from_canonical_table(
 
 def _apply_node_pattern_filter(table: pa.Table, pattern: NodePattern) -> pa.Table:
     """Apply this transformation or predicate inside the Cypher pipeline."""
+    if any(isinstance(value, PropertyReferenceValue) for value in pattern.properties.values()):
+        return _apply_node_pattern_reference_filter(table, pattern)
+
     masks: list[pa.Array] = []
     if pattern.labels:
         label_column = _binding_column_name(pattern.variable, "labels")
@@ -7233,6 +9634,33 @@ def _apply_node_pattern_filter(table: pa.Table, pattern: NodePattern) -> pa.Tabl
             return table.slice(0, 0)
         masks.append(_comparison_mask(table[column_name], "=", value))
     return _filter_table_with_masks(table, masks)
+
+
+def _apply_node_pattern_reference_filter(table: pa.Table, pattern: NodePattern) -> pa.Table:
+    """Apply a node pattern filter whose inline properties reference row bindings."""
+    if table.num_rows == 0:
+        return table
+    keep: list[bool] = []
+    for row in table.to_pylist():
+        if pattern.labels:
+            labels = row.get(_binding_column_name(pattern.variable, "labels"))
+            if not isinstance(labels, list) or not all(label in labels for label in pattern.labels):
+                keep.append(False)
+                continue
+        matched = True
+        for key, expected in pattern.properties.items():
+            actual = row.get(_binding_column_name(pattern.variable, key))
+            if isinstance(expected, PropertyReferenceValue):
+                expected_value = _try_resolve_input_reference_value(expected, source_row=row)
+                if expected_value is _UNRESOLVED_REFERENCE:
+                    continue
+            else:
+                expected_value = expected
+            if actual != expected_value:
+                matched = False
+                break
+        keep.append(matched)
+    return table.filter(pa.array(keep, type=pa.bool_()))
 
 
 def _apply_edge_pattern_filter(table: pa.Table, prefix: str, step: RelationshipStep) -> pa.Table:
@@ -7256,7 +9684,7 @@ def _apply_existing_binding_filter(
     pattern: NodePattern,
 ) -> pa.Table:
     """Apply this transformation or predicate inside the Cypher pipeline."""
-    node_id_column = _binding_column_name(pattern.variable, "id")
+    node_id_column = _binding_column_name(pattern.variable, _NODE_ID_FIELD)
     masks = [_comparison_mask(table[node_id_column], "=", table[edge_target_column])]
 
     label_column = _binding_column_name(pattern.variable, "labels")
@@ -7269,6 +9697,23 @@ def _apply_existing_binding_filter(
             return table.slice(0, 0)
         masks.append(_comparison_mask(table[column_name], "=", value))
     return _filter_table_with_masks(table, masks)
+
+
+def _ensure_edge_source_column(
+    table: pa.Table,
+    *,
+    edge_prefix: str,
+    source_variable: str,
+    endpoint: str = "source",
+) -> pa.Table:
+    """Restore relationship endpoint ids when Arrow drops the right join key."""
+    endpoint_column = f"{edge_prefix}.{endpoint}"
+    if endpoint_column in table.column_names:
+        return table
+    node_id_column = _binding_column_name(source_variable, _NODE_ID_FIELD)
+    if node_id_column not in table.column_names:
+        return table
+    return table.append_column(endpoint_column, table[node_id_column])
 
 
 def _apply_where_predicate_table(
@@ -7447,10 +9892,11 @@ def _label_membership_mask(
     column: pa.ChunkedArray,
     value: str,
 ) -> pa.Array:
-    # Labels are stored as a canonical JSON string in the binding table, so a
-    # quoted JSON token match preserves exact membership while staying Arrow-native.
     """Support the current Cypher compilation or execution step."""
-    return _string_predicate_mask(column, "contains", json.dumps(value))
+    return pa.array(
+        [value in _decode_labels(labels) for labels in column.to_pylist()],
+        type=pa.bool_(),
+    )
 
 
 def _exists_mask(column: pa.ChunkedArray) -> pa.Array:

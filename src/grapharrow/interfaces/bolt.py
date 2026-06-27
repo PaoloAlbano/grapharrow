@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import socketserver
 import struct
@@ -18,6 +19,7 @@ from grapharrow.config import GraphArrowSettings
 from grapharrow.core.errors import GraphArrowError
 from grapharrow.interfaces.cypher_guard import query_requires_write
 from grapharrow.use_cases import CypherQueryUseCase, GraphTransactionUseCase
+from grapharrow.use_cases import cypher as cypher_module
 from grapharrow.use_cases.graph import GraphState
 
 BOLT_MAGIC = bytes.fromhex("6060B017")
@@ -49,8 +51,9 @@ class BoltInterfaceApplication:
     host: str
     port: int
     auth_token: str | None
-    server_agent: str = "GraphArrow/0.1.0"
+    server_agent: str = "Neo4j/5.26.0"
     database_name: str = "grapharrow"
+    log_queries: bool = True
 
 
 @dataclass(slots=True)
@@ -262,9 +265,15 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
         """Drive the per-connection Bolt loop from handshake through message dispatch."""
         server = cast(GraphArrowBoltServer, self.server)
         state = _ConnectionState()
+        _bolt_log(
+            server,
+            f"connection opened from {self.client_address[0]}:{self.client_address[1]}",
+        )
         try:
             if not self._negotiate_protocol():
+                _bolt_log(server, "handshake rejected")
                 return
+            _bolt_log(server, "handshake accepted")
             while not state.closed:
                 payload = _recv_message(self.request)
                 if payload is None:
@@ -276,6 +285,8 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
                 self._dispatch(server, state, message)
         except (ConnectionError, OSError):
             return
+        finally:
+            _bolt_log(server, "connection closed")
 
     def _negotiate_protocol(self) -> bool:
         """Accept the handshake only when the client offers a Bolt version we support."""
@@ -422,6 +433,7 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
             self._fail(state, "RUN query must be a string and parameters a dictionary.")
             return
 
+        _bolt_query_log(server, query, parameters)
         try:
             executor = state.transaction_cypher or server.bolt_app.grapharrow.use_cases.cypher
             statement_type = _statement_type_for_query(query)
@@ -434,10 +446,21 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
             )
         except GraphArrowError as exc:
             state.failed = True
+            _bolt_log(server, f"query failed: {exc}")
             _send_failure(
                 self.request,
                 self.codec,
                 code="GraphArrow.QueryError",
+                message=str(exc),
+            )
+            return
+        except Exception as exc:
+            state.failed = True
+            _bolt_log(server, f"internal error: {exc}")
+            _send_failure(
+                self.request,
+                self.codec,
+                code="GraphArrow.InternalError",
                 message=str(exc),
             )
             return
@@ -499,6 +522,15 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
                 message=str(exc),
             )
             return
+        except Exception as exc:
+            state.failed = True
+            _send_failure(
+                self.request,
+                self.codec,
+                code="GraphArrow.InternalError",
+                message=str(exc),
+            )
+            return
         finally:
             state.transaction = None
             state.transaction_cypher = None
@@ -554,7 +586,10 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
 
         batch = remaining[:limit]
         for row in batch:
-            values = [row.get(column) for column in pending.columns]
+            values = [
+                _packstream_result_value(column, row.get(column))
+                for column in pending.columns
+            ]
             _send_message(self.request, self.codec, PackstreamStructure(RECORD, [values]))
 
         pending.index += len(batch)
@@ -603,6 +638,7 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
     def _fail(self, state: _ConnectionState, message: str) -> None:
         """Mark the connection as failed and send a Bolt FAILURE frame to the client."""
         state.failed = True
+        _bolt_log(cast(GraphArrowBoltServer, self.server), f"protocol failure: {message}")
         _send_failure(
             self.request,
             self.codec,
@@ -668,7 +704,9 @@ def build_bolt_application(
         host=resolved_settings.bolt_host,
         port=resolved_settings.bolt_port,
         auth_token=resolved_settings.bolt_auth_token,
+        server_agent=resolved_settings.bolt_server_agent,
         database_name=_database_name_from_root(grapharrow.layout.root),
+        log_queries=resolved_settings.bolt_log_queries,
     )
 
 
@@ -678,6 +716,14 @@ def start_bolt_server(application: BoltInterfaceApplication) -> BoltServerHandle
     server = GraphArrowBoltServer((application.host, application.port), application)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    bound_host = cast(str, server.server_address[0])
+    _bolt_log(
+        server,
+        (
+            f"listening on {bound_host}:{server.server_address[1]} "
+            f"db={application.database_name!r} agent={application.server_agent!r}"
+        ),
+    )
     return BoltServerHandle(server=server, thread=thread)
 
 
@@ -706,6 +752,16 @@ def main() -> int:
     parser.add_argument("--path", default=None, help="Database directory served by Bolt.")
     parser.add_argument("--host", default=None, help="Bolt host override.")
     parser.add_argument("--port", type=int, default=None, help="Bolt port override.")
+    parser.add_argument(
+        "--server-agent",
+        default=None,
+        help="Bolt HELLO server agent advertised to clients.",
+    )
+    parser.add_argument(
+        "--no-query-log",
+        action="store_true",
+        help="Disable stdout logging for Bolt RUN statements.",
+    )
     args = parser.parse_args()
 
     settings = GraphArrowSettings()
@@ -718,14 +774,46 @@ def main() -> int:
             "database_path": database_path,
             "bolt_host": args.host or settings.bolt_host,
             "bolt_port": args.port or settings.bolt_port,
+            "bolt_server_agent": args.server_agent or settings.bolt_server_agent,
+            "bolt_log_queries": False
+            if args.no_query_log
+            else settings.bolt_log_queries,
         }
     )
     handle = start_bolt_server(build_bolt_application(database_path, settings=resolved_settings))
+    if resolved_settings.bolt_log_queries:
+        print(
+            "[grapharrow-bolt] runtime "
+            f"cwd={os.getcwd()!r} "
+            f"db={str(database_path)!r} "
+            f"bolt_module={__file__!r} "
+            f"cypher_module={cypher_module.__file__!r}",
+            flush=True,
+        )
     try:
         handle.thread.join()
     except KeyboardInterrupt:
         handle.stop()
+        print("[grapharrow-bolt] stopped", flush=True)
     return 0
+
+
+def _bolt_log(server: GraphArrowBoltServer, message: str) -> None:
+    """Emit lightweight Bolt operational logs to stdout for local debugging."""
+
+    print(f"[grapharrow-bolt] {message}", flush=True)
+
+
+def _bolt_query_log(
+    server: GraphArrowBoltServer,
+    query: str,
+    parameters: dict[str, Any],
+) -> None:
+    """Log RUN statements when query logging is enabled for this server."""
+
+    if not server.bolt_app.log_queries:
+        return
+    _bolt_log(server, f"RUN {query!r} params={sorted(parameters.keys())}")
 
 
 def _version_matches(candidate: bytes) -> bool:
@@ -793,6 +881,64 @@ def _send_success(
 ) -> None:
     """Send a Bolt SUCCESS response with the supplied metadata payload."""
     _send_message(sock, codec, PackstreamStructure(SUCCESS, [metadata]))
+
+
+def _packstream_result_value(column: str, value: Any) -> Any:
+    """Convert schema procedure payloads into native Bolt graph structures."""
+    if column == "nodes" and isinstance(value, list):
+        return [_node_to_packstream(item) for item in value]
+    if column == "relationships" and isinstance(value, list):
+        return [_relationship_to_packstream(item) for item in value]
+    converted = _node_to_packstream(value)
+    if converted is not value:
+        return converted
+    return _relationship_to_packstream(value)
+
+
+def _node_to_packstream(value: Any) -> Any:
+    """Encode one node map as a Bolt Node structure when possible."""
+    if not isinstance(value, dict):
+        return value
+    node_id = value.get("id")
+    labels = value.get("labels")
+    properties = value.get("properties")
+    if (
+        not isinstance(node_id, int)
+        or not isinstance(labels, list)
+        or not isinstance(properties, dict)
+    ):
+        return value
+    return PackstreamStructure(
+        signature=ord("N"),
+        fields=[node_id, labels, properties],
+    )
+
+
+def _relationship_to_packstream(value: Any) -> Any:
+    """Encode one relationship map as a Bolt Relationship structure when possible."""
+    if not isinstance(value, dict):
+        return value
+    rel_id = value.get("id")
+    start = value.get("start")
+    end = value.get("end")
+    rel_type = value.get("type")
+    properties = value.get("properties")
+    if start is None:
+        start = value.get("source")
+    if end is None:
+        end = value.get("target")
+    if (
+        not isinstance(rel_id, int)
+        or not isinstance(start, int)
+        or not isinstance(end, int)
+        or not isinstance(rel_type, str)
+        or not isinstance(properties, dict)
+    ):
+        return value
+    return PackstreamStructure(
+        signature=ord("R"),
+        fields=[rel_id, start, end, rel_type, properties],
+    )
 
 
 def _send_failure(

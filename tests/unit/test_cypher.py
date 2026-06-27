@@ -5,6 +5,7 @@ import pytest
 from grapharrow import Database
 from grapharrow.adapters import parse_cypher
 from grapharrow.core.errors import QueryError, TransactionError
+from grapharrow.interfaces.cypher_guard import query_requires_write
 from grapharrow.use_cases.cypher import (
     CompiledMatchOptionalQuery,
     CompiledMatchQuery,
@@ -1308,6 +1309,68 @@ def test_read_transaction_rejects_set_queries(tmp_path: Path) -> None:
             session.query("MATCH (n:Person) SET n.age = 31 RETURN n")
 
 
+def test_match_remove_deletes_node_property_and_returns_null_projection(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query("CREATE (n:Person {name: 'Alice', temp: true}) RETURN n")
+        result = session.query("MATCH (n:Person) REMOVE n.temp RETURN n.temp, n.name")
+
+    assert result.columns == ("n.temp", "n.name")
+    assert result.rows == ({"n.temp": None, "n.name": "Alice"},)
+
+    with database.read_transaction() as session:
+        persisted = session.query("MATCH (n:Person) RETURN keys(n) AS keys")
+
+    assert persisted.rows == ({"keys": ["name"]},)
+
+
+def test_match_remove_deletes_relationship_property(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query(
+            "CREATE (a:Person {name: 'Alice'})-[:KNOWS {temp: true, since: 2024}]->"
+            "(b:Person {name: 'Bob'}) RETURN a"
+        )
+        result = session.query(
+            "MATCH (:Person)-[r:KNOWS]->(:Person) REMOVE r.temp RETURN r.temp, r.since"
+        )
+
+    assert result.rows == ({"r.temp": None, "r.since": 2024},)
+
+    with database.read_transaction() as session:
+        persisted = session.query("MATCH (:Person)-[r:KNOWS]->(:Person) RETURN keys(r) AS keys")
+
+    assert persisted.rows == ({"keys": ["since"]},)
+
+
+def test_match_remove_label_deletes_node_label(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query("CREATE (n:Person:Temp {name: 'Alice'}) RETURN n")
+        result = session.query("MATCH (n:Temp) REMOVE n:Temp RETURN labels(n) AS labels")
+
+    assert result.rows == ({"labels": ["Person"]},)
+
+    with database.read_transaction() as session:
+        persisted = session.query("MATCH (n) RETURN labels(n) AS labels, n.name")
+
+    assert persisted.rows == ({"labels": ["Person"], "n.name": "Alice"},)
+
+
+def test_read_transaction_rejects_remove_queries(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query("CREATE (n:Person {name: 'Alice', temp: true}) RETURN n")
+
+    with database.read_transaction() as session:
+        with pytest.raises(TransactionError, match="write transaction"):
+            session.query("MATCH (n:Person) REMOVE n.temp RETURN n")
+
+
 def test_match_delete_removes_relationship_and_returns_deleted_count(tmp_path: Path) -> None:
     database = Database(tmp_path / "example-db")
 
@@ -1911,6 +1974,62 @@ def test_match_supports_labels_function_in_return(tmp_path: Path) -> None:
     assert result.rows == ({"labels": ["Person", "Employee"]},)
 
 
+def test_match_supports_keys_function_for_lab_internal_node_variable(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.add_node(
+            labels=["Person"],
+            properties={"age": 42, "name": "Alice"},
+        )
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (APP_INTERNAL_EXEC_VAR:Person) "
+            "RETURN keys(APP_INTERNAL_EXEC_VAR) AS property_keys"
+        )
+
+    assert result.columns == ("property_keys",)
+    assert result.rows == ({"property_keys": ["age", "name"]},)
+
+
+def test_match_with_entity_alias_supports_keys_function_for_lab_schema_query(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.add_node(labels=["Product"], properties={"id": "prod_1", "name": "Widget"})
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (n:Product) "
+            "WITH n AS APP_INTERNAL_EXEC_VAR "
+            "RETURN keys(APP_INTERNAL_EXEC_VAR) AS property_keys"
+        )
+
+    assert result.rows == ({"property_keys": ["id", "name"]},)
+
+
+def test_match_supports_keys_function_for_relationships(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        alice = session.add_node(labels=["Person"], properties={"name": "Alice"})
+        bob = session.add_node(labels=["Person"], properties={"name": "Bob"})
+        session.add_edge(
+            src=alice["id"],
+            rel_type="KNOWS",
+            dst=bob["id"],
+            properties={"since": 2024, "weight": 0.9},
+        )
+
+    with database.read_transaction() as session:
+        result = session.query("MATCH ()-[r:KNOWS]->() RETURN keys(r) AS property_keys")
+
+    assert result.rows == ({"property_keys": ["since", "weight"]},)
+
+
 def test_match_supports_type_function_in_return_and_order_by(tmp_path: Path) -> None:
     database = Database(tmp_path / "example-db")
 
@@ -2202,15 +2321,412 @@ def test_match_rejects_count_distinct_star_as_invalid_opencypher_syntax(tmp_path
             session.query("MATCH (n) RETURN COUNT(DISTINCT *) AS total")
 
 
-def test_match_rejects_mixing_aggregate_and_non_aggregate_return_items(tmp_path: Path) -> None:
+def test_match_supports_grouped_aggregate_return_by_property(tmp_path: Path) -> None:
     database = Database(tmp_path / "example-db")
 
     with database.write_transaction() as session:
         session.add_node(labels=["Person"], properties={"name": "Alice"})
+        session.add_node(labels=["Person"], properties={"name": "Alice"})
+        session.add_node(labels=["Person"], properties={"name": "Bob"})
 
     with database.read_transaction() as session:
-        with pytest.raises(QueryError, match="Mixing aggregate and non-aggregate"):
-            session.query("MATCH (n:Person) RETURN COUNT(*), n.name")
+        result = session.query(
+            "MATCH (n:Person) RETURN n.name, COUNT(n) ORDER BY COUNT(n) DESC"
+        )
+
+    assert result.columns == ("n.name", "COUNT(n)")
+    assert result.rows == (
+        {"n.name": "Alice", "COUNT(n)": 2},
+        {"n.name": "Bob", "COUNT(n)": 1},
+    )
+
+
+def test_match_supports_grouped_aggregate_return_by_related_property_alias(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query(
+            "CREATE (d:Death {name: 'A'})-[:HAPPENED_IN]->"
+            "(e:Episode {name: 'Episode 1'}) RETURN d"
+        )
+        session.query(
+            "CREATE (d:Death {name: 'B'})-[:HAPPENED_IN]->"
+            "(e:Episode {name: 'Episode 1'}) RETURN d"
+        )
+        session.query(
+            "CREATE (d:Death {name: 'C'})-[:HAPPENED_IN]->"
+            "(e:Episode {name: 'Episode 2'}) RETURN d"
+        )
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (d:Death)-[:HAPPENED_IN]->(e:Episode) "
+            "RETURN e.name AS episode_name, COUNT(d) AS kill_count "
+            "ORDER BY kill_count DESC;"
+        )
+
+    assert result.columns == ("episode_name", "kill_count")
+    assert result.rows == (
+        {"episode_name": "Episode 1", "kill_count": 2},
+        {"episode_name": "Episode 2", "kill_count": 1},
+    )
+
+
+def test_memgraph_got_location_deaths_query_supports_incoming_relationship(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query(
+            "CREATE (d:Death {order: 1})-[:HAPPENED_IN]->"
+            "(l:Location {name: 'Castle Black'}) RETURN d"
+        )
+        session.query(
+            "CREATE (d:Death {order: 2})-[:HAPPENED_IN]->"
+            "(l:Location {name: 'Castle Black'}) RETURN d"
+        )
+        session.query(
+            "CREATE (d:Death {order: 3})-[:HAPPENED_IN]->"
+            "(l:Location {name: 'Winterfell'}) RETURN d"
+        )
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (l:Location)<-[:HAPPENED_IN]-(d:Death) "
+            "RETURN l.name AS location_name, count(d) AS death_count "
+            "ORDER BY death_count DESC"
+        )
+
+    assert result.rows == (
+        {"location_name": "Castle Black", "death_count": 2},
+        {"location_name": "Winterfell", "death_count": 1},
+    )
+
+    with database.read_transaction() as session:
+        graph_result = session.query(
+            "MATCH (l:Location)<-[h:HAPPENED_IN]-(d:Death) RETURN l, h, d LIMIT 1"
+        )
+
+    assert graph_result.columns == ("l", "h", "d")
+    assert graph_result.rows[0]["l"]["labels"] == ["Location"]
+    assert graph_result.rows[0]["h"]["type"] == "HAPPENED_IN"
+    assert graph_result.rows[0]["d"]["labels"] == ["Death"]
+
+
+def test_memgraph_got_season_deaths_query_orders_by_group_alias(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query("CREATE (d:Death {order: 1})-[:HAPPENED_IN]->(s:Season {number: 2}) RETURN d")
+        session.query("CREATE (d:Death {order: 2})-[:HAPPENED_IN]->(s:Season {number: 1}) RETURN d")
+        session.query("CREATE (d:Death {order: 3})-[:HAPPENED_IN]->(s:Season {number: 1}) RETURN d")
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (d:Death)-[:HAPPENED_IN]->(s:Season) "
+            "RETURN s.number AS season_number, count(d) AS death_count "
+            "ORDER BY season_number ASC"
+        )
+
+    assert result.rows == (
+        {"season_number": 1, "death_count": 2},
+        {"season_number": 2, "death_count": 1},
+    )
+
+
+def test_memgraph_got_victim_death_location_visual_query_supports_multi_match(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query(
+            "CREATE (jon:Character {name: 'Jon Snow'})-[:KILLED]->"
+            "(victim:Character {name: 'Orell'}) RETURN jon"
+        )
+        session.query(
+            "MATCH (jon:Character {name: 'Jon Snow'}), (victim:Character {name: 'Orell'}) "
+            "CREATE (jon)-[:KILLER_IN]->(death:Death {order: 1}) RETURN death"
+        )
+        session.query(
+            "MATCH (death:Death {order: 1}), (victim:Character {name: 'Orell'}) "
+            "CREATE (victim)-[:VICTIM_IN]->(death) RETURN death"
+        )
+        session.query(
+            "MATCH (death:Death {order: 1}) "
+            "CREATE (death)-[:HAPPENED_IN]->(location:Location {name: 'Beyond the Wall'}) "
+            "RETURN location"
+        )
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (jon:Character {name: 'Jon Snow'})-[:KILLED]->(victim:Character) "
+            "MATCH (jon)-[:KILLER_IN]->(death:Death)<-[victim_to_death:VICTIM_IN]-(victim) "
+            "MATCH (death)-[death_to_location:HAPPENED_IN]->(location:Location) "
+            "RETURN victim,victim_to_death,death,death_to_location,location"
+        )
+
+    assert result.columns == (
+        "victim",
+        "victim_to_death",
+        "death",
+        "death_to_location",
+        "location",
+    )
+    assert result.rows[0]["victim"]["properties"]["name"] == "Orell"
+    assert result.rows[0]["victim_to_death"]["type"] == "VICTIM_IN"
+    assert result.rows[0]["death"]["properties"]["order"] == 1
+    assert result.rows[0]["death_to_location"]["type"] == "HAPPENED_IN"
+    assert result.rows[0]["location"]["properties"]["name"] == "Beyond the Wall"
+
+
+def test_match_normalizes_legacy_backticked_schema_names(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        death = session.add_node(labels=["`Death`"], properties={"`name`": "A"})
+        episode = session.add_node(labels=["`Episode`"], properties={"`name`": "Episode 1"})
+        session.add_edge(
+            src=death["id"],
+            rel_type="`HAPPENED_IN`",
+            dst=episode["id"],
+            properties={},
+        )
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (d:Death)-[:HAPPENED_IN]->(e:Episode) "
+            "RETURN e.name AS episode_name, COUNT(d) AS kill_count"
+        )
+
+    assert result.rows == ({"episode_name": "Episode 1", "kill_count": 1},)
+
+
+def test_match_with_supports_grouped_aggregate_count_entity(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query(
+            "CREATE (d:Death {name: 'A'})-[:HAPPENED_IN]->"
+            "(e:Episode {name: 'Episode 1'}) RETURN d"
+        )
+        session.query(
+            "CREATE (d:Death {name: 'B'})-[:HAPPENED_IN]->"
+            "(e:Episode {name: 'Episode 1'}) RETURN d"
+        )
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (d:Death)-[:HAPPENED_IN]->(e:Episode) "
+            "WITH e.name AS episode_name, COUNT(d) AS kill_count "
+            "RETURN episode_name, kill_count"
+        )
+
+    assert result.rows == ({"episode_name": "Episode 1", "kill_count": 2},)
+
+
+def test_match_grouped_aggregate_treats_missing_group_property_as_null(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query("CREATE (n:Person {name: 'Alice'}) RETURN n")
+        session.query("CREATE (n:Person {name: 'Bob'}) RETURN n")
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (n:Person) RETURN n.country AS country, COUNT(n) AS total"
+        )
+
+    assert result.rows == ({"country": None, "total": 2},)
+
+
+def test_match_grouped_aggregate_treats_missing_related_property_as_null(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query(
+            "CREATE (d:Death {name: 'A'})-[:HAPPENED_IN]->"
+            "(e:Episode {title: 'Episode 1'}) RETURN d"
+        )
+        session.query(
+            "CREATE (d:Death {name: 'B'})-[:HAPPENED_IN]->"
+            "(e:Episode {title: 'Episode 2'}) RETURN d"
+        )
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (d:Death)-[:HAPPENED_IN]->(e:Episode) "
+            "RETURN e.name AS episode_name, COUNT(d) AS kill_count"
+        )
+
+    assert result.rows == ({"episode_name": None, "kill_count": 2},)
+
+
+def test_match_grouped_aggregate_over_empty_path_returns_no_rows(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query("CREATE (n:Person {name: 'Arya'}) RETURN n")
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (d:Death)-[:HAPPENED_IN]->(e:Episode) "
+            "RETURN e.name AS episode_name, COUNT(d) AS kill_count "
+            "ORDER BY kill_count DESC"
+        )
+
+    assert result.columns == ("episode_name", "kill_count")
+    assert result.rows == ()
+
+
+def test_match_supports_grouped_aggregate_return_by_labels(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.add_node(labels=["Person"], properties={"name": "Alice"})
+        session.add_node(labels=["Person"], properties={"name": "Bob"})
+        session.add_node(labels=["Company"], properties={"name": "Acme"})
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (n) RETURN labels(n), count(n) ORDER BY count(n) DESC"
+        )
+
+    assert result.columns == ("labels(n)", "count(n)")
+    assert result.rows == (
+        {"labels(n)": ["Person"], "count(n)": 2},
+        {"labels(n)": ["Company"], "count(n)": 1},
+    )
+
+
+def test_match_supports_order_by_return_alias_for_labels(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.add_node(labels=["Person"], properties={"name": "Alice"})
+        session.add_node(labels=["Company"], properties={"name": "Acme"})
+
+    with database.read_transaction() as session:
+        result = session.query("MATCH (n) RETURN DISTINCT labels(n) AS labels ORDER BY labels")
+
+    assert result.rows == (
+        {"labels": ["Company"]},
+        {"labels": ["Person"]},
+    )
+
+
+def test_match_supports_order_by_return_alias_for_property(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.add_node(labels=["Person"], properties={"name": "Bob"})
+        session.add_node(labels=["Person"], properties={"name": "Alice"})
+
+    with database.read_transaction() as session:
+        result = session.query("MATCH (n:Person) RETURN n.name AS name ORDER BY name")
+
+    assert result.rows == ({"name": "Alice"}, {"name": "Bob"})
+
+
+def test_match_supports_distinct_grouped_aggregate_return_by_labels(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.add_node(labels=["Person"], properties={"name": "Alice"})
+        session.add_node(labels=["Person"], properties={"name": "Bob"})
+        session.add_node(labels=["Company"], properties={"name": "Acme"})
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (n) RETURN DISTINCT labels(n), count(n) ORDER BY count(n) DESC"
+        )
+
+    assert result.rows == (
+        {"labels(n)": ["Person"], "count(n)": 2},
+        {"labels(n)": ["Company"], "count(n)": 1},
+    )
+
+
+def test_match_supports_lab_schema_distinct_aggregate_with_keys(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.add_node(labels=["Product"], properties={"id": "prod_1", "name": "Widget"})
+        session.add_node(labels=["Product"], properties={"id": "prod_2", "name": "Gadget"})
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (APP_INTERNAL_EXEC_VAR:Product) "
+            "RETURN DISTINCT "
+            "labels(APP_INTERNAL_EXEC_VAR) AS labels, "
+            "keys(APP_INTERNAL_EXEC_VAR) AS property_keys, "
+            "count(APP_INTERNAL_EXEC_VAR) AS node_count "
+            "ORDER BY node_count DESC"
+        )
+
+    assert result.columns == ("labels", "property_keys", "node_count")
+    assert result.rows == (
+        {"labels": ["Product"], "property_keys": ["id", "name"], "node_count": 2},
+    )
+
+
+def test_match_path_can_return_whole_nodes_with_list_properties(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        product = session.add_node(
+            labels=["Product"],
+            properties={"name": "Widget", "product_ids": ["prod_1", "prod_2"]},
+        )
+        category = session.add_node(labels=["Category"], properties={"name": "Tools"})
+        session.add_edge(
+            src=product["id"],
+            rel_type="BELONGS_TO",
+            dst=category["id"],
+            properties={},
+        )
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (p:Product)-[r:BELONGS_TO]->(c:Category) RETURN p, r, c LIMIT 1"
+        )
+
+    assert result.rows == (
+        {
+            "p": {
+                "id": 1,
+                "labels": ["Product"],
+                "properties": {"name": "Widget", "product_ids": ["prod_1", "prod_2"]},
+            },
+            "r": {
+                "id": 1,
+                "type": "BELONGS_TO",
+                "source": 1,
+                "target": 2,
+                "properties": {},
+            },
+            "c": {
+                "id": 2,
+                "labels": ["Category"],
+                "properties": {"name": "Tools"},
+            },
+        },
+    )
 
 
 def test_match_supports_connected_multiple_pattern_parts(tmp_path: Path) -> None:
@@ -2259,6 +2775,22 @@ def test_match_rejects_disconnected_multiple_pattern_parts(tmp_path: Path) -> No
             session.query("MATCH (a:Person), (c:Company) RETURN a.name, c.name")
 
 
+def test_match_supports_disconnected_bounded_node_lookup_parts(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.add_node(labels=["Person"], properties={"id": "p1", "name": "Alice"})
+        session.add_node(labels=["Company"], properties={"id": "c1", "name": "Acme"})
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (a:Person {id: 'p1'}), (c:Company {id: 'c1'}) "
+            "RETURN a.name, c.name"
+        )
+
+    assert result.rows == ({"a.name": "Alice", "c.name": "Acme"},)
+
+
 def test_match_create_can_create_an_edge_between_bound_nodes(tmp_path: Path) -> None:
     database = Database(tmp_path / "example-db")
 
@@ -2279,6 +2811,607 @@ def test_match_create_can_create_an_edge_between_bound_nodes(tmp_path: Path) -> 
         check = session.query("MATCH (a:Person)-[:LIKES]->(b:Person) RETURN a.name, b.name")
 
     assert check.rows == ({"a.name": "Alice", "b.name": "Bob"},)
+
+
+def test_match_create_supports_disconnected_bounded_loader_lookup_parts(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.add_node(labels=["Person"], properties={"id": "p1", "name": "Alice"})
+        session.add_node(labels=["Company"], properties={"id": "c1", "name": "Acme"})
+        result = session.query(
+            "MATCH (a:Person {id: 'p1'}), (c:Company {id: 'c1'}) "
+            "CREATE (a)-[:WORKS_FOR]->(c)"
+        )
+
+    assert result.rows == ()
+
+    with database.read_transaction() as session:
+        check = session.query(
+            "MATCH (a:Person)-[:WORKS_FOR]->(c:Company) RETURN a.name, c.name"
+        )
+
+    assert check.rows == ({"a.name": "Alice", "c.name": "Acme"},)
+
+
+def test_match_can_filter_property_named_id_separately_from_internal_id(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query("CREATE (u:User {id: 'user_0001', name: 'Alice'}) RETURN u")
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (u:User {id: $user_id}) RETURN id(u) AS iid, u.id, u.name",
+            {"user_id": "user_0001"},
+        )
+
+    assert result.rows == ({"iid": 1, "u.id": "user_0001", "u.name": "Alice"},)
+
+
+def test_neo4j_components_procedure_is_available_for_bolt_clients(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.read_transaction() as session:
+        result = session.query("CALL dbms.components()")
+
+    assert result.columns == ("name", "versions", "edition")
+    assert result.rows == (
+        {"name": "Neo4j Kernel", "versions": ["5.26.0"], "edition": "community"},
+    )
+
+
+def test_neo4j_components_procedure_supports_discovery_projection(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "CALL dbms.components() "
+            "YIELD name, versions, edition "
+            "UNWIND versions AS version "
+            "RETURN name, version, edition"
+        )
+
+    assert result.columns == ("name", "version", "edition")
+    assert result.rows == (
+        {"name": "Neo4j Kernel", "version": "5.26.0", "edition": "community"},
+    )
+
+
+def test_neo4j_ping_procedure_is_available_for_cypher_shell(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.read_transaction() as session:
+        result = session.query("CALL db.ping()")
+
+    assert result.columns == ()
+    assert result.rows == ()
+
+
+def test_schema_visualization_procedure_returns_label_relationship_summary(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query("CREATE (p:Product {id: 'p1'}) RETURN p")
+        session.query(
+            "MATCH (p:Product {id: 'p1'}) "
+            "CREATE (p)-[:BELONGS_TO]->(c:Category {name: 'Books'}) "
+            "RETURN c"
+        )
+
+    with database.read_transaction() as session:
+        result = session.query("CALL db.schema.visualization()")
+
+    assert result.columns == ("nodes", "relationships")
+    assert result.rows == (
+        {
+            "nodes": [
+                {"id": 0, "labels": ["Category"], "properties": {"name": "Category"}},
+                {"id": 1, "labels": ["Product"], "properties": {"name": "Product"}},
+            ],
+            "relationships": [
+                {
+                    "id": 0,
+                    "start": 1,
+                    "end": 0,
+                    "type": "BELONGS_TO",
+                    "properties": {},
+                },
+            ],
+        },
+    )
+
+
+def test_schema_visualization_procedure_supports_yield_return_projection(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "CALL db.schema.visualization() "
+            "YIELD nodes, relationships "
+            "RETURN nodes, relationships"
+        )
+
+    assert result.columns == ("nodes", "relationships")
+    assert result.rows == ({"nodes": [], "relationships": []},)
+
+
+def test_schema_metadata_procedures_support_graph_exploration_clients(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query(
+            "CREATE (p:Product {id: 'p1', price: 10.5})-"
+            "[:BELONGS_TO {rank: 1}]->(c:Category {name: 'Books'}) "
+            "RETURN p, c"
+        )
+
+    with database.read_transaction() as session:
+        labels = session.query("CALL db.labels()")
+        relationship_types = session.query("CALL db.relationshipTypes()")
+        property_keys = session.query("CALL db.propertyKeys()")
+        node_properties = session.query("CALL db.schema.nodeTypeProperties()")
+        rel_properties = session.query("CALL db.schema.relTypeProperties()")
+
+    assert labels.rows == ({"label": "Category"}, {"label": "Product"})
+    assert relationship_types.rows == ({"relationshipType": "BELONGS_TO"},)
+    assert property_keys.rows == (
+        {"propertyKey": "id"},
+        {"propertyKey": "name"},
+        {"propertyKey": "price"},
+        {"propertyKey": "rank"},
+    )
+    assert {
+        (row["nodeLabels"][0], row["propertyName"])
+        for row in node_properties.rows
+    } == {("Category", "name"), ("Product", "id"), ("Product", "price")}
+    assert rel_properties.rows == (
+        {
+            "relType": ":`BELONGS_TO`",
+            "propertyName": "rank",
+            "propertyTypes": ["Integer"],
+            "mandatory": True,
+        },
+    )
+
+
+def test_memgraph_lab_show_metadata_statements_are_available(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query("CREATE (n:Person {name: 'Alice'}) RETURN n")
+
+    with database.read_transaction() as session:
+        storage = session.query("SHOW STORAGE INFO;")
+        storage_current = session.query("SHOW STORAGE INFO ON CURRENT DATABASE")
+        replication = session.query("SHOW REPLICATION ROLE")
+        license_info = session.query("SHOW LICENSE INFO")
+        indexes = session.query("SHOW INDEX INFO;")
+        constraints = session.query("SHOW CONSTRAINT INFO")
+        triggers = session.query("SHOW TRIGGERS")
+        schema = session.query("SHOW SCHEMA INFO;")
+
+    assert {"name": "vertex_count", "value": 1} in storage.rows
+    assert {"name": "edge_count", "value": 0} in storage_current.rows
+    assert replication.rows == ({"role": "main"},)
+    assert license_info.rows == (
+        {
+            "license_type": "community",
+            "organization_name": "GraphArrow",
+            "valid_until": None,
+        },
+    )
+    assert indexes.columns == ("index_type", "label", "property", "count", "identifier")
+    assert indexes.rows == ()
+    assert constraints.columns == ("constraint_type", "label", "properties")
+    assert constraints.rows == ()
+    assert triggers.columns == ("name", "event_type", "phase", "statement", "owner")
+    assert triggers.rows == ()
+    assert schema.columns == ("nodes", "relationships")
+    assert schema.rows == ()
+
+
+def test_memgraph_lab_create_index_statement_is_noop_for_dataset_loader(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        result = session.query("CREATE INDEX ON :Death(character)")
+
+    assert result.columns == ()
+    assert result.rows == ()
+    assert query_requires_write("CREATE INDEX ON :Death(character)") is True
+    assert query_requires_write("MATCH (n:Death) REMOVE n.temp") is True
+
+
+def test_memgraph_lab_drop_index_and_remove_bootstrap_markers(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query("CREATE (u:__mg_vertex__ {__mg_id__: 1, name: 'Arya'}) RETURN u")
+        drop_result = session.query("DROP INDEX ON :__mg_vertex__(__mg_id__);")
+        remove_result = session.query("MATCH (u) REMOVE u:__mg_vertex__, u.__mg_id__;")
+
+    assert drop_result.rows == ()
+    assert remove_result.rows == ()
+
+    with database.read_transaction() as session:
+        persisted = session.query("MATCH (u) RETURN labels(u) AS labels, keys(u) AS keys, u.name")
+
+    assert persisted.rows == ({"labels": [], "keys": ["name"], "u.name": "Arya"},)
+
+
+def test_unwind_with_create_supports_dataset_loader_shape(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        result = session.query(
+            "UNWIND $rows AS row "
+            "WITH row "
+            "CREATE (c:Character {name: row.name, deaths: row.deaths}) "
+            "RETURN count(c) AS created",
+            {
+                "rows": [
+                    {"name": "Ned Stark", "deaths": 1},
+                    {"name": "Robb Stark", "deaths": 1},
+                ],
+            },
+        )
+
+    assert result.rows == ({"created": 2},)
+
+    with database.read_transaction() as session:
+        check = session.query(
+            "MATCH (c:Character) RETURN c.name, c.deaths ORDER BY c.name"
+        )
+
+    assert check.rows == (
+        {"c.name": "Ned Stark", "c.deaths": 1},
+        {"c.name": "Robb Stark", "c.deaths": 1},
+    )
+
+
+def test_unwind_with_create_allows_loader_shape_without_return(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        result = session.query(
+            "UNWIND $rows AS row "
+            "WITH row "
+            "CREATE (d:Death {character: row.character, episode: row.episode})",
+            {
+                "rows": [
+                    {"character": "Robert Baratheon", "episode": "S01E07"},
+                    {"character": "Ned Stark", "episode": "S01E09"},
+                ],
+            },
+        )
+
+    assert result.columns == ()
+    assert result.rows == ()
+
+    with database.read_transaction() as session:
+        check = session.query(
+            "MATCH (d:Death) RETURN d.character, d.episode ORDER BY d.character"
+        )
+
+    assert check.rows == (
+        {"d.character": "Ned Stark", "d.episode": "S01E09"},
+        {"d.character": "Robert Baratheon", "d.episode": "S01E07"},
+    )
+
+
+def test_unwind_with_match_create_supports_pandora_like_relationship_loader(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query(
+            "UNWIND $rows AS row "
+            "WITH row "
+            "CREATE (o:Officer {node_id: row.node_id, name: row.name})",
+            {"rows": [{"node_id": "officer_1", "name": "Alice"}]},
+        )
+        session.query(
+            "UNWIND $rows AS row "
+            "WITH row "
+            "CREATE (e:Entity {node_id: row.node_id, name: row.name})",
+            {"rows": [{"node_id": "entity_1", "name": "Acme Offshore"}]},
+        )
+        result = session.query(
+            "UNWIND $rows AS row "
+            "WITH row "
+            "MATCH (o:Officer {node_id: row.officer_id}), "
+            "(e:Entity {node_id: row.entity_id}) "
+            "CREATE (o)-[:OFFICER_OF {role: row.role}]->(e)",
+            {
+                "rows": [
+                    {
+                        "officer_id": "officer_1",
+                        "entity_id": "entity_1",
+                        "role": "beneficial owner",
+                    },
+                ],
+            },
+        )
+
+    assert result.columns == ()
+    assert result.rows == ()
+
+    with database.read_transaction() as session:
+        check = session.query(
+            "MATCH (o:Officer)-[r:OFFICER_OF]->(e:Entity) "
+            "RETURN o.name, r.role, e.name"
+        )
+
+    assert check.rows == (
+        {
+            "o.name": "Alice",
+            "r.role": "beneficial owner",
+            "e.name": "Acme Offshore",
+        },
+    )
+
+
+def test_unwind_with_merge_supports_memgraph_lab_dataset_loader_shape(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+    rows = [
+        {"character": "Robert Baratheon", "episode": "S01E07"},
+        {"character": "Ned Stark", "episode": "S01E09"},
+        {"character": "Ned Stark", "episode": "S01E09"},
+    ]
+
+    with database.write_transaction() as session:
+        result = session.query(
+            "UNWIND $rows AS row "
+            "WITH row "
+            "MERGE (d:Death {character: row.character, episode: row.episode})",
+            {"rows": rows},
+        )
+
+    assert result.columns == ()
+    assert result.rows == ()
+
+    with database.read_transaction() as session:
+        check = session.query(
+            "MATCH (d:Death) RETURN d.character, d.episode ORDER BY d.character"
+        )
+
+    assert check.rows == (
+        {"d.character": "Ned Stark", "d.episode": "S01E09"},
+        {"d.character": "Robert Baratheon", "d.episode": "S01E07"},
+    )
+
+
+def test_unwind_with_merge_supports_row_references_in_merge_actions(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query(
+            "UNWIND $rows AS row "
+            "WITH row "
+            "MERGE (d:Death {character: row.character}) "
+            "ON CREATE SET d.episode = row.episode "
+            "ON MATCH SET d.seen = row.seen",
+            {
+                "rows": [
+                    {"character": "Ned Stark", "episode": "S01E09", "seen": 1},
+                    {"character": "Ned Stark", "episode": "S01E09", "seen": 2},
+                ],
+            },
+        )
+
+    with database.read_transaction() as session:
+        check = session.query("MATCH (d:Death) RETURN d.character, d.episode, d.seen")
+
+    assert check.rows == (
+        {"d.character": "Ned Stark", "d.episode": "S01E09", "d.seen": 2},
+    )
+
+
+def test_unwind_with_match_set_supports_dataset_loader_update_shape(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query("CREATE (d:Death {character: 'Ned Stark'}) RETURN d")
+        session.query(
+            "UNWIND $rows AS row "
+            "WITH row "
+            "MATCH (d:Death {character: row.character}) "
+            "SET d.episode = row.episode",
+            {"rows": [{"character": "Ned Stark", "episode": "S01E09"}]},
+        )
+
+    with database.read_transaction() as session:
+        check = session.query("MATCH (d:Death) RETURN d.character, d.episode")
+
+    assert check.rows == ({"d.character": "Ned Stark", "d.episode": "S01E09"},)
+
+
+def test_unwind_with_merge_set_row_supports_dataset_loader_update_shape(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query(
+            "UNWIND $rows AS row "
+            "WITH row "
+            "MERGE (d:Death {character: row.character}) "
+            "SET d += row",
+            {
+                "rows": [
+                    {
+                        "character": "Ned Stark",
+                        "episode": "S01E09",
+                        "method": "Execution",
+                    },
+                    {
+                        "character": "Ned Stark",
+                        "episode": "S01E09",
+                        "method": "Execution",
+                    },
+                ],
+            },
+        )
+
+    with database.read_transaction() as session:
+        check = session.query(
+            "MATCH (d:Death) RETURN d.character, d.episode, d.method"
+        )
+
+    assert check.rows == (
+        {
+            "d.character": "Ned Stark",
+            "d.episode": "S01E09",
+            "d.method": "Execution",
+        },
+    )
+
+
+def test_match_with_detach_delete_supports_dataset_cleanup_shape(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query(
+            "CREATE (d:Death {character: 'Ned Stark'})-[:IN_EPISODE]->"
+            "(e:Episode {id: 'S01E09'}) RETURN d, e"
+        )
+        result = session.query("MATCH (n) WITH n DETACH DELETE n")
+
+    assert result.columns == ()
+    assert result.rows == ()
+
+    with database.read_transaction() as session:
+        check = session.query("MATCH (n) RETURN count(n) AS count")
+
+    assert check.rows == ({"count": 0},)
+
+
+def test_match_update_queries_allow_write_only_loader_shapes(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query("CREATE (a:Person {name: 'Alice'}) RETURN a")
+        create_result = session.query(
+            "MATCH (a:Person {name: 'Alice'}) CREATE (a)-[:KNOWS]->(b:Person {name: 'Bob'})"
+        )
+        set_result = session.query(
+            "MATCH (b:Person {name: 'Bob'}) SET b.loaded = true"
+        )
+        merge_result = session.query(
+            "MATCH (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'}) "
+            "MERGE (a)-[:LIKES]->(b)"
+        )
+        delete_result = session.query("MATCH (b:Person {name: 'Bob'}) DETACH DELETE b")
+
+    assert create_result.rows == ()
+    assert set_result.rows == ()
+    assert merge_result.rows == ()
+    assert delete_result.rows == ()
+
+    with database.read_transaction() as session:
+        check = session.query("MATCH (n:Person) RETURN n.name")
+
+    assert check.rows == ({"n.name": "Alice"},)
+
+
+def test_unwind_with_match_merge_supports_pandora_like_relationship_loader(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query(
+            "UNWIND $rows AS row "
+            "WITH row "
+            "CREATE (o:Officer {node_id: row.node_id, name: row.name})",
+            {"rows": [{"node_id": "officer_1", "name": "Alice"}]},
+        )
+        session.query(
+            "UNWIND $rows AS row "
+            "WITH row "
+            "CREATE (e:Entity {node_id: row.node_id, name: row.name})",
+            {"rows": [{"node_id": "entity_1", "name": "Acme Offshore"}]},
+        )
+        session.query(
+            "UNWIND $rows AS row "
+            "WITH row "
+            "MATCH (o:Officer {node_id: row.officer_id}), "
+            "(e:Entity {node_id: row.entity_id}) "
+            "MERGE (o)-[r:OFFICER_OF {role: row.role}]->(e)",
+            {
+                "rows": [
+                    {
+                        "officer_id": "officer_1",
+                        "entity_id": "entity_1",
+                        "role": "beneficial owner",
+                    },
+                    {
+                        "officer_id": "officer_1",
+                        "entity_id": "entity_1",
+                        "role": "beneficial owner",
+                    },
+                ],
+            },
+        )
+
+    with database.read_transaction() as session:
+        check = session.query(
+            "MATCH (o:Officer)-[r:OFFICER_OF]->(e:Entity) "
+            "RETURN o.name, r.role, e.name"
+        )
+
+    assert check.rows == (
+        {
+            "o.name": "Alice",
+            "r.role": "beneficial owner",
+            "e.name": "Acme Offshore",
+        },
+    )
+
+
+def test_match_with_create_supports_updating_clause_after_with(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query("CREATE (s:Source {name: 'Arya Stark'}) RETURN s")
+        result = session.query(
+            "MATCH (s:Source) "
+            "WITH s.name AS name "
+            "CREATE (c:Character {name: name}) "
+            "RETURN c.name"
+        )
+
+    assert result.rows == ({"c.name": "Arya Stark"},)
+
+
+def test_standalone_return_supports_connectivity_probes(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.read_transaction() as session:
+        result = session.query("RETURN 1 AS ok")
+
+    assert result.columns == ("ok",)
+    assert result.rows == ({"ok": 1},)
 
 
 def test_match_create_supports_multiple_create_patterns_per_row(tmp_path: Path) -> None:
@@ -2363,13 +3496,46 @@ def test_match_create_can_return_whole_nodes(tmp_path: Path) -> None:
     )
 
 
-def test_match_create_rejects_inline_new_nodes(tmp_path: Path) -> None:
+def test_match_create_can_create_right_inline_node(tmp_path: Path) -> None:
     database = Database(tmp_path / "example-db")
 
     with database.write_transaction() as session:
         session.query("CREATE (a:Person {name: 'Alice'}) RETURN a")
-        with pytest.raises(QueryError, match="inline labels or properties"):
-            session.query("MATCH (a:Person) CREATE (a)-[:KNOWS]->(b:Person {name: 'Bob'}) RETURN a")
+        result = session.query(
+            "MATCH (a:Person {name: 'Alice'}) "
+            "CREATE (a)-[:KNOWS]->(b:Person {name: 'Bob'}) "
+            "RETURN id(b) AS iid, b.name"
+        )
+
+    assert result.columns == ("iid", "b.name")
+    assert result.rows == ({"iid": 2, "b.name": "Bob"},)
+
+    with database.read_transaction() as session:
+        check = session.query(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name"
+        )
+
+    assert check.rows == ({"a.name": "Alice", "b.name": "Bob"},)
+
+
+def test_match_create_can_create_left_inline_node(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query("CREATE (a:Person {name: 'Alice'}) RETURN a")
+        result = session.query(
+            "MATCH (a:Person {name: 'Alice'}) "
+            "CREATE (b:Tag {name: 'vip'})-[:TAGGED]->(a) "
+            "RETURN id(b) AS iid, b.name"
+        )
+
+    assert result.columns == ("iid", "b.name")
+    assert result.rows == ({"iid": 2, "b.name": "vip"},)
+
+    with database.read_transaction() as session:
+        check = session.query("MATCH (b:Tag)-[:TAGGED]->(a:Person) RETURN b.name, a.name")
+
+    assert check.rows == ({"b.name": "vip", "a.name": "Alice"},)
 
 
 def test_match_create_rejects_unbound_variables(tmp_path: Path) -> None:
@@ -2377,7 +3543,7 @@ def test_match_create_rejects_unbound_variables(tmp_path: Path) -> None:
 
     with database.write_transaction() as session:
         session.query("CREATE (a:Person {name: 'Alice'}) RETURN a")
-        with pytest.raises(QueryError, match="unbound node variable"):
+        with pytest.raises(QueryError, match="requires unbound nodes"):
             session.query("MATCH (a:Person) CREATE (a)-[:KNOWS]->(b) RETURN a")
 
 

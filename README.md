@@ -116,6 +116,16 @@ requires `Authorization: Bearer <token>`.
 and database paths, and now exposes a minimal Bolt 4.4 server with basic auth,
 `RUN`, `PULL`, `DISCARD`, `RESET`, and `GOODBYE`.
 
+Run it locally with:
+
+```bash
+make bolt DB=/tmp/grapharrow-db PORT=18080
+```
+
+The Bolt server writes lightweight operational logs to stdout, including startup,
+connections, query `RUN` statements, and failures. Query logging is enabled by default
+and can be disabled with `BOLT_ARGS=--no-query-log` or `GRAPHARROW_BOLT_LOG_QUERIES=false`.
+
 ### REST endpoints
 
 Current bootstrap endpoints:
