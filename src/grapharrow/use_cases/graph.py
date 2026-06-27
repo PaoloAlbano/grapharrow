@@ -540,6 +540,98 @@ class GraphStateUseCase:
             edges=edges,
         )
 
+    def remove_properties_batch(
+        self,
+        *,
+        node_removals: tuple[tuple[int, str], ...],
+        edge_removals: tuple[tuple[int, str], ...],
+    ) -> GraphState:
+        """Remove node and edge properties and publish a new snapshot."""
+
+        state = self.load_state()
+        if not node_removals and not edge_removals:
+            return state
+
+        nodes = list(state.nodes)
+        edges = list(state.edges)
+        node_indexes = {node.node_id: index for index, node in enumerate(nodes)}
+        edge_indexes = {edge.edge_id: index for index, edge in enumerate(edges)}
+
+        for node_id, property_name in node_removals:
+            index = node_indexes.get(node_id)
+            if index is None:
+                raise NotFoundError(f"Node does not exist: {node_id}")
+            properties = dict(nodes[index].properties)
+            properties.pop(property_name, None)
+            nodes[index] = NodeRecord(
+                node_id=nodes[index].node_id,
+                labels=nodes[index].labels,
+                properties=properties,
+            )
+
+        for edge_id, property_name in edge_removals:
+            index = edge_indexes.get(edge_id)
+            if index is None:
+                raise NotFoundError(f"Relationship does not exist: {edge_id}")
+            properties = dict(edges[index].properties)
+            properties.pop(property_name, None)
+            edges[index] = EdgeRecord(
+                edge_id=edges[index].edge_id,
+                rel_type=edges[index].rel_type,
+                src_id=edges[index].src_id,
+                dst_id=edges[index].dst_id,
+                properties=properties,
+            )
+
+        self._validate_full_graph(
+            catalog=state.catalog,
+            nodes=tuple(nodes),
+            edges=tuple(edges),
+        )
+        return self._publish_graph(
+            previous_state=state,
+            catalog=state.catalog,
+            nodes=nodes,
+            edges=edges,
+        )
+
+    def remove_labels_batch(
+        self,
+        *,
+        node_label_removals: tuple[tuple[int, str], ...],
+    ) -> GraphState:
+        """Remove labels from nodes and publish a new snapshot."""
+
+        state = self.load_state()
+        if not node_label_removals:
+            return state
+
+        nodes = list(state.nodes)
+        node_indexes = {node.node_id: index for index, node in enumerate(nodes)}
+
+        for node_id, label in node_label_removals:
+            index = node_indexes.get(node_id)
+            if index is None:
+                raise NotFoundError(f"Node does not exist: {node_id}")
+            labels = tuple(existing for existing in nodes[index].labels if existing != label)
+            nodes[index] = NodeRecord(
+                node_id=nodes[index].node_id,
+                labels=labels,
+                properties=nodes[index].properties,
+            )
+
+        self._validate_full_graph(
+            catalog=state.catalog,
+            nodes=tuple(nodes),
+            edges=state.edges,
+        )
+        return self._publish_graph(
+            previous_state=state,
+            catalog=state.catalog,
+            nodes=nodes,
+            edges=list(state.edges),
+        )
+
     def delete_entities_batch(
         self,
         *,
@@ -1090,6 +1182,96 @@ class GraphTransactionUseCase:
             catalog=self._state.catalog,
             nodes=nodes,
             edges=edges,
+        )
+
+    def remove_properties_batch(
+        self,
+        *,
+        node_removals: tuple[tuple[int, str], ...],
+        edge_removals: tuple[tuple[int, str], ...],
+    ) -> GraphState:
+        """Remove properties inside the transaction-local state."""
+
+        self._ensure_open()
+        if not node_removals and not edge_removals:
+            return self._state
+
+        nodes = list(self._state.nodes)
+        edges = list(self._state.edges)
+        node_indexes = {node.node_id: index for index, node in enumerate(nodes)}
+        edge_indexes = {edge.edge_id: index for index, edge in enumerate(edges)}
+
+        for node_id, property_name in node_removals:
+            index = node_indexes.get(node_id)
+            if index is None:
+                raise NotFoundError(f"Node does not exist: {node_id}")
+            properties = dict(nodes[index].properties)
+            properties.pop(property_name, None)
+            nodes[index] = NodeRecord(
+                node_id=nodes[index].node_id,
+                labels=nodes[index].labels,
+                properties=properties,
+            )
+
+        for edge_id, property_name in edge_removals:
+            index = edge_indexes.get(edge_id)
+            if index is None:
+                raise NotFoundError(f"Relationship does not exist: {edge_id}")
+            properties = dict(edges[index].properties)
+            properties.pop(property_name, None)
+            edges[index] = EdgeRecord(
+                edge_id=edges[index].edge_id,
+                rel_type=edges[index].rel_type,
+                src_id=edges[index].src_id,
+                dst_id=edges[index].dst_id,
+                properties=properties,
+            )
+
+        self._graph_service._validate_full_graph(
+            catalog=self._state.catalog,
+            nodes=tuple(nodes),
+            edges=tuple(edges),
+        )
+        return self._replace_state(
+            catalog=self._state.catalog,
+            nodes=nodes,
+            edges=edges,
+        )
+
+    def remove_labels_batch(
+        self,
+        *,
+        node_label_removals: tuple[tuple[int, str], ...],
+    ) -> GraphState:
+        """Remove labels from nodes inside the transaction-local state."""
+
+        self._ensure_open()
+        if not node_label_removals:
+            return self._state
+
+        nodes = list(self._state.nodes)
+        node_indexes = {node.node_id: index for index, node in enumerate(nodes)}
+
+        for node_id, label in node_label_removals:
+            index = node_indexes.get(node_id)
+            if index is None:
+                raise NotFoundError(f"Node does not exist: {node_id}")
+            labels = tuple(existing for existing in nodes[index].labels if existing != label)
+            nodes[index] = NodeRecord(
+                node_id=nodes[index].node_id,
+                labels=labels,
+                properties=nodes[index].properties,
+            )
+
+        self._graph_service._validate_full_graph(
+            catalog=self._state.catalog,
+            nodes=tuple(nodes),
+            edges=self._state.edges,
+        )
+        return self._replace_state(
+            catalog=self._state.catalog,
+            nodes=nodes,
+            edges=list(self._state.edges),
         )
 
     def delete_entities_batch(
