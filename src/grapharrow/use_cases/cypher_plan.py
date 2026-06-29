@@ -26,6 +26,7 @@ class ExpandPlan:
     end_labels: tuple[str, ...]
     end_properties: dict[str, object]
     end_requested_fields: set[str] | None
+    end_pushdown_predicate: object | None = None
 
 
 @dataclass(frozen=True, slots=True)

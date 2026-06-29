@@ -44,6 +44,14 @@ class BenchmarkResult:
     worst_arrow_peak_mb: float
     arrow_peak_runs: tuple[float, ...]
 
+
+@dataclass(frozen=True, slots=True)
+class TraversalDiagnostic:
+    name: str
+    count: int
+    seconds: float
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark GraphArrow Cypher execution.")
     parser.add_argument("--nodes", type=int, default=20_000, help="Number of synthetic nodes.")
@@ -139,13 +147,10 @@ def main() -> None:
         force_rebuild=args.force_rebuild,
     )
 
+    diagnostics = measure_traversal_diagnostics(database)
+
     query_params: dict[str, dict[str, object]] = {
-        "unwind_parameter_pipeline": {
-            "values": [
-                f"Tag-{index:04d}"
-                for index in range(500)
-            ]
-        }
+        "unwind_parameter_pipeline": {"values": [f"Tag-{index:04d}" for index in range(500)]}
     }
 
     results: list[BenchmarkResult] = []
@@ -172,8 +177,8 @@ def main() -> None:
 
     args.json_out.parent.mkdir(parents=True, exist_ok=True)
     args.markdown_out.parent.mkdir(parents=True, exist_ok=True)
-    write_json_report(args.json_out, args, results)
-    write_markdown_report(args.markdown_out, args, results)
+    write_json_report(args.json_out, args, results, diagnostics)
+    write_markdown_report(args.markdown_out, args, results, diagnostics)
 
     _log(f"Wrote JSON report to {args.json_out}")
     _log(f"Wrote Markdown report to {args.markdown_out}")
@@ -197,6 +202,13 @@ def build_queries() -> dict[str, str]:
             "ORDER BY r.weight DESC, a.external_id ASC, b.external_id ASC "
             "LIMIT 500"
         ),
+        "incoming_typed_projection_order_limit": (
+            "MATCH (b:Person)<-[:KNOWS]-(a:Person) "
+            "WHERE b.anchor = true "
+            "RETURN b.external_id, a.external_id "
+            "ORDER BY b.external_id ASC, a.external_id ASC "
+            "LIMIT 500"
+        ),
         "grouped_with_count": (
             "MATCH (n:Person) "
             "WITH n.country AS country, COUNT(*) AS total "
@@ -204,11 +216,46 @@ def build_queries() -> dict[str, str]:
             "ORDER BY total DESC, country ASC "
             "LIMIT 10"
         ),
+        "grouped_collect_neighbors": (
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) "
+            "WHERE a.anchor = true "
+            "RETURN a.external_id AS person, collect(b.country) AS neighbor_countries "
+            "ORDER BY person ASC "
+            "LIMIT 100"
+        ),
+        "with_collect_size": (
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) "
+            "WHERE a.anchor = true "
+            "WITH a.external_id AS person, collect(b.external_id) AS neighbors "
+            "RETURN person, size(neighbors) AS neighbor_count "
+            "ORDER BY person ASC "
+            "LIMIT 100"
+        ),
+        "not_exists_candidate_filter": (
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(candidate:Person) "
+            "WHERE a.anchor = true "
+            "AND NOT EXISTS { (a)-[:KNOWS]->(candidate) } "
+            "RETURN DISTINCT a.external_id, candidate.external_id "
+            "ORDER BY a.external_id ASC, candidate.external_id ASC "
+            "LIMIT 500"
+        ),
+        "relationship_type_alternatives_projection": (
+            "MATCH (a:Person)-[:KNOWS|FOLLOWS]->(b:Person) "
+            "WHERE a.anchor = true "
+            "RETURN a.external_id, b.external_id "
+            "ORDER BY a.external_id ASC, b.external_id ASC "
+            "LIMIT 500"
+        ),
+        "abs_arithmetic_similarity_filter": (
+            "MATCH (a:Person)-[r1:KNOWS]->(b:Person)<-[r2:KNOWS]-(c:Person) "
+            "WHERE a.anchor = true "
+            "AND abs(r1.weight-r2.weight) < 0.1 "
+            "RETURN a.external_id, c.external_id, r1.weight * 2 + r2.weight AS score "
+            "ORDER BY a.external_id ASC, c.external_id ASC "
+            "LIMIT 500"
+        ),
         "return_distinct_projection_order_limit": (
-            "MATCH (n:Person) "
-            "RETURN DISTINCT n.score "
-            "ORDER BY n.score DESC "
-            "LIMIT 1000"
+            "MATCH (n:Person) RETURN DISTINCT n.score ORDER BY n.score DESC LIMIT 1000"
         ),
         "optional_match_projection": (
             "MATCH (a:Person) "
@@ -250,7 +297,7 @@ def build_queries() -> dict[str, str]:
             "AND b.active = true "
             "AND c.country IN ['IT', 'DE', 'FR'] "
             "AND d.score >= 0.5 "
-            "AND d.external_id STARTS WITH 'person-0' "
+            "AND d.external_id STARTS WITH 'person-000' "
             "RETURN COUNT(*) AS total"
         ),
         "multi_match_with_where": (
@@ -279,9 +326,51 @@ def build_queries() -> dict[str, str]:
             "LIMIT 500"
         ),
         "unwind_parameter_pipeline": (
-            "UNWIND $values AS value "
-            "RETURN toLower(value) "
-            "ORDER BY toLower(value) ASC"
+            "UNWIND $values AS value RETURN toLower(value) ORDER BY toLower(value) ASC"
+        ),
+    }
+
+
+def build_traversal_diagnostic_queries() -> dict[str, str]:
+    return {
+        "hop_1_anchor_knows": (
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.anchor = true RETURN COUNT(*) AS total"
+        ),
+        "incoming_hop_1_anchor_knows": (
+            "MATCH (b:Person)<-[:KNOWS]-(a:Person) WHERE b.anchor = true RETURN COUNT(*) AS total"
+        ),
+        "hop_2_anchor_knows": (
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) "
+            "WHERE a.anchor = true "
+            "RETURN COUNT(*) AS total"
+        ),
+        "hop_3_anchor_knows": (
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(d:Person) "
+            "WHERE a.anchor = true "
+            "RETURN COUNT(*) AS total"
+        ),
+        "hop_3_dense_filters": (
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(d:Person) "
+            "WHERE a.anchor = true "
+            "AND b.active = true "
+            "AND c.country IN ['IT', 'DE', 'FR'] "
+            "AND d.score >= 0.5 "
+            "RETURN COUNT(*) AS total"
+        ),
+        "hop_3_mixed_filters": (
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person)-[:KNOWS]->(d:Person) "
+            "WHERE a.anchor = true "
+            "AND b.active = true "
+            "AND c.country IN ['IT', 'DE', 'FR'] "
+            "AND d.score >= 0.5 "
+            "AND d.external_id STARTS WITH 'person-000' "
+            "RETURN COUNT(*) AS total"
+        ),
+        "wildcard_3_anchor": (
+            "MATCH (a:Person)-[*3]->(d:Person) WHERE a.anchor = true RETURN COUNT(*) AS total"
+        ),
+        "range_1_3_anchor": (
+            "MATCH (a:Person)-[*1..3]->(d:Person) WHERE a.anchor = true RETURN COUNT(*) AS total"
         ),
     }
 
@@ -346,6 +435,13 @@ def prepare_database(
     src_ids = np.concatenate([controlled_sources, src_random])
     dst_ids = np.concatenate([controlled_targets, dst_random])
     rel_types = np.array(["KNOWS"] * len(src_ids), dtype=object)
+    if len(rel_types) > len(controlled_sources):
+        random_rel_count = len(rel_types) - len(controlled_sources)
+        rel_types[len(controlled_sources) :] = rng.choice(
+            np.array(["KNOWS", "FOLLOWS"], dtype=object),
+            size=random_rel_count,
+            p=[0.8, 0.2],
+        )
     weights = rng.random(len(src_ids)).tolist()
     edge_table = pa.table(
         {
@@ -441,6 +537,23 @@ def measure_query(
     )
 
 
+def measure_traversal_diagnostics(database: Database) -> list[TraversalDiagnostic]:
+    diagnostics: list[TraversalDiagnostic] = []
+    for name, query in build_traversal_diagnostic_queries().items():
+        _log(f"Measuring traversal diagnostic '{name}'.")
+        started = time.perf_counter()
+        count = run_count_query(database, query)
+        ended = time.perf_counter()
+        diagnostics.append(
+            TraversalDiagnostic(
+                name=name,
+                count=count,
+                seconds=ended - started,
+            )
+        )
+    return diagnostics
+
+
 def _log(message: str) -> None:
     timestamp = datetime.now(UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}", file=sys.stderr, flush=True)
@@ -459,6 +572,21 @@ def run_query(
     }
     checksum = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
     return len(result.rows), checksum
+
+
+def run_count_query(
+    database: Database,
+    query: str,
+) -> int:
+    with database.read_transaction() as session:
+        result = session.query(query)
+    if not result.rows:
+        return 0
+    row = result.rows[0]
+    value = row.get("total")
+    if not isinstance(value, int):
+        raise RuntimeError(f"Expected integer diagnostic count, got {value!r}.")
+    return value
 
 
 def run_memory_probe_subprocess(
@@ -541,6 +669,7 @@ def write_json_report(
     path: Path,
     args: argparse.Namespace,
     results: list[BenchmarkResult],
+    diagnostics: list[TraversalDiagnostic],
 ) -> None:
     payload = {
         "config": {
@@ -554,6 +683,7 @@ def write_json_report(
             "workspace": str(args.workspace),
         },
         "results": [asdict(result) for result in results],
+        "traversal_diagnostics": [asdict(diagnostic) for diagnostic in diagnostics],
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -562,6 +692,7 @@ def write_markdown_report(
     path: Path,
     args: argparse.Namespace,
     results: list[BenchmarkResult],
+    diagnostics: list[TraversalDiagnostic],
 ) -> None:
     lines = [
         "# Cypher Engine Benchmark",
@@ -596,6 +727,22 @@ def write_markdown_report(
             f"{result.row_count} | "
             f"`{result.checksum[:12]}` |"
         )
+    lines.extend(
+        [
+            "",
+            "## Traversal Diagnostics",
+            "",
+            (
+                "These counts measure representative intermediate traversal cardinalities "
+                "so traversal latency and memory can be explained by row expansion."
+            ),
+            "",
+            "| Diagnostic | Count | Seconds |",
+            "| --- | ---: | ---: |",
+        ]
+    )
+    for diagnostic in diagnostics:
+        lines.append(f"| {diagnostic.name} | {diagnostic.count} | {diagnostic.seconds:.6f} |")
     lines.extend(
         [
             "",

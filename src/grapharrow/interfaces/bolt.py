@@ -437,13 +437,9 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
         try:
             executor = state.transaction_cypher or server.bolt_app.grapharrow.use_cases.cypher
             statement_type = _statement_type_for_query(query)
-            before_state = (
-                executor._graph_service.load_state() if statement_type != "r" else None
-            )
+            before_state = executor._graph_service.load_state() if statement_type != "r" else None
             result = executor.execute(query, parameters)
-            after_state = (
-                executor._graph_service.load_state() if before_state is not None else None
-            )
+            after_state = executor._graph_service.load_state() if before_state is not None else None
         except GraphArrowError as exc:
             state.failed = True
             _bolt_log(server, f"query failed: {exc}")
@@ -587,8 +583,7 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
         batch = remaining[:limit]
         for row in batch:
             values = [
-                _packstream_result_value(column, row.get(column))
-                for column in pending.columns
+                _packstream_result_value(column, row.get(column)) for column in pending.columns
             ]
             _send_message(self.request, self.codec, PackstreamStructure(RECORD, [values]))
 
@@ -775,9 +770,7 @@ def main() -> int:
             "bolt_host": args.host or settings.bolt_host,
             "bolt_port": args.port or settings.bolt_port,
             "bolt_server_agent": args.server_agent or settings.bolt_server_agent,
-            "bolt_log_queries": False
-            if args.no_query_log
-            else settings.bolt_log_queries,
+            "bolt_log_queries": False if args.no_query_log else settings.bolt_log_queries,
         }
     )
     handle = start_bolt_server(build_bolt_application(database_path, settings=resolved_settings))

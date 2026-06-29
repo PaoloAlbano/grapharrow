@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pyarrow.parquet as pq  # type: ignore[import-untyped]
+
 from grapharrow import Database
 from grapharrow.domain import CatalogVersion, SnapshotId
 
@@ -64,6 +66,12 @@ def test_published_snapshot_contains_derived_files_for_labels_and_adjacency(tmp_
         session.query(
             "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'}) RETURN a, b"
         )
+        session.query(
+            "CREATE (a:Person {name: 'Carol'})-[:KNOWS]->(b:Person {name: 'Alice'}) RETURN a, b"
+        )
+        session.query(
+            "CREATE (a:Person {name: 'Dave'})-[:KNOWS]->(b:Person {name: 'Bob'}) RETURN a, b"
+        )
 
     manifest = database.load_snapshot()
 
@@ -72,9 +80,17 @@ def test_published_snapshot_contains_derived_files_for_labels_and_adjacency(tmp_
     assert len(manifest.node_labels) == 1
     assert len(manifest.node_properties) == 1
     assert len(manifest.adjacency_by_source) == 1
+    assert len(manifest.adjacency_by_dest) == 1
     assert len(manifest.edge_properties) == 1
     assert isinstance(database.path, Path)
     assert (database.path / manifest.node_labels[0].path).exists() is True
     assert (database.path / manifest.node_properties[0].path).exists() is True
     assert (database.path / manifest.adjacency_by_source[0].path).exists() is True
+    assert (database.path / manifest.adjacency_by_dest[0].path).exists() is True
     assert (database.path / manifest.edge_properties[0].path).exists() is True
+
+    adjacency_by_dest = pq.read_table(database.path / manifest.adjacency_by_dest[0].path)
+    assert adjacency_by_dest.column_names == ["src_id", "dst_id", "edge_id"]
+    assert adjacency_by_dest["dst_id"].to_pylist() == sorted(
+        adjacency_by_dest["dst_id"].to_pylist()
+    )

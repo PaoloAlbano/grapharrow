@@ -37,9 +37,8 @@ def query_requires_write(query: str) -> bool:
         if _updating_clauses_require_write(multi_part.oC_UpdatingClause()):
             return True
         single_part = multi_part.oC_SinglePartQuery()
-        return (
-            single_part is not None
-            and _updating_clauses_require_write(single_part.oC_UpdatingClause())
+        return single_part is not None and _updating_clauses_require_write(
+            single_part.oC_UpdatingClause()
         )
     single_part = single_query.oC_SinglePartQuery()
     if single_part is None:

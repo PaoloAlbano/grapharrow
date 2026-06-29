@@ -327,6 +327,7 @@ def _require_server_auth(
 
 def _register_error_handlers(app: FastAPI) -> None:
     """Register the API exception handlers used by this REST application."""
+
     @app.exception_handler(NotFoundError)
     async def not_found_handler(_: Request, exc: NotFoundError) -> JSONResponse:
         """Translate missing-entity failures into the stable REST error envelope."""

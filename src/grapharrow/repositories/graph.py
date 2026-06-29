@@ -74,6 +74,7 @@ class PersistedGraph:
     node_labels: tuple[DatasetFile, ...]
     node_properties: tuple[DatasetFile, ...]
     adjacency_by_source: tuple[DatasetFile, ...]
+    adjacency_by_dest: tuple[DatasetFile, ...]
     edge_properties: tuple[DatasetFile, ...]
 
 
@@ -119,6 +120,14 @@ class GraphRepository:
 
     def load_adjacency_by_source_table(self, files: tuple[DatasetFile, ...]) -> pa.Table:
         """Load adjacency-by-source tables referenced by ``files`` into one Arrow table."""
+
+        return self._parquet.read_dataset_table(
+            [self._absolute_location(dataset_file.path) for dataset_file in files],
+            schema=ADJACENCY_BY_SOURCE_SCHEMA,
+        )
+
+    def load_adjacency_by_dest_table(self, files: tuple[DatasetFile, ...]) -> pa.Table:
+        """Load adjacency-by-destination tables referenced by ``files`` into one Arrow table."""
 
         return self._parquet.read_dataset_table(
             [self._absolute_location(dataset_file.path) for dataset_file in files],
@@ -273,6 +282,11 @@ class GraphRepository:
             edges=edges,
             staged_dir=staged_dir,
         )
+        adjacency_by_dest_files = self._persist_adjacency_by_dest(
+            snapshot_id=snapshot_id,
+            edges=edges,
+            staged_dir=staged_dir,
+        )
         edge_property_files = self._persist_edge_property_tables(
             snapshot_id=snapshot_id,
             edges=edges,
@@ -306,6 +320,7 @@ class GraphRepository:
             node_labels=node_label_files,
             node_properties=node_property_files,
             adjacency_by_source=adjacency_files,
+            adjacency_by_dest=adjacency_by_dest_files,
             edge_properties=edge_property_files,
         )
         return persisted
@@ -436,6 +451,61 @@ class GraphRepository:
                     row_count=len(sorted_edges),
                     min_key=min((edge.src_id for edge in sorted_edges), default=None),
                     max_key=max((edge.src_id for edge in sorted_edges), default=None),
+                )
+            )
+        return tuple(dataset_files)
+
+    def _persist_adjacency_by_dest(
+        self,
+        *,
+        snapshot_id: SnapshotId,
+        edges: list[EdgeRecord],
+        staged_dir: Location,
+    ) -> tuple[DatasetFile, ...]:
+        """Write one adjacency-by-destination dataset per relationship type."""
+        dataset_files: list[DatasetFile] = []
+        by_type: dict[str, list[EdgeRecord]] = {}
+        for edge in edges:
+            by_type.setdefault(edge.rel_type, []).append(edge)
+
+        for rel_type, typed_edges in sorted(by_type.items()):
+            final_path = self._join(
+                self._layout.adjacency_by_dest_dir,
+                rel_type,
+                f"snapshot-{snapshot_id.value:06d}.parquet",
+            )
+            staged_path = self._join(
+                staged_dir,
+                "derived",
+                "adjacency",
+                "by_dest",
+                rel_type,
+                f"snapshot-{snapshot_id.value:06d}.parquet",
+            )
+            self._filesystem.create_dir(self._parent(staged_path))
+            self._filesystem.create_dir(self._parent(final_path))
+            sorted_edges = sorted(
+                typed_edges,
+                key=lambda item: (item.dst_id, item.src_id, item.edge_id),
+            )
+            table = pa.Table.from_pylist(
+                [
+                    {"src_id": edge.src_id, "dst_id": edge.dst_id, "edge_id": edge.edge_id}
+                    for edge in sorted_edges
+                ],
+                schema=ADJACENCY_BY_SOURCE_SCHEMA,
+            )
+            self._parquet.write_table(table, staged_path)
+            self._filesystem.copy_file(staged_path, final_path)
+            dataset_files.append(
+                _dataset_file_for(
+                    path=final_path,
+                    layout=self._layout,
+                    filesystem=self._filesystem,
+                    kind="adjacency_by_dest",
+                    row_count=len(sorted_edges),
+                    min_key=min((edge.dst_id for edge in sorted_edges), default=None),
+                    max_key=max((edge.dst_id for edge in sorted_edges), default=None),
                 )
             )
         return tuple(dataset_files)
