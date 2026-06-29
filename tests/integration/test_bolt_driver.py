@@ -43,8 +43,8 @@ def test_bolt_server_supports_direct_neo4j_driver_queries(tmp_path: Path) -> Non
                     "RETURN a, b"
                 ).single()
                 assert create_record is not None
-                assert create_record["a"]["properties"]["name"] == "Alice"
-                assert create_record["b"]["properties"]["name"] == "Bob"
+                assert create_record["a"]["name"] == "Alice"
+                assert create_record["b"]["name"] == "Bob"
 
                 result = session.run(
                     "MATCH (a:Person)-[:KNOWS]->(b:Person) "
@@ -54,6 +54,85 @@ def test_bolt_server_supports_direct_neo4j_driver_queries(tmp_path: Path) -> Non
             driver.close()
 
     assert result == [{"a.name": "Alice", "b.name": "Bob"}]
+
+
+@pytest.mark.integration
+def test_bolt_server_supports_endpoint_range_traversal_queries(tmp_path: Path) -> None:
+    database_path = tmp_path / "example-db"
+    settings = GraphArrowSettings(
+        database_path=database_path,
+        bolt_host="127.0.0.1",
+        bolt_port=0,
+        bolt_auth_token="secret",
+    )
+
+    with run_bolt_server(database_path, settings=settings) as handle:
+        driver = GraphDatabase.driver(
+            f"bolt://127.0.0.1:{handle.port}",
+            auth=basic_auth("neo4j", "secret"),
+        )
+        try:
+            with driver.session() as session:
+                for external_id, anchor in (
+                    ("person-000001", True),
+                    ("person-000002", False),
+                    ("person-000003", False),
+                    ("person-000004", False),
+                ):
+                    session.run(
+                        "CREATE (n:Person {external_id: $external_id, anchor: $anchor})",
+                        external_id=external_id,
+                        anchor=anchor,
+                    ).consume()
+                for source, target in (
+                    ("person-000001", "person-000002"),
+                    ("person-000001", "person-000003"),
+                    ("person-000003", "person-000002"),
+                    ("person-000002", "person-000004"),
+                ):
+                    session.run(
+                        "MATCH (a:Person {external_id: $source}), "
+                        "(b:Person {external_id: $target}) "
+                        "CREATE (a)-[:KNOWS]->(b)",
+                        source=source,
+                        target=target,
+                    ).consume()
+
+                range_rows = session.run(
+                    "MATCH (a:Person)-[*1..3]->(d:Person) "
+                    "WHERE a.anchor = true "
+                    "RETURN DISTINCT a.external_id, d.external_id "
+                    "ORDER BY a.external_id ASC, d.external_id ASC "
+                    "LIMIT 3"
+                ).data()
+                exact_rows = session.run(
+                    "MATCH (a:Person)-[*3]->(d:Person) "
+                    "WHERE a.anchor = true "
+                    "RETURN a.external_id, d.external_id "
+                    "ORDER BY a.external_id ASC, d.external_id ASC "
+                    "LIMIT 10"
+                ).data()
+                incoming_rows = session.run(
+                    "MATCH (d:Person)<-[:KNOWS]-(a:Person) "
+                    "WHERE d.external_id = 'person-000002' "
+                    "RETURN a.external_id, d.external_id "
+                    "ORDER BY a.external_id ASC"
+                ).data()
+        finally:
+            driver.close()
+
+    assert range_rows == [
+        {"a.external_id": "person-000001", "d.external_id": "person-000002"},
+        {"a.external_id": "person-000001", "d.external_id": "person-000003"},
+        {"a.external_id": "person-000001", "d.external_id": "person-000004"},
+    ]
+    assert exact_rows == [
+        {"a.external_id": "person-000001", "d.external_id": "person-000004"},
+    ]
+    assert incoming_rows == [
+        {"a.external_id": "person-000001", "d.external_id": "person-000002"},
+        {"a.external_id": "person-000003", "d.external_id": "person-000002"},
+    ]
 
 
 @pytest.mark.integration
@@ -132,8 +211,7 @@ def test_bolt_server_supports_match_create_with_inline_endpoint(tmp_path: Path) 
                     name="Acme Widget",
                 ).single()
                 linked = session.run(
-                    "MATCH (p:Product)-[:BELONGS_TO]->(c:Category) "
-                    "RETURN p.name, c.name"
+                    "MATCH (p:Product)-[:BELONGS_TO]->(c:Category) RETURN p.name, c.name"
                 ).single()
         finally:
             driver.close()
@@ -310,10 +388,7 @@ def test_bolt_server_returns_native_graph_values_for_schema_visualization(
 
     assert record is not None
     assert all(isinstance(node, Node) for node in record["nodes"])
-    assert all(
-        isinstance(relationship, Relationship)
-        for relationship in record["relationships"]
-    )
+    assert all(isinstance(relationship, Relationship) for relationship in record["relationships"])
     assert {tuple(node.labels)[0] for node in record["nodes"]} == {
         "Category",
         "Product",
@@ -347,8 +422,7 @@ def test_bolt_server_returns_native_graph_values_for_regular_return(
                     "(a:Location {name: 'Castle Black'}) RETURN d"
                 ).consume()
                 record = session.run(
-                    "MATCH (a:Location)<-[r:HAPPENED_IN]-(d:Death) "
-                    "RETURN a, r, d"
+                    "MATCH (a:Location)<-[r:HAPPENED_IN]-(d:Death) RETURN a, r, d"
                 ).single()
         finally:
             driver.close()

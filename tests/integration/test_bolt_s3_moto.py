@@ -41,8 +41,8 @@ def test_bolt_supports_s3_storage_via_moto_end_to_end(
                     "RETURN a, b"
                 ).single()
                 assert create_record is not None
-                assert create_record["a"]["properties"]["name"] == "Alice"
-                assert create_record["b"]["properties"]["name"] == "Bob"
+                assert create_record["a"]["name"] == "Alice"
+                assert create_record["b"]["name"] == "Bob"
 
                 result = session.run(
                     "MATCH (a:Person)-[:KNOWS]->(b:Person) "

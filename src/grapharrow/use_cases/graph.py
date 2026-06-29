@@ -152,6 +152,21 @@ class GraphStateUseCase:
         )
         return self._graph_store.load_adjacency_by_source_table(files)
 
+    def load_adjacency_by_dest_table(
+        self,
+        *,
+        snapshot: SnapshotManifest,
+        rel_type: str,
+    ) -> pa.Table:
+        """Load the adjacency-by-destination table for a relationship type."""
+
+        files = tuple(
+            dataset_file
+            for dataset_file in snapshot.adjacency_by_dest
+            if _adjacency_rel_type_from_file(dataset_file) == rel_type
+        )
+        return self._graph_store.load_adjacency_by_dest_table(files)
+
     def create_node(
         self,
         *,
@@ -750,7 +765,7 @@ class GraphStateUseCase:
             node_labels=persisted.node_labels,
             node_properties=persisted.node_properties,
             adjacency_by_source=persisted.adjacency_by_source,
-            adjacency_by_dest=(),
+            adjacency_by_dest=persisted.adjacency_by_dest,
             edge_properties=persisted.edge_properties,
         )
         try:
@@ -1415,7 +1430,11 @@ def _nodes_by_id(
 def _adjacency_rel_type_from_file(dataset_file: DatasetFile) -> str | None:
     """Extract the relationship type encoded in an adjacency derived-dataset path."""
     parts = PurePosixPath(dataset_file.path).parts
-    if "adjacency" not in parts or "by_source" not in parts or len(parts) < 2:
+    if (
+        "adjacency" not in parts
+        or ("by_source" not in parts and "by_dest" not in parts)
+        or len(parts) < 2
+    ):
         return None
     return parts[-2]
 

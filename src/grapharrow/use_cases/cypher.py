@@ -71,6 +71,7 @@ class RelationshipStep:
     direction: str = "outgoing"
     min_hops: int = 1
     max_hops: int = 1
+    rel_type_alternatives: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,11 +164,39 @@ RemoveItem: TypeAlias = RemovePropertyItem | RemoveLabelItem
 
 
 @dataclass(frozen=True, slots=True)
+class FieldExpression:
+    variable: str
+    field: str
+
+
+@dataclass(frozen=True, slots=True)
+class LiteralExpression:
+    value: object
+
+
+@dataclass(frozen=True, slots=True)
+class BinaryExpression:
+    operator: str
+    left: ScalarExpression
+    right: ScalarExpression
+
+
+@dataclass(frozen=True, slots=True)
+class FunctionExpression:
+    name: str
+    argument: ScalarExpression
+
+
+ScalarExpression = FieldExpression | LiteralExpression | BinaryExpression | FunctionExpression
+
+
+@dataclass(frozen=True, slots=True)
 class Comparison:
     variable: str
     field: str
     operator: str
     value: object
+    left_expression: ScalarExpression | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +211,12 @@ class StringPredicate:
 class ExistsPredicate:
     variable: str
     field: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExistsPatternPredicate:
+    patterns: tuple[CompiledPattern, ...]
+    where_predicate: WherePredicate | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +252,7 @@ WherePredicate = (
     Comparison
     | StringPredicate
     | ExistsPredicate
+    | ExistsPatternPredicate
     | InPredicate
     | NullPredicate
     | NotPredicate
@@ -230,9 +266,11 @@ class ReturnItem:
     expression: str
     variable: str
     field: str | None
+    scalar_expression: ScalarExpression | None = None
     aggregate: str | None = None
     count_all: bool = False
     aggregate_distinct: bool = False
+    aggregate_transform: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -513,11 +551,12 @@ class CypherQueryUseCase:
         """Support the current Cypher compilation or execution step."""
         if isinstance(self._graph_service, GraphTransactionUseCase):
             return None
-        cache: dict[str, pa.Table] = {}
+        source_cache: dict[str, pa.Table] = {}
+        dest_cache: dict[str, pa.Table] = {}
 
-        def load(rel_type: str) -> pa.Table:
-            """Load and cache the derived table needed by the current execution step."""
-            table = cache.get(rel_type)
+        def load_source(rel_type: str) -> pa.Table:
+            """Load and cache the outgoing adjacency table for the current execution step."""
+            table = source_cache.get(rel_type)
             if table is None:
                 table = self._graph_service.load_adjacency_by_source_table(
                     snapshot=state.snapshot,
@@ -528,10 +567,27 @@ class CypherQueryUseCase:
                         snapshot=state.snapshot,
                         rel_type=f"`{rel_type}`",
                     )
-                cache[rel_type] = table
+                source_cache[rel_type] = table
             return table
 
-        return load
+        def load_dest(rel_type: str) -> pa.Table:
+            """Load and cache the incoming adjacency table for the current execution step."""
+            table = dest_cache.get(rel_type)
+            if table is None:
+                table = self._graph_service.load_adjacency_by_dest_table(
+                    snapshot=state.snapshot,
+                    rel_type=rel_type,
+                )
+                if table.num_rows == 0:
+                    table = self._graph_service.load_adjacency_by_dest_table(
+                        snapshot=state.snapshot,
+                        rel_type=f"`{rel_type}`",
+                    )
+                dest_cache[rel_type] = table
+            return table
+
+        cast(Any, load_source).by_dest = load_dest
+        return load_source
 
     def _node_property_loader_for_state(
         self,
@@ -680,7 +736,13 @@ class CypherQueryUseCase:
 
     def _execute_match(self, query: CompiledMatchQuery) -> QueryResult:
         """Execute this query shape and return the result needed by the caller."""
-        logical_plan = _build_match_logical_plan(query) if _cypher_planner_enabled() else None
+        logical_plan = (
+            _build_match_logical_plan(query)
+            if _cypher_planner_enabled()
+            and not _predicate_has_exists_pattern(query.where_predicate)
+            and not _patterns_have_relationship_type_alternatives(query.patterns)
+            else None
+        )
         if logical_plan is not None:
             planned = self._execute_match_logical_plan(logical_plan)
             if planned.query_result is not None:
@@ -826,7 +888,17 @@ class CypherQueryUseCase:
                 left_keys=f"{plan.edge_variable}.target",
                 right_keys=_binding_column_name(plan.end_variable, "__join_id"),
             )
-            return _apply_node_pattern_filter(matched, step.node)
+            matched = _apply_node_pattern_filter(matched, step.node)
+            return _apply_where_predicate_table(
+                matched,
+                cast(WherePredicate | None, plan.end_pushdown_predicate),
+                nodes=state.node_table,
+                edges=state.edge_table,
+                tabular=self._tabular,
+                adjacency_by_source_loader=adjacency_loader,
+                node_property_loader=node_property_loader,
+                edge_property_loader=edge_property_loader,
+            )
         if isinstance(plan, FilterPlan):
             return _apply_where_predicate_table(
                 self._execute_logical_plan_node(
@@ -837,6 +909,12 @@ class CypherQueryUseCase:
                     node_property_loader=node_property_loader,
                 ),
                 cast(WherePredicate, plan.predicate),
+                nodes=state.node_table,
+                edges=state.edge_table,
+                tabular=self._tabular,
+                adjacency_by_source_loader=adjacency_loader,
+                node_property_loader=node_property_loader,
+                edge_property_loader=edge_property_loader,
             )
         if isinstance(plan, OptionalMatchPlan):
             if plan.input is None:
@@ -853,6 +931,12 @@ class CypherQueryUseCase:
                 matched = _apply_where_predicate_table(
                     matched,
                     cast(WherePredicate | None, plan.where_predicate),
+                    nodes=state.node_table,
+                    edges=state.edge_table,
+                    tabular=self._tabular,
+                    adjacency_by_source_loader=adjacency_loader,
+                    node_property_loader=node_property_loader,
+                    edge_property_loader=edge_property_loader,
                 )
                 if matched.num_rows == 0 and plan.null_columns is not None:
                     matched = _build_optional_null_table(list(plan.null_columns))
@@ -999,8 +1083,18 @@ class CypherQueryUseCase:
             adjacency_by_source_loader=adjacency_loader,
             node_property_loader=node_property_loader,
             edge_property_loader=edge_property_loader,
+            where_pushdown_predicate=query.where_predicate,
         )
-        matched_rows = _apply_where_predicate_table(matched_rows, query.where_predicate)
+        matched_rows = _apply_where_predicate_table(
+            matched_rows,
+            query.where_predicate,
+            nodes=state.node_table,
+            edges=state.edge_table,
+            tabular=self._tabular,
+            adjacency_by_source_loader=adjacency_loader,
+            node_property_loader=node_property_loader,
+            edge_property_loader=edge_property_loader,
+        )
         if matched_rows.num_rows == 0:
             matched_rows = _build_optional_null_table(matched_rows.column_names)
         return self._finalize_table_query_result(
@@ -1073,8 +1167,15 @@ class CypherQueryUseCase:
                 adjacency_by_source_loader=adjacency_loader,
                 node_property_loader=node_property_loader,
                 edge_property_loader=edge_property_loader,
+                where_pushdown_predicate=query.match_where_predicate,
             ),
             query.match_where_predicate,
+            nodes=state.node_table,
+            edges=state.edge_table,
+            tabular=self._tabular,
+            adjacency_by_source_loader=adjacency_loader,
+            node_property_loader=node_property_loader,
+            edge_property_loader=edge_property_loader,
         )
         result_rows = _optional_match_patterns_from_input_table(
             matched_rows,
@@ -1472,7 +1573,13 @@ class CypherQueryUseCase:
 
     def _execute_match_with(self, query: CompiledMatchWithQuery) -> QueryResult:
         """Execute this query shape and return the result needed by the caller."""
-        logical_plan = _build_match_with_logical_plan(query) if _cypher_planner_enabled() else None
+        logical_plan = (
+            _build_match_with_logical_plan(query)
+            if _cypher_planner_enabled()
+            and not _match_with_query_has_exists_pattern(query)
+            and not _match_with_query_has_relationship_type_alternatives(query)
+            else None
+        )
         if logical_plan is not None:
             planned = self._execute_match_logical_plan(logical_plan)
             if planned.query_result is not None:
@@ -1505,7 +1612,16 @@ class CypherQueryUseCase:
                 node_property_loader=node_property_loader,
                 edge_property_loader=edge_property_loader,
             )
-            matched_rows = _apply_where_predicate_table(matched_rows, query.match_where_predicate)
+            matched_rows = _apply_where_predicate_table(
+                matched_rows,
+                query.match_where_predicate,
+                nodes=state.node_table,
+                edges=state.edge_table,
+                tabular=self._tabular,
+                adjacency_by_source_loader=adjacency_loader,
+                node_property_loader=node_property_loader,
+                edge_property_loader=edge_property_loader,
+            )
             if matched_rows.num_rows == 0:
                 matched_rows = _build_optional_null_table(
                     _pattern_null_columns(query.match_patterns)
@@ -1520,7 +1636,16 @@ class CypherQueryUseCase:
                 node_property_loader=node_property_loader,
                 edge_property_loader=edge_property_loader,
             )
-            matched_rows = _apply_where_predicate_table(matched_rows, query.match_where_predicate)
+            matched_rows = _apply_where_predicate_table(
+                matched_rows,
+                query.match_where_predicate,
+                nodes=state.node_table,
+                edges=state.edge_table,
+                tabular=self._tabular,
+                adjacency_by_source_loader=adjacency_loader,
+                node_property_loader=node_property_loader,
+                edge_property_loader=edge_property_loader,
+            )
 
         if query.with_aggregate_items:
             with_rows = _build_aggregate_table_from_table(
@@ -1532,7 +1657,16 @@ class CypherQueryUseCase:
             with_rows = _project_with_items_table(matched_rows, query.with_items)
         if query.with_distinct:
             with_rows = _apply_distinct_to_table(with_rows)
-        with_rows = _apply_where_predicate_table(with_rows, query.with_where_predicate)
+        with_rows = _apply_where_predicate_table(
+            with_rows,
+            query.with_where_predicate,
+            nodes=state.node_table,
+            edges=state.edge_table,
+            tabular=self._tabular,
+            adjacency_by_source_loader=adjacency_loader,
+            node_property_loader=node_property_loader,
+            edge_property_loader=edge_property_loader,
+        )
         if query.with_order_by is not None:
             with_rows = self._apply_order_by(with_rows, query.with_order_by)
         if query.with_skip is not None:
@@ -1597,10 +1731,17 @@ class CypherQueryUseCase:
                         adjacency_by_source_loader=adjacency_loader,
                         node_property_loader=node_property_loader,
                         edge_property_loader=edge_property_loader,
+                        where_pushdown_predicate=query.post_with_match_where_predicate,
                     )
                 result_input_rows = _apply_where_predicate_table(
                     result_input_rows,
                     query.post_with_match_where_predicate,
+                    nodes=state.node_table,
+                    edges=state.edge_table,
+                    tabular=self._tabular,
+                    adjacency_by_source_loader=adjacency_loader,
+                    node_property_loader=node_property_loader,
+                    edge_property_loader=edge_property_loader,
                 )
 
         if query.post_with_create_relationship_patterns:
@@ -1727,8 +1868,15 @@ class CypherQueryUseCase:
                 adjacency_by_source_loader=adjacency_loader,
                 node_property_loader=node_property_loader,
                 edge_property_loader=edge_property_loader,
+                where_pushdown_predicate=residual_predicate,
             ),
             residual_predicate,
+            nodes=state.node_table,
+            edges=state.edge_table,
+            tabular=self._tabular,
+            adjacency_by_source_loader=adjacency_loader,
+            node_property_loader=node_property_loader,
+            edge_property_loader=edge_property_loader,
         )
 
     def _finalize_table_query_result(
@@ -1764,6 +1912,17 @@ class CypherQueryUseCase:
                 return _build_grouped_aggregate_query_result(return_items, result_rows)
             result = _build_aggregate_query_result_from_table(aggregate_items, rows)
             return _apply_distinct_to_query_result(result) if distinct else result
+
+        if distinct and _can_apply_projected_distinct_window(return_items, order_by):
+            projected_rows = _project_return_items_table(rows, return_items)
+            projected_rows = _apply_distinct_to_table(projected_rows)
+            projected_rows = self._apply_result_window(
+                projected_rows,
+                order_by=order_by,
+                skip=skip,
+                limit=limit,
+            )
+            return _build_query_result_from_table(return_items, projected_rows)
 
         result_rows = self._apply_result_window(rows, order_by=order_by, skip=skip, limit=limit)
         result = _build_query_result_from_table(return_items, result_rows)
@@ -1918,8 +2077,7 @@ def _execute_neo4j_compatibility_procedure(query: str) -> QueryResult | None:
                 {
                     "name": "db.schema.visualization",
                     "signature": (
-                        "db.schema.visualization() :: "
-                        "(nodes :: LIST, relationships :: LIST)"
+                        "db.schema.visualization() :: (nodes :: LIST, relationships :: LIST)"
                     ),
                     "description": "Returns a lightweight graph schema visualization.",
                     "mode": "READ",
@@ -2018,13 +2176,9 @@ def _execute_schema_compatibility_procedure(
     if lower.startswith("call db.propertykeys"):
         property_keys: set[str] = set()
         for node in state.nodes:
-            property_keys.update(
-                key for key, value in node.properties.items() if value is not None
-            )
+            property_keys.update(key for key, value in node.properties.items() if value is not None)
         for edge in state.edges:
-            property_keys.update(
-                key for key, value in edge.properties.items() if value is not None
-            )
+            property_keys.update(key for key, value in edge.properties.items() if value is not None)
         return _compatibility_rows_query_result(
             query,
             ({"propertyKey": key} for key in sorted(property_keys)),
@@ -2417,7 +2571,12 @@ def _compile_query(
             if first_match_ctx.OPTIONAL() is not None:
                 raise QueryError("OPTIONAL MATCH cannot be the first clause in a two-MATCH query.")
             if second_match_ctx.OPTIONAL() is None:
-                raise QueryError("Only MATCH ... OPTIONAL MATCH ... RETURN is supported for now.")
+                return _compile_multi_match_query(
+                    reading_clauses,
+                    return_ctx,
+                    params,
+                    compiler_state,
+                )
             return _compile_match_optional_query(
                 first_match_ctx,
                 second_match_ctx,
@@ -2446,7 +2605,10 @@ def _compile_create_query(
     """Compile this Cypher fragment into the internal structures used later."""
     patterns = _compile_create_patterns(create_ctx.oC_Pattern(), params, state)
     if return_ctx is not None:
-        return_items, distinct = _compile_return_items(return_ctx.oC_ProjectionBody())
+        return_items, distinct = _compile_return_items(
+            return_ctx.oC_ProjectionBody(),
+            scope=_scope_from_patterns(patterns),
+        )
     else:
         return_items, distinct = (), False
     return CompiledCreateQuery(
@@ -2661,18 +2823,14 @@ def _compile_multi_part_query(
                 set_ctx,
                 params,
                 bound_variables={
-                    variable
-                    for variable, kind in final_scope.items()
-                    if kind == "entity"
+                    variable for variable, kind in final_scope.items() if kind == "entity"
                 },
             )
         elif delete_ctx is not None:
             post_with_delete_detach, post_with_delete_items = _compile_delete_items(
                 delete_ctx,
                 bound_variables={
-                    variable
-                    for variable, kind in final_scope.items()
-                    if kind == "entity"
+                    variable for variable, kind in final_scope.items() if kind == "entity"
                 },
             )
         else:
@@ -2689,9 +2847,7 @@ def _compile_multi_part_query(
                 trailing_set_ctx,
                 params,
                 bound_variables={
-                    variable
-                    for variable, kind in final_scope.items()
-                    if kind == "entity"
+                    variable for variable, kind in final_scope.items() if kind == "entity"
                 },
             )
     if return_ctx is not None:
@@ -3555,7 +3711,7 @@ def _compile_pattern_element(
     for chain_ctx in chains:
         relationship_pattern = chain_ctx.oC_RelationshipPattern()
         next_node = _compile_node_pattern(chain_ctx.oC_NodePattern(), params, state)
-        variable, rel_type, properties, direction, min_hops, max_hops = (
+        variable, rel_type, rel_type_alternatives, properties, direction, min_hops, max_hops = (
             _compile_relationship_pattern(
                 relationship_pattern,
                 params,
@@ -3571,6 +3727,7 @@ def _compile_pattern_element(
                 direction=direction,
                 min_hops=min_hops,
                 max_hops=max_hops,
+                rel_type_alternatives=rel_type_alternatives,
             )
         )
 
@@ -3630,8 +3787,7 @@ def _compile_node_labels(
     if labels_ctx is None:
         return ()
     return tuple(
-        _cypher_name(label_ctx.oC_LabelName().getText())
-        for label_ctx in labels_ctx.oC_NodeLabel()
+        _cypher_name(label_ctx.oC_LabelName().getText()) for label_ctx in labels_ctx.oC_NodeLabel()
     )
 
 
@@ -3640,7 +3796,7 @@ def _compile_relationship_pattern(
     params: dict[str, object],
     *,
     allow_variable: bool,
-) -> tuple[str | None, str | None, dict[str, object], str, int, int]:
+) -> tuple[str | None, str | None, tuple[str, ...], dict[str, object], str, int, int]:
     """Compile this Cypher fragment into the internal structures used later."""
     if relationship_ctx is None:
         raise QueryError("Relationship pattern is required.")
@@ -3648,34 +3804,36 @@ def _compile_relationship_pattern(
     has_right_arrow = relationship_ctx.oC_RightArrowHead() is not None
     if has_left_arrow and has_right_arrow:
         raise QueryError("Bidirectional relationship arrows are not supported.")
-    if not has_left_arrow and not has_right_arrow:
-        raise QueryError("Undirected relationship patterns are not supported yet.")
-    direction = "incoming" if has_left_arrow else "outgoing"
+    direction = "incoming" if has_left_arrow else "outgoing" if has_right_arrow else "undirected"
 
     detail = relationship_ctx.oC_RelationshipDetail()
     if detail is None:
-        return None, None, {}, direction, 1, 1
+        return None, None, (), {}, direction, 1, 1
     variable_ctx = detail.oC_Variable()
     variable = variable_ctx.getText() if variable_ctx is not None else None
     if variable is not None and not allow_variable:
         raise QueryError("Relationship variables are not supported yet.")
 
     rel_type: str | None = None
+    rel_type_alternatives: tuple[str, ...] = ()
     relationship_types = detail.oC_RelationshipTypes()
     if relationship_types is not None:
         rel_type_names = cast(
             list[CypherParser.OC_RelTypeNameContext],
             relationship_types.oC_RelTypeName(),
         )
-        if len(rel_type_names) != 1:
-            raise QueryError("Only a single relationship type is supported per hop.")
-        rel_type = _cypher_name(rel_type_names[0].getText())
+        rel_type_alternatives = tuple(
+            _cypher_name(rel_type_name.getText()) for rel_type_name in rel_type_names
+        )
+        rel_type = rel_type_alternatives[0] if len(rel_type_alternatives) == 1 else None
 
     properties = _compile_properties(detail.oC_Properties(), params)
     min_hops, max_hops = _compile_range_literal(detail.oC_RangeLiteral())
+    if direction == "undirected" and (min_hops != 1 or max_hops != 1):
+        raise QueryError("Variable-length undirected relationships are not supported yet.")
     if variable is not None and (min_hops != 1 or max_hops != 1):
         raise QueryError("Relationship variables are not supported on variable-length hops yet.")
-    return variable, rel_type, properties, direction, min_hops, max_hops
+    return variable, rel_type, rel_type_alternatives, properties, direction, min_hops, max_hops
 
 
 def _compile_range_literal(
@@ -4056,7 +4214,7 @@ def _compile_return_items(
     if projection_items is None:
         raise QueryError("RETURN clause cannot be empty.")
     if projection_items.getText() == "*":
-        raise QueryError("RETURN * is not supported yet.")
+        return _compile_return_star_items(scope), distinct
 
     items = cast(list[CypherParser.OC_ProjectionItemContext], projection_items.oC_ProjectionItem())
     if not items:
@@ -4076,6 +4234,18 @@ def _compile_return_items(
             compiled_items.append(aggregate_item)
             continue
 
+        scalar_expression = _compile_scalar_expression(expression_text, scope=scope)
+        if scalar_expression is not None and not isinstance(scalar_expression, FieldExpression):
+            compiled_items.append(
+                ReturnItem(
+                    expression=column_name,
+                    variable=column_name,
+                    field="value",
+                    scalar_expression=scalar_expression,
+                )
+            )
+            continue
+
         variable, field = _compile_projection_expression(expression_text, scope=scope)
         compiled_items.append(
             ReturnItem(
@@ -4086,6 +4256,29 @@ def _compile_return_items(
         )
 
     return tuple(compiled_items), distinct
+
+
+def _compile_return_star_items(
+    scope: Mapping[str, ScopeBindingKind] | None,
+) -> tuple[ReturnItem, ...]:
+    """Expand RETURN * into the currently visible public bindings."""
+
+    if scope is None:
+        raise QueryError("RETURN * requires a known query scope.")
+    items: list[ReturnItem] = []
+    for variable, binding_kind in scope.items():
+        if _is_internal_variable(variable):
+            continue
+        items.append(
+            ReturnItem(
+                expression=variable,
+                variable=variable,
+                field=None if binding_kind == "entity" else "value",
+            )
+        )
+    if not items:
+        raise QueryError("RETURN * has no visible bindings.")
+    return tuple(items)
 
 
 def _compile_unwind_source(
@@ -4121,16 +4314,33 @@ def _compile_aggregate_return_item(
     scope: Mapping[str, ScopeBindingKind] | None = None,
 ) -> ReturnItem | None:
     """Compile this Cypher fragment into the internal structures used later."""
-    match = re.fullmatch(r"(?i)count\((.+)\)", expression_text)
+    normalized_expression = expression_text.replace(" ", "")
+    rounded_avg_match = re.fullmatch(
+        r"(?i)round\(100\*avg\((.+)\)\)/100",
+        normalized_expression,
+    )
+    if rounded_avg_match is not None:
+        return _compile_scalar_aggregate_item(
+            "avg",
+            rounded_avg_match.group(1).strip(),
+            column_name,
+            scope=scope,
+            aggregate_transform="round_2",
+        )
+
+    match = re.fullmatch(r"(?i)(count|sum|avg|min|max|collect)\((.+)\)", expression_text)
     if match is None:
         return None
 
-    operand = match.group(1).strip()
+    aggregate_name = match.group(1).lower()
+    operand = match.group(2).strip()
     aggregate_distinct = False
     if operand.upper().startswith("DISTINCT "):
         aggregate_distinct = True
         operand = operand[len("DISTINCT ") :].strip()
     if operand == "*":
+        if aggregate_name != "count":
+            raise QueryError(f"{aggregate_name.upper()}(*) is not supported.")
         if aggregate_distinct:
             raise QueryError("COUNT(DISTINCT *) is not supported.")
         return ReturnItem(
@@ -4140,14 +4350,37 @@ def _compile_aggregate_return_item(
             aggregate="count",
             count_all=True,
         )
+    if aggregate_name not in {"count", "collect"} and aggregate_distinct:
+        raise QueryError(f"{aggregate_name.upper()}(DISTINCT ...) is not supported yet.")
+    return _compile_scalar_aggregate_item(
+        aggregate_name,
+        operand,
+        column_name,
+        scope=scope,
+        aggregate_distinct=aggregate_distinct,
+    )
+
+
+def _compile_scalar_aggregate_item(
+    aggregate_name: str,
+    operand: str,
+    column_name: str,
+    *,
+    scope: Mapping[str, ScopeBindingKind] | None,
+    aggregate_distinct: bool = False,
+    aggregate_transform: str | None = None,
+) -> ReturnItem:
+    """Compile an aggregate over a property, scalar binding, or entity binding."""
+
     if "." in operand:
         variable, field = _parse_property_reference(operand)
         return ReturnItem(
             expression=column_name,
             variable=variable,
             field=field,
-            aggregate="count",
+            aggregate=aggregate_name,
             aggregate_distinct=aggregate_distinct,
+            aggregate_transform=aggregate_transform,
         )
     if _IDENTIFIER_RE.fullmatch(operand):
         operand_field: str | None = None
@@ -4155,14 +4388,17 @@ def _compile_aggregate_return_item(
             binding_kind = scope.get(operand)
             if binding_kind == "scalar":
                 operand_field = "value"
+        if aggregate_name not in {"count", "collect"} and operand_field is None:
+            raise QueryError(f"{aggregate_name.upper()} requires a scalar or property operand.")
         return ReturnItem(
             expression=column_name,
             variable=operand,
             field=operand_field,
-            aggregate="count",
+            aggregate=aggregate_name,
             aggregate_distinct=aggregate_distinct,
+            aggregate_transform=aggregate_transform,
         )
-    raise QueryError(f"Unsupported aggregate RETURN expression: {expression_text}")
+    raise QueryError(f"Unsupported aggregate RETURN expression: {aggregate_name}({operand})")
 
 
 def _validate_return_items(return_items: tuple[ReturnItem, ...]) -> None:
@@ -4170,9 +4406,15 @@ def _validate_return_items(return_items: tuple[ReturnItem, ...]) -> None:
     aggregate_items = [item for item in return_items if item.aggregate is not None]
     if not aggregate_items:
         return
-    unsupported = [item for item in aggregate_items if item.aggregate != "count"]
+    unsupported = [
+        item
+        for item in aggregate_items
+        if item.aggregate not in {"count", "sum", "avg", "min", "max", "collect"}
+    ]
     if unsupported:
-        raise QueryError("Only COUNT aggregate RETURN items are supported.")
+        raise QueryError(
+            "Only COUNT, SUM, AVG, MIN, MAX, and COLLECT aggregate RETURN items are supported."
+        )
 
 
 def _compile_order_by(
@@ -4240,6 +4482,117 @@ def _compile_projection_expression(
         if binding_kind == "scalar":
             return expression_text, "value"
     return expression_text, None
+
+
+def _compile_scalar_expression(
+    expression_text: str,
+    *,
+    scope: Mapping[str, ScopeBindingKind] | None = None,
+) -> ScalarExpression | None:
+    """Compile a small numeric/list scalar expression used by projections and WHERE."""
+
+    expression_text = expression_text.strip()
+    wrapped = _strip_wrapping_parentheses(expression_text)
+    if wrapped != expression_text:
+        return _compile_scalar_expression(wrapped, scope=scope)
+
+    function_match = re.fullmatch(r"(?i)(abs|size|tolower|toupper)\((.+)\)", expression_text)
+    if function_match is not None:
+        argument = _compile_scalar_expression(function_match.group(2), scope=scope)
+        if argument is None:
+            return None
+        return FunctionExpression(name=function_match.group(1).lower(), argument=argument)
+
+    for operators in (("+", "-"), ("*", "/")):
+        split = _split_top_level_operator(expression_text, operators)
+        if split is None:
+            continue
+        left_text, operator, right_text = split
+        left = _compile_scalar_expression(left_text, scope=scope)
+        right = _compile_scalar_expression(right_text, scope=scope)
+        if left is None or right is None:
+            return None
+        return BinaryExpression(operator=operator, left=left, right=right)
+
+    try:
+        parsed_value = _parse_value(expression_text, {})
+        if not isinstance(parsed_value, PropertyReferenceValue):
+            return LiteralExpression(value=parsed_value)
+    except QueryError:
+        pass
+
+    if "." in expression_text:
+        variable, field = _parse_property_reference(expression_text)
+        if scope is not None and scope.get(variable) == "scalar":
+            raise QueryError(f"Cannot access properties on scalar binding '{variable}'.")
+        return FieldExpression(variable=variable, field=field)
+
+    if scope is not None and _IDENTIFIER_RE.fullmatch(expression_text):
+        binding_kind = scope.get(expression_text)
+        if binding_kind == "scalar":
+            return FieldExpression(variable=expression_text, field="value")
+        return None
+    if _IDENTIFIER_RE.fullmatch(expression_text):
+        return None
+    return None
+
+
+def _strip_wrapping_parentheses(expression_text: str) -> str:
+    """Remove one pair of parentheses that wraps the whole expression."""
+
+    if not expression_text.startswith("(") or not expression_text.endswith(")"):
+        return expression_text
+    depth = 0
+    quote: str | None = None
+    for index, character in enumerate(expression_text):
+        if quote is not None:
+            if character == quote:
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            continue
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0 and index != len(expression_text) - 1:
+                return expression_text
+    return expression_text[1:-1].strip() if depth == 0 else expression_text
+
+
+def _split_top_level_operator(
+    expression_text: str,
+    operators: tuple[str, ...],
+) -> tuple[str, str, str] | None:
+    """Split an expression on the right-most top-level arithmetic operator."""
+
+    depth = 0
+    quote: str | None = None
+    for index in range(len(expression_text) - 1, -1, -1):
+        character = expression_text[index]
+        if quote is not None:
+            if character == quote:
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            continue
+        if character in ")]}":
+            depth += 1
+            continue
+        if character in "([{":
+            depth -= 1
+            continue
+        if depth != 0 or character not in operators:
+            continue
+        if character in {"+", "-"} and (index == 0 or expression_text[index - 1] in "+-*/("):
+            continue
+        left = expression_text[:index].strip()
+        right = expression_text[index + 1 :].strip()
+        if left and right:
+            return left, character, right
+    return None
 
 
 def _compile_order_expression(
@@ -4433,22 +4786,48 @@ def _compile_comparison_expression(
     if len(partials) > 1:
         raise QueryError("WHERE clauses must contain a single comparison.")
 
+    exists_pattern_predicate = _compile_exists_pattern_predicate(
+        left_operand,
+        params,
+        scope=scope,
+    )
+    if exists_pattern_predicate is not None:
+        if partials:
+            raise QueryError("EXISTS { ... } cannot be used with a comparison operator.")
+        return exists_pattern_predicate
+
     if partials:
-        left_variable, left_field = _compile_property_operand(left_operand, scope=scope)
+        left_expression_text = left_operand.oC_AddOrSubtractExpression().getText()
+        left_expression = _compile_scalar_expression(left_expression_text, scope=scope)
+        left_variable: str
+        left_field: str
+        if left_expression is not None and not isinstance(left_expression, FieldExpression):
+            left_variable, left_field = "__expr__", "value"
+        else:
+            left_variable, left_field = _compile_property_operand(left_operand, scope=scope)
         partial = partials[0]
         operator = partial.getChild(0).getText()
-        if operator not in {"=", "!=", ">", ">=", "<", "<="}:
+        if operator not in {"=", "!=", "<>", ">", ">=", "<", "<="}:
             raise QueryError(f"Unsupported comparison operator: {operator}")
+        if operator == "<>":
+            operator = "!="
 
-        right_value = _compile_scalar_operand(
-            partial.oC_StringListNullPredicateExpression(),
-            params,
+        right_operand = partial.oC_StringListNullPredicateExpression()
+        right_expression_text = right_operand.oC_AddOrSubtractExpression().getText()
+        right_expression = _compile_scalar_expression(right_expression_text, scope=scope)
+        right_value = (
+            right_expression
+            if right_expression is not None and not isinstance(right_expression, LiteralExpression)
+            else _compile_scalar_operand(right_operand, params)
         )
         return Comparison(
             variable=left_variable,
             field=left_field,
             operator=operator,
             value=right_value,
+            left_expression=left_expression
+            if left_expression is not None and not isinstance(left_expression, FieldExpression)
+            else None,
         )
 
     exists_predicate = _compile_exists_predicate(left_operand, scope=scope)
@@ -4494,6 +4873,56 @@ def _compile_comparison_expression(
         )
 
     raise QueryError("Unsupported WHERE predicate.")
+
+
+def _compile_exists_pattern_predicate(
+    predicate_ctx: Any,
+    params: dict[str, object],
+    *,
+    scope: Mapping[str, ScopeBindingKind] | None = None,
+) -> ExistsPatternPredicate | None:
+    """Compile EXISTS { pattern } into a correlated pattern predicate."""
+
+    atom = _single_predicate_atom(predicate_ctx.oC_AddOrSubtractExpression())
+    if atom is None:
+        return None
+    exists_ctx = atom.oC_ExistentialSubquery()
+    if exists_ctx is None:
+        return None
+    if exists_ctx.oC_RegularQuery() is not None:
+        raise QueryError("EXISTS subqueries with full queries are not supported yet.")
+    pattern_ctx = exists_ctx.oC_Pattern()
+    if pattern_ctx is None:
+        raise QueryError("EXISTS { ... } requires a pattern.")
+    patterns = _compile_match_patterns(pattern_ctx, params, _CompilerState())
+    pattern_scope = _scope_from_patterns(patterns)
+    inner_scope = (
+        _extend_scope_with_patterns(scope, patterns) if scope is not None else pattern_scope
+    )
+    where_predicate = (
+        _compile_where(exists_ctx.oC_Where(), params, inner_scope)
+        if exists_ctx.oC_Where() is not None
+        else None
+    )
+    return ExistsPatternPredicate(patterns=patterns, where_predicate=where_predicate)
+
+
+def _single_predicate_atom(expression_ctx: Any) -> Any | None:
+    """Return the single atom for non-arithmetic predicate expressions."""
+
+    multiply_contexts = expression_ctx.oC_MultiplyDivideModuloExpression()
+    if len(multiply_contexts) != 1:
+        return None
+    power_contexts = multiply_contexts[0].oC_PowerOfExpression()
+    if len(power_contexts) != 1:
+        return None
+    unary_contexts = power_contexts[0].oC_UnaryAddOrSubtractExpression()
+    if len(unary_contexts) != 1:
+        return None
+    non_arithmetic = unary_contexts[0].oC_NonArithmeticOperatorExpression()
+    if len(non_arithmetic.oC_PropertyLookup()) > 0 or non_arithmetic.oC_NodeLabels() is not None:
+        return None
+    return non_arithmetic.oC_Atom()
 
 
 def _compile_property_operand(
@@ -4659,6 +5088,7 @@ def _match_patterns_table(
     adjacency_by_source_loader: Callable[[str], pa.Table] | None = None,
     node_property_loader: Callable[[str], pa.Table] | None = None,
     edge_property_loader: Callable[[str], pa.Table] | None = None,
+    where_pushdown_predicate: WherePredicate | None = None,
 ) -> pa.Table:
     """Produce binding rows for this pattern against the current graph state."""
     if not patterns:
@@ -4673,6 +5103,7 @@ def _match_patterns_table(
         adjacency_by_source_loader=adjacency_by_source_loader,
         node_property_loader=node_property_loader,
         edge_property_loader=edge_property_loader,
+        where_pushdown_predicate=where_pushdown_predicate,
     )
     bound_variables = set(_pattern_variables(patterns[0]))
     allow_disconnected_cross_join = _is_bounded_node_lookup_pattern(patterns[0])
@@ -4687,6 +5118,7 @@ def _match_patterns_table(
             adjacency_by_source_loader=adjacency_by_source_loader,
             node_property_loader=node_property_loader,
             edge_property_loader=edge_property_loader,
+            where_pushdown_predicate=where_pushdown_predicate,
         )
         pattern_variables = set(_pattern_variables(pattern))
         shared_variables = tuple(sorted(bound_variables & pattern_variables))
@@ -4735,6 +5167,7 @@ def _match_patterns_from_input_table(
     adjacency_by_source_loader: Callable[[str], pa.Table] | None = None,
     node_property_loader: Callable[[str], pa.Table] | None = None,
     edge_property_loader: Callable[[str], pa.Table] | None = None,
+    where_pushdown_predicate: WherePredicate | None = None,
 ) -> pa.Table:
     """Produce binding rows for this pattern against the current graph state."""
     if not patterns:
@@ -4752,6 +5185,7 @@ def _match_patterns_from_input_table(
             adjacency_by_source_loader=adjacency_by_source_loader,
             node_property_loader=node_property_loader,
             edge_property_loader=edge_property_loader,
+            where_pushdown_predicate=where_pushdown_predicate,
         )
         pattern_variables = set(_pattern_variables(pattern))
         shared_variables = tuple(sorted(bound_variables & pattern_variables))
@@ -4767,8 +5201,7 @@ def _match_patterns_from_input_table(
                 shared_variables=set(shared_variables),
             )
             join_keys = [
-                _binding_column_name(variable, "__join_id")
-                for variable in shared_variables
+                _binding_column_name(variable, "__join_id") for variable in shared_variables
             ]
             matched = tabular.inner_join(
                 matched,
@@ -4822,7 +5255,16 @@ def _optional_match_patterns_from_input_table(
         node_property_loader=node_property_loader,
         edge_property_loader=edge_property_loader,
     )
-    matched = _apply_where_predicate_table(matched, where_predicate)
+    matched = _apply_where_predicate_table(
+        matched,
+        where_predicate,
+        nodes=nodes,
+        edges=edges,
+        tabular=tabular,
+        adjacency_by_source_loader=adjacency_by_source_loader,
+        node_property_loader=node_property_loader,
+        edge_property_loader=edge_property_loader,
+    )
 
     input_variables = _entity_variables_from_table(input_table)
     optional_variables = {
@@ -5059,6 +5501,7 @@ def _match_single_pattern_table(
     adjacency_by_source_loader: Callable[[str], pa.Table] | None = None,
     node_property_loader: Callable[[str], pa.Table] | None = None,
     edge_property_loader: Callable[[str], pa.Table] | None = None,
+    where_pushdown_predicate: WherePredicate | None = None,
 ) -> pa.Table:
     """Produce binding rows for this pattern against the current graph state."""
     if _can_use_iterative_variable_length_match(pattern):
@@ -5086,6 +5529,7 @@ def _match_single_pattern_table(
                     required_fields=required_fields,
                     adjacency_by_source_loader=adjacency_by_source_loader,
                     edge_property_loader=edge_property_loader,
+                    where_pushdown_predicate=where_pushdown_predicate,
                 )
             )
         else:
@@ -5113,6 +5557,7 @@ def _match_fixed_path_table(
     adjacency_by_source_loader: Callable[[str], pa.Table] | None = None,
     node_property_loader: Callable[[str], pa.Table] | None = None,
     edge_property_loader: Callable[[str], pa.Table] | None = None,
+    where_pushdown_predicate: WherePredicate | None = None,
 ) -> pa.Table:
     """Produce binding rows for this pattern against the current graph state."""
     matched = _apply_node_pattern_filter(
@@ -5189,6 +5634,13 @@ def _match_fixed_path_table(
             right_keys=_binding_column_name(step.node.variable, "__join_id"),
         )
         matched = _apply_node_pattern_filter(matched, step.node)
+        matched = _apply_where_predicate_table(
+            matched,
+            _pushdown_predicate_for_bound_variable(
+                where_pushdown_predicate,
+                step.node.variable,
+            ),
+        )
         matched = _ensure_join_id_column(matched, step.node.variable)
         if matched.num_rows == 0:
             return _project_public_pattern_columns(matched, pattern)
@@ -5249,6 +5701,7 @@ def _match_single_variable_length_path_table(
         )
 
     current_id_column = "__varlen_current.id"
+    start_id_column = "__varlen_start.id"
     start_prefix = f"{pattern.start.variable}."
     start_columns = [
         column_name
@@ -5257,7 +5710,9 @@ def _match_single_variable_length_path_table(
     ]
     frontier = pa.table(
         {
-            **{column_name: start_table[column_name] for column_name in start_columns},
+            start_id_column: start_table[
+                _binding_column_name(pattern.start.variable, _NODE_ID_FIELD)
+            ],
             current_id_column: start_table[
                 _binding_column_name(pattern.start.variable, _NODE_ID_FIELD)
             ],
@@ -5317,11 +5772,22 @@ def _match_single_variable_length_path_table(
         if hop_count >= step.min_hops:
             candidate_rows = _apply_node_pattern_filter(joined_nodes, step.node)
             if candidate_rows.num_rows > 0:
-                result_tables.append(_project_public_pattern_columns(candidate_rows, pattern))
+                result_tables.append(
+                    _project_public_pattern_columns(
+                        _with_variable_length_start_fields(
+                            candidate_rows,
+                            start_table.select(start_columns),
+                            start_variable=pattern.start.variable,
+                            start_id_column=start_id_column,
+                            tabular=tabular,
+                        ),
+                        pattern,
+                    )
+                )
 
         frontier = pa.table(
             {
-                **{column_name: joined_nodes[column_name] for column_name in start_columns},
+                start_id_column: joined_nodes[start_id_column],
                 current_id_column: joined_nodes[
                     _binding_column_name(step.node.variable, _NODE_ID_FIELD)
                 ],
@@ -5369,11 +5835,54 @@ def _empty_public_path_table(
     return pa.table({**start_columns, **end_columns})
 
 
+def _with_variable_length_start_fields(
+    table: pa.Table,
+    start_table: pa.Table,
+    *,
+    start_variable: str,
+    start_id_column: str,
+    tabular: PyArrowTabularAdapter,
+) -> pa.Table:
+    """Attach start-node fields after variable-length expansion produces output rows."""
+
+    if all(column_name in table.column_names for column_name in start_table.column_names):
+        return table
+    return tabular.inner_join(
+        table,
+        start_table,
+        left_keys=start_id_column,
+        right_keys=_binding_column_name(start_variable, _NODE_ID_FIELD),
+    )
+
+
+def _empty_endpoint_range_projection_table(
+    start_table: pa.Table,
+    end_table: pa.Table,
+    *,
+    return_items: tuple[ReturnItem, ...],
+) -> pa.Table:
+    """Build an empty projected result for the endpoint-range executor."""
+
+    columns: dict[str, pa.ChunkedArray | pa.Array] = {}
+    for column_name in start_table.column_names:
+        columns[column_name] = start_table[column_name].slice(0, 0)
+    for column_name in end_table.column_names:
+        if column_name not in columns:
+            columns[column_name] = end_table[column_name].slice(0, 0)
+    return _project_return_items_table(pa.table(columns), return_items)
+
+
 def _expand_pattern_variants(pattern: CompiledPattern) -> tuple[CompiledPattern, ...]:
     """Expand this pattern or value into the variants required by execution."""
     if isinstance(pattern, NodePattern):
         return (pattern,)
-    if not any(step.min_hops != 1 or step.max_hops != 1 for step in pattern.steps):
+    if not any(
+        step.min_hops != 1
+        or step.max_hops != 1
+        or step.direction == "undirected"
+        or len(step.rel_type_alternatives) > 1
+        for step in pattern.steps
+    ):
         return (pattern,)
 
     variants = _expand_path_steps(pattern.start, pattern.steps, 0)
@@ -5411,6 +5920,21 @@ def _expand_relationship_step_variants(
     step_index: int,
 ) -> tuple[tuple[RelationshipStep, ...], ...]:
     """Expand this pattern or value into the variants required by execution."""
+    if len(step.rel_type_alternatives) > 1:
+        alternative_variants: list[tuple[RelationshipStep, ...]] = []
+        for rel_type in step.rel_type_alternatives:
+            alternative_variants.extend(
+                _expand_relationship_step_variants(
+                    _with_step_rel_type(step, rel_type),
+                    step_index,
+                )
+            )
+        return tuple(alternative_variants)
+    if step.direction == "undirected":
+        return (
+            _with_step_direction(step, "outgoing"),
+            _with_step_direction(step, "incoming"),
+        )
     if step.min_hops == 1 and step.max_hops == 1:
         return ((step,),)
 
@@ -5437,10 +5961,49 @@ def _expand_relationship_step_variants(
                     direction=step.direction,
                     min_hops=1,
                     max_hops=1,
+                    rel_type_alternatives=(),
                 )
             )
         variants.append(tuple(expanded_steps))
     return tuple(variants)
+
+
+def _with_step_direction(
+    step: RelationshipStep,
+    direction: str,
+) -> tuple[RelationshipStep, ...]:
+    """Return a fixed-hop step variant with a concrete traversal direction."""
+
+    return (
+        RelationshipStep(
+            variable=step.variable,
+            rel_type=step.rel_type,
+            properties=step.properties,
+            node=step.node,
+            direction=direction,
+            min_hops=step.min_hops,
+            max_hops=step.max_hops,
+            rel_type_alternatives=step.rel_type_alternatives,
+        ),
+    )
+
+
+def _with_step_rel_type(
+    step: RelationshipStep,
+    rel_type: str,
+) -> RelationshipStep:
+    """Return a step variant constrained to one relationship type."""
+
+    return RelationshipStep(
+        variable=step.variable,
+        rel_type=rel_type,
+        properties=step.properties,
+        node=step.node,
+        direction=step.direction,
+        min_hops=step.min_hops,
+        max_hops=step.max_hops,
+        rel_type_alternatives=(),
+    )
 
 
 def _build_query_result(
@@ -5470,7 +6033,9 @@ def _build_query_result_from_table(
     """Build the intermediate plan, table, or result used by later stages."""
     projected_values: list[tuple[str, list[Any]]] = []
     for item in return_items:
-        if item.field is None:
+        if item.scalar_expression is not None:
+            values = _evaluate_scalar_expression_array(bindings, item.scalar_expression).to_pylist()
+        elif item.field is None:
             values = _project_bound_entity_values_from_table(bindings, item.variable)
         else:
             values = _project_bound_field_values_from_table(bindings, item.variable, item.field)
@@ -5493,6 +6058,11 @@ def _project_return_items_table(
     """Project bindings into the columns or values needed by the next step."""
     columns: dict[str, pa.ChunkedArray | pa.Array] = {}
     for item in return_items:
+        if item.scalar_expression is not None:
+            columns[_binding_column_name(item.expression, "value")] = (
+                _evaluate_scalar_expression_array(table, item.scalar_expression)
+            )
+            continue
         if item.field is None:
             prefix = f"{item.variable}."
             entity_columns = [
@@ -5522,7 +6092,7 @@ def _build_aggregate_query_result_from_table(
     """Build the intermediate plan, table, or result used by later stages."""
     row: dict[str, Any] = {}
     for item in return_items:
-        if item.aggregate != "count":
+        if item.aggregate not in {"count", "sum", "avg", "min", "max", "collect"}:
             raise QueryError(f"Unsupported aggregate: {item.aggregate}")
         if item.count_all:
             row[item.expression] = bindings.num_rows
@@ -5534,9 +6104,16 @@ def _build_aggregate_query_result_from_table(
             column_name = _binding_column_name(item.variable, field)
             raise QueryError(f"COUNT references an unknown binding: {column_name}")
         if item.aggregate_distinct:
-            row[item.expression] = _count_distinct_non_null(column)
+            row[item.expression] = (
+                _collect_column_values(column, distinct=True)
+                if item.aggregate == "collect"
+                else _count_distinct_non_null(column)
+            )
             continue
-        row[item.expression] = int(pc.sum(pc.is_valid(column)).as_py() or 0)
+        row[item.expression] = _apply_aggregate_transform(
+            _aggregate_column_value(column, item.aggregate),
+            item.aggregate_transform,
+        )
     return QueryResult(
         columns=tuple(item.expression for item in return_items),
         rows=(row,),
@@ -5554,10 +6131,15 @@ def _build_grouped_aggregate_query_result(
         row: dict[str, Any] = {}
         for item in return_items:
             if item.aggregate is not None:
-                row[item.expression] = _resolve_record_field_value(
+                value = _resolve_record_field_value(
                     record,
                     variable=item.expression,
                     field="value",
+                )
+                row[item.expression] = (
+                    _deduplicate_list_values(value)
+                    if item.aggregate == "collect" and item.aggregate_distinct
+                    else value
                 )
                 continue
             if item.field is None:
@@ -5569,7 +6151,9 @@ def _build_grouped_aggregate_query_result(
                 field="value",
             )
             row[item.expression] = (
-                None if value is None else _decode_labels(value)
+                None
+                if value is None
+                else _decode_labels(value)
                 if item.field == "labels"
                 else _decode_join_json_value(value)
             )
@@ -5638,7 +6222,7 @@ def _build_aggregate_table_from_table(
     resolved_arrays: dict[str, pa.ChunkedArray | pa.Array] = {}
     count_all_array: pa.Array | None = None
     for index, item in enumerate(return_items):
-        if item.aggregate != "count":
+        if item.aggregate not in {"count", "sum", "avg", "min", "max", "collect"}:
             raise QueryError(f"Unsupported aggregate: {item.aggregate}")
         if item.count_all:
             temp_name = f"__agg__.{index}"
@@ -5650,7 +6234,8 @@ def _build_aggregate_table_from_table(
             continue
 
         source_column = _aggregate_source_column_name(item)
-        resolved = resolved_arrays.get(source_column)
+        cache_key = _binding_column_name(item.variable, source_column)
+        resolved = resolved_arrays.get(cache_key)
         if resolved is None:
             resolved = _resolve_table_field_array(
                 bindings,
@@ -5662,10 +6247,10 @@ def _build_aggregate_table_from_table(
             if resolved is None:
                 column_name = _binding_column_name(item.variable, source_column)
                 raise QueryError(f"COUNT references an unknown binding: {column_name}")
-        resolved_arrays[source_column] = resolved
+        resolved_arrays[cache_key] = resolved
         temp_name = f"__agg__.{index}"
         aggregate_input_columns[temp_name] = resolved
-        function_name = "count_distinct" if item.aggregate_distinct else "count"
+        function_name = _arrow_group_by_aggregate_name(item)
         aggregate_specs.append((temp_name, function_name))
         aggregate_output_columns.append((f"{temp_name}_{function_name}", item.expression))
 
@@ -5676,9 +6261,107 @@ def _build_aggregate_table_from_table(
     output_columns: dict[str, pa.ChunkedArray | pa.Array] = {
         column_name: aggregated[column_name] for column_name in grouping_projection.column_names
     }
+    transform_by_expression = {
+        item.expression: item.aggregate_transform
+        for item in return_items
+        if item.aggregate_transform is not None
+    }
     for source_name, expression in aggregate_output_columns:
-        output_columns[_binding_column_name(expression, "value")] = aggregated[source_name]
+        values = aggregated[source_name]
+        transform = transform_by_expression.get(expression)
+        if transform is not None:
+            values = _apply_aggregate_transform_array(values, transform)
+        output_columns[_binding_column_name(expression, "value")] = values
     return pa.table(output_columns)
+
+
+def _aggregate_column_value(
+    column: pa.ChunkedArray | pa.Array,
+    aggregate: str | None,
+) -> object:
+    """Compute a scalar aggregate value over an Arrow column."""
+
+    if aggregate == "count":
+        return int(pc.sum(pc.is_valid(column)).as_py() or 0)
+    if aggregate == "sum":
+        return pc.sum(column).as_py()
+    if aggregate == "avg":
+        return pc.mean(column).as_py()
+    if aggregate == "min":
+        return pc.min(column).as_py()
+    if aggregate == "max":
+        return pc.max(column).as_py()
+    if aggregate == "collect":
+        return _collect_column_values(column, distinct=False)
+    raise QueryError(f"Unsupported aggregate: {aggregate}")
+
+
+def _collect_column_values(
+    column: pa.ChunkedArray | pa.Array,
+    *,
+    distinct: bool,
+) -> list[object]:
+    """Collect non-null Arrow values into a Cypher list value."""
+
+    values = [_decode_join_json_value(value) for value in column.to_pylist() if value is not None]
+    return _deduplicate_list_values(values) if distinct else values
+
+
+def _deduplicate_list_values(value: object) -> list[object]:
+    """Deduplicate collected list values while preserving their first-seen order."""
+
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        return [value]
+    seen: set[str] = set()
+    deduplicated: list[object] = []
+    for item in value:
+        key = json.dumps(item, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(item)
+    return deduplicated
+
+
+def _arrow_group_by_aggregate_name(item: ReturnItem) -> str:
+    """Map the internal aggregate name to the Arrow group-by aggregate name."""
+
+    if item.aggregate == "count":
+        return "count_distinct" if item.aggregate_distinct else "count"
+    if item.aggregate == "avg":
+        return "mean"
+    if item.aggregate in {"sum", "min", "max"}:
+        return item.aggregate
+    if item.aggregate == "collect":
+        return "list"
+    raise QueryError(f"Unsupported aggregate: {item.aggregate}")
+
+
+def _apply_aggregate_transform(value: object, transform: str | None) -> object:
+    """Apply a supported post-aggregate scalar transform."""
+
+    if transform is None:
+        return value
+    if transform == "round_2":
+        if value is None:
+            return None
+        if not isinstance(value, int | float):
+            raise QueryError("round(...) requires a numeric aggregate value.")
+        return round(float(value), 2)
+    raise QueryError(f"Unsupported aggregate transform: {transform}")
+
+
+def _apply_aggregate_transform_array(
+    values: pa.ChunkedArray | pa.Array,
+    transform: str,
+) -> pa.ChunkedArray | pa.Array:
+    """Apply a supported post-aggregate transform to an Arrow column."""
+
+    if transform == "round_2":
+        return pc.round(values, ndigits=2)
+    raise QueryError(f"Unsupported aggregate transform: {transform}")
 
 
 def _encode_nested_grouping_columns(table: pa.Table) -> pa.Table:
@@ -5712,7 +6395,8 @@ def _empty_grouped_aggregate_table(
     for column_name in grouping_projection.column_names:
         columns[column_name] = pa.array([], type=grouping_projection[column_name].type)
     for item in aggregate_items:
-        columns[_binding_column_name(item.expression, "value")] = pa.array([], type=pa.int64())
+        value_type = pa.list_(pa.null()) if item.aggregate == "collect" else pa.int64()
+        columns[_binding_column_name(item.expression, "value")] = pa.array([], type=value_type)
     return pa.table(columns)
 
 
@@ -5729,6 +6413,76 @@ def _empty_grouping_projection_table(grouping_items: tuple[WithItem, ...]) -> pa
 def _contains_aggregates(return_items: tuple[ReturnItem, ...]) -> bool:
     """Support the current Cypher compilation or execution step."""
     return any(item.aggregate is not None for item in return_items)
+
+
+def _can_apply_projected_distinct_window(
+    return_items: tuple[ReturnItem, ...],
+    order_by: tuple[OrderByItem, ...] | None,
+) -> bool:
+    """Return true when DISTINCT/ORDER/LIMIT can run on projected scalar columns."""
+
+    if not return_items:
+        return False
+    projected_fields: set[tuple[str, str]] = set()
+    for item in return_items:
+        if item.scalar_expression is not None or item.aggregate is not None or item.field is None:
+            return False
+        projected_fields.add((item.variable, item.field))
+    if order_by is None:
+        return True
+    return all((item.variable, item.field) in projected_fields for item in order_by)
+
+
+def _match_with_query_has_exists_pattern(query: CompiledMatchWithQuery) -> bool:
+    """Return true when a MATCH/WITH query uses EXISTS { pattern } predicates."""
+
+    return any(
+        _predicate_has_exists_pattern(predicate)
+        for predicate in (
+            query.match_where_predicate,
+            query.with_where_predicate,
+            query.post_with_match_where_predicate,
+        )
+    )
+
+
+def _match_with_query_has_relationship_type_alternatives(query: CompiledMatchWithQuery) -> bool:
+    """Return true when a MATCH/WITH query contains relationship type alternatives."""
+
+    return any(
+        _patterns_have_relationship_type_alternatives(patterns)
+        for patterns in (
+            query.match_patterns,
+            query.post_with_match_patterns,
+        )
+    )
+
+
+def _patterns_have_relationship_type_alternatives(
+    patterns: tuple[CompiledPattern, ...],
+) -> bool:
+    """Check whether any path step still carries relationship type alternatives."""
+
+    for pattern in patterns:
+        if isinstance(pattern, NodePattern):
+            continue
+        if any(len(step.rel_type_alternatives) > 1 for step in pattern.steps):
+            return True
+    return False
+
+
+def _predicate_has_exists_pattern(predicate: WherePredicate | None) -> bool:
+    """Check whether a predicate tree contains an existential pattern subquery."""
+
+    if predicate is None:
+        return False
+    if isinstance(predicate, ExistsPatternPredicate):
+        return True
+    if isinstance(predicate, NotPredicate):
+        return _predicate_has_exists_pattern(predicate.predicate)
+    if isinstance(predicate, AndPredicate | OrPredicate):
+        return any(_predicate_has_exists_pattern(child) for child in predicate.predicates)
+    return False
 
 
 def _build_match_logical_plan(query: CompiledMatchQuery) -> MatchLogicalPlan | None:
@@ -5750,7 +6504,11 @@ def _build_match_logical_plan(query: CompiledMatchQuery) -> MatchLogicalPlan | N
         return_items=query.return_items,
         order_by=query.order_by,
     )
-    root = _build_match_scan_plan(pushed_pattern, required_fields)
+    root = _build_match_scan_plan(
+        pushed_pattern,
+        required_fields,
+        where_predicate=residual_predicate,
+    )
     if root is None:
         return None
     if residual_predicate is not None:
@@ -6023,7 +6781,11 @@ def _build_scan_filter_plan(
         patterns,
         where_predicate,
     )
-    root = _build_match_scan_plan(pushed_patterns[0], required_fields)
+    root = _build_match_scan_plan(
+        pushed_patterns[0],
+        required_fields,
+        where_predicate=residual_predicate,
+    )
     if root is None:
         return None
     if residual_predicate is not None:
@@ -6084,6 +6846,8 @@ def _push_window_before_optional_match(
 def _build_match_scan_plan(
     pattern: CompiledPattern,
     required_fields: Mapping[str, set[str]],
+    *,
+    where_predicate: WherePredicate | None = None,
 ) -> LogicalPlan | None:
     """Build the intermediate plan, table, or result used by later stages."""
     if isinstance(pattern, NodePattern):
@@ -6130,6 +6894,10 @@ def _build_match_scan_plan(
             end_properties=step.node.properties,
             end_requested_fields=_requested_fields_for_variable(
                 required_fields,
+                step.node.variable,
+            ),
+            end_pushdown_predicate=_pushdown_predicate_for_bound_variable(
+                where_predicate,
                 step.node.variable,
             ),
         )
@@ -6226,7 +6994,7 @@ def _project_columns_for_with_stage_input(
             continue
         columns.append(_binding_column_name(with_item.source_variable, with_item.source_field))
     for aggregate_item in aggregate_items:
-        if aggregate_item.aggregate != "count" or aggregate_item.count_all:
+        if aggregate_item.count_all:
             continue
         source_column = _aggregate_source_column_name(aggregate_item)
         if source_column == _ENTITY_ID_FIELD:
@@ -6280,6 +7048,41 @@ def _push_down_match_where_predicate(
         _pattern_with_pushed_properties(pattern, properties_by_variable) for pattern in patterns
     )
     return pushed_patterns, _combine_and_predicates(tuple(residual_predicates))
+
+
+def _pushdown_predicate_for_bound_variable(
+    predicate: WherePredicate | None,
+    variable: str,
+) -> WherePredicate | None:
+    """Extract safe single-variable filters once a traversal variable is bound."""
+
+    if predicate is None:
+        return None
+    pushable = tuple(
+        conjunct
+        for conjunct in _flatten_and_predicates(predicate)
+        if _is_single_variable_pushdown_predicate(conjunct, variable)
+    )
+    return _combine_and_predicates(pushable)
+
+
+def _is_single_variable_pushdown_predicate(
+    predicate: WherePredicate,
+    variable: str,
+) -> bool:
+    """Return true for predicates that can be applied immediately after binding."""
+
+    if isinstance(predicate, Comparison):
+        if predicate.left_expression is not None:
+            return False
+        if predicate.variable != variable:
+            return False
+        if isinstance(predicate.value, PropertyReferenceValue | ScalarExpression):
+            return False
+        return True
+    if isinstance(predicate, StringPredicate | ExistsPredicate | InPredicate | NullPredicate):
+        return predicate.variable == variable
+    return False
 
 
 def _flatten_and_predicates(predicate: WherePredicate) -> tuple[WherePredicate, ...]:
@@ -6480,14 +7283,28 @@ def _collect_required_fields_from_predicate(
     if predicate is None:
         return
     simple_predicates = (
-        Comparison,
         StringPredicate,
         ExistsPredicate,
         InPredicate,
         NullPredicate,
     )
+    if isinstance(predicate, Comparison):
+        if predicate.left_expression is not None:
+            _collect_required_fields_from_scalar_expression(predicate.left_expression, required)
+        else:
+            _add_required_field(required, predicate.variable, predicate.field)
+        if isinstance(predicate.value, ScalarExpression):
+            _collect_required_fields_from_scalar_expression(predicate.value, required)
+        elif isinstance(predicate.value, PropertyReferenceValue):
+            _add_required_field(required, predicate.value.variable, predicate.value.field)
+        return
     if isinstance(predicate, simple_predicates):
         _add_required_field(required, predicate.variable, predicate.field)
+        return
+    if isinstance(predicate, ExistsPatternPredicate):
+        for pattern in predicate.patterns:
+            _collect_required_fields_from_pattern(pattern, required)
+        _collect_required_fields_from_predicate(predicate.where_predicate, required)
         return
     if isinstance(predicate, NotPredicate):
         _collect_required_fields_from_predicate(predicate.predicate, required)
@@ -6503,7 +7320,10 @@ def _collect_required_fields_from_return_items(
 ) -> None:
     """Collect metadata used by compilation, planning, or required-field tracking."""
     for item in return_items:
-        if item.aggregate == "count":
+        if item.scalar_expression is not None:
+            _collect_required_fields_from_scalar_expression(item.scalar_expression, required)
+            continue
+        if item.aggregate is not None:
             if item.count_all:
                 continue
             _add_required_field(required, item.variable, _aggregate_source_column_name(item))
@@ -6515,6 +7335,25 @@ def _collect_required_fields_from_return_items(
             _mark_requires_full_entity(required, item.variable)
             continue
         _add_required_field(required, item.variable, item.field)
+
+
+def _collect_required_fields_from_scalar_expression(
+    expression: ScalarExpression,
+    required: dict[str, set[str]],
+) -> None:
+    """Collect fields read by a compiled scalar expression."""
+
+    if isinstance(expression, FieldExpression):
+        _add_required_field(required, expression.variable, expression.field)
+        return
+    if isinstance(expression, LiteralExpression):
+        return
+    if isinstance(expression, FunctionExpression):
+        _collect_required_fields_from_scalar_expression(expression.argument, required)
+        return
+    if isinstance(expression, BinaryExpression):
+        _collect_required_fields_from_scalar_expression(expression.left, required)
+        _collect_required_fields_from_scalar_expression(expression.right, required)
 
 
 def _collect_required_fields_from_order_by(
@@ -7100,12 +7939,10 @@ def _pattern_has_property_reference_values(pattern: CompiledPattern) -> bool:
     """Return true when a pattern property reads from an existing row binding."""
     if isinstance(pattern, NodePattern):
         return any(
-            isinstance(value, PropertyReferenceValue)
-            for value in pattern.properties.values()
+            isinstance(value, PropertyReferenceValue) for value in pattern.properties.values()
         )
     if any(
-        isinstance(value, PropertyReferenceValue)
-        for value in pattern.start.properties.values()
+        isinstance(value, PropertyReferenceValue) for value in pattern.start.properties.values()
     ):
         return True
     return any(
@@ -8851,6 +9688,43 @@ def _apply_scalar_function_array(
     raise QueryError(f"Unsupported scalar function: {function_name}")
 
 
+def _evaluate_scalar_expression_array(
+    table: pa.Table,
+    expression: ScalarExpression,
+) -> pa.ChunkedArray | pa.Array:
+    """Evaluate a small scalar expression against a binding table."""
+
+    if isinstance(expression, FieldExpression):
+        column = _resolve_table_field_array(
+            table,
+            variable=expression.variable,
+            field=expression.field,
+        )
+        if column is None:
+            column_name = _binding_column_name(expression.variable, expression.field)
+            raise QueryError(f"Expression references an unknown binding: {column_name}")
+        return column
+    if isinstance(expression, LiteralExpression):
+        return pa.array([expression.value] * table.num_rows)
+    if isinstance(expression, FunctionExpression):
+        argument = _evaluate_scalar_expression_array(table, expression.argument)
+        if expression.name == "abs":
+            return pc.abs(argument)
+        return _apply_scalar_function_array(expression.name, argument)
+    if isinstance(expression, BinaryExpression):
+        left = _evaluate_scalar_expression_array(table, expression.left)
+        right = _evaluate_scalar_expression_array(table, expression.right)
+        if expression.operator == "+":
+            return pc.add(left, right)
+        if expression.operator == "-":
+            return pc.subtract(left, right)
+        if expression.operator == "*":
+            return pc.multiply(left, right)
+        if expression.operator == "/":
+            return pc.divide(pc.cast(left, pa.float64()), pc.cast(right, pa.float64()))
+    raise QueryError(f"Unsupported scalar expression: {expression!r}")
+
+
 def _normalize_unwind_values(value: object) -> tuple[object, ...]:
     """Normalize this value into the shape expected by later execution steps."""
     if isinstance(value, list | tuple):
@@ -9278,8 +10152,14 @@ def _edge_match_table(
     ):
         assert step.rel_type is not None
         rel_type = step.rel_type
+        load_adjacency = adjacency_by_source_loader
+        if step.direction == "incoming":
+            load_adjacency = cast(
+                Callable[[str], pa.Table],
+                getattr(adjacency_by_source_loader, "by_dest", adjacency_by_source_loader),
+            )
         return _typed_adjacency_binding_table(
-            adjacency_by_source_loader(rel_type),
+            load_adjacency(rel_type),
             edge_prefix,
             rel_type=rel_type,
             include_type=requested_fields is not None and "type" in requested_fields,
@@ -9466,12 +10346,10 @@ def _node_binding_table_from_canonical_table(
 ) -> pa.Table:
     """Handle node-specific matching, projection, or lookup logic for Cypher."""
     labels_values = [
-        [_cypher_name(label) for label in (labels or [])]
-        for labels in table["labels"].to_pylist()
+        [_cypher_name(label) for label in (labels or [])] for labels in table["labels"].to_pylist()
     ]
     properties = [
-        _normalize_property_map(json.loads(value))
-        for value in table["properties_json"].to_pylist()
+        _normalize_property_map(json.loads(value)) for value in table["properties_json"].to_pylist()
     ]
     reserved_fields = {_NODE_ID_FIELD, _ENTITY_ID_FIELD, "__join_id", "labels"}
     if requested_fields is None:
@@ -9715,8 +10593,7 @@ def _edge_binding_table_from_canonical_table(
 ) -> pa.Table:
     """Handle edge-specific matching, projection, or lookup logic for Cypher."""
     properties = [
-        _normalize_property_map(json.loads(value))
-        for value in table["properties_json"].to_pylist()
+        _normalize_property_map(json.loads(value)) for value in table["properties_json"].to_pylist()
     ]
     reserved_fields = {"id", "type", "source", "target"}
     if requested_fields is None:
@@ -9795,6 +10672,8 @@ def _apply_node_pattern_reference_filter(table: pa.Table, pattern: NodePattern) 
 def _apply_edge_pattern_filter(table: pa.Table, prefix: str, step: RelationshipStep) -> pa.Table:
     """Apply this transformation or predicate inside the Cypher pipeline."""
     masks: list[pa.Array] = []
+    if len(step.rel_type_alternatives) > 1:
+        raise QueryError("Relationship type alternatives must be expanded before execution.")
     if step.rel_type is not None:
         masks.append(_comparison_mask(table[f"{prefix}.type"], "=", step.rel_type))
 
@@ -9848,28 +10727,64 @@ def _ensure_edge_source_column(
 def _apply_where_predicate_table(
     table: pa.Table,
     predicate: WherePredicate | None,
+    *,
+    nodes: NodeBindingSource | None = None,
+    edges: EdgeBindingSource | None = None,
+    tabular: PyArrowTabularAdapter | None = None,
+    adjacency_by_source_loader: Callable[[str], pa.Table] | None = None,
+    node_property_loader: Callable[[str], pa.Table] | None = None,
+    edge_property_loader: Callable[[str], pa.Table] | None = None,
 ) -> pa.Table:
     """Apply this transformation or predicate inside the Cypher pipeline."""
     if predicate is None:
         return table
     # WHERE predicates compile into Arrow boolean masks, which keeps the read
     # path columnar even though the public result is projected back to Python maps.
-    return table.filter(pc.fill_null(_predicate_mask(table, predicate), False))
+    return table.filter(
+        pc.fill_null(
+            _predicate_mask(
+                table,
+                predicate,
+                nodes=nodes,
+                edges=edges,
+                tabular=tabular,
+                adjacency_by_source_loader=adjacency_by_source_loader,
+                node_property_loader=node_property_loader,
+                edge_property_loader=edge_property_loader,
+            ),
+            False,
+        )
+    )
 
 
-def _predicate_mask(table: pa.Table, predicate: WherePredicate) -> pa.Array:
+def _predicate_mask(
+    table: pa.Table,
+    predicate: WherePredicate,
+    *,
+    nodes: NodeBindingSource | None = None,
+    edges: EdgeBindingSource | None = None,
+    tabular: PyArrowTabularAdapter | None = None,
+    adjacency_by_source_loader: Callable[[str], pa.Table] | None = None,
+    node_property_loader: Callable[[str], pa.Table] | None = None,
+    edge_property_loader: Callable[[str], pa.Table] | None = None,
+) -> pa.Array:
     """Support the current Cypher compilation or execution step."""
     if isinstance(predicate, Comparison):
-        column = _resolve_table_field_array(
-            table,
-            variable=predicate.variable,
-            field=predicate.field,
+        column = (
+            _evaluate_scalar_expression_array(table, predicate.left_expression)
+            if predicate.left_expression is not None
+            else _resolve_table_field_array(
+                table,
+                variable=predicate.variable,
+                field=predicate.field,
+            )
         )
         if column is None:
             return pa.array([False] * table.num_rows, type=pa.bool_())
         if predicate.field == "labels":
             return _labels_comparison_mask(column, predicate.operator, predicate.value)
-        return _comparison_mask(column, predicate.operator, predicate.value)
+        right_value = _comparison_right_value(table, predicate.value)
+        return _comparison_mask(column, predicate.operator, right_value)
 
     if isinstance(predicate, StringPredicate):
         column = _resolve_table_field_array(
@@ -9892,6 +10807,18 @@ def _predicate_mask(table: pa.Table, predicate: WherePredicate) -> pa.Array:
         if column is None:
             return pa.array([False] * table.num_rows, type=pa.bool_())
         return _exists_mask(column)
+
+    if isinstance(predicate, ExistsPatternPredicate):
+        return _exists_pattern_mask(
+            table,
+            predicate,
+            nodes=nodes,
+            edges=edges,
+            tabular=tabular,
+            adjacency_by_source_loader=adjacency_by_source_loader,
+            node_property_loader=node_property_loader,
+            edge_property_loader=edge_property_loader,
+        )
 
     if isinstance(predicate, InPredicate):
         column = _resolve_table_field_array(
@@ -9918,17 +10845,130 @@ def _predicate_mask(table: pa.Table, predicate: WherePredicate) -> pa.Array:
         return _null_mask(column, predicate.is_null)
 
     if isinstance(predicate, NotPredicate):
-        return pc.fill_null(pc.invert(_predicate_mask(table, predicate.predicate)), False)
+        return pc.fill_null(
+            pc.invert(
+                _predicate_mask(
+                    table,
+                    predicate.predicate,
+                    nodes=nodes,
+                    edges=edges,
+                    tabular=tabular,
+                    adjacency_by_source_loader=adjacency_by_source_loader,
+                    node_property_loader=node_property_loader,
+                    edge_property_loader=edge_property_loader,
+                )
+            ),
+            False,
+        )
 
     if isinstance(predicate, AndPredicate):
-        child_masks = [_predicate_mask(table, child) for child in predicate.predicates]
+        child_masks = [
+            _predicate_mask(
+                table,
+                child,
+                nodes=nodes,
+                edges=edges,
+                tabular=tabular,
+                adjacency_by_source_loader=adjacency_by_source_loader,
+                node_property_loader=node_property_loader,
+                edge_property_loader=edge_property_loader,
+            )
+            for child in predicate.predicates
+        ]
         return _combine_masks(child_masks, operator="and")
 
     if isinstance(predicate, OrPredicate):
-        child_masks = [_predicate_mask(table, child) for child in predicate.predicates]
+        child_masks = [
+            _predicate_mask(
+                table,
+                child,
+                nodes=nodes,
+                edges=edges,
+                tabular=tabular,
+                adjacency_by_source_loader=adjacency_by_source_loader,
+                node_property_loader=node_property_loader,
+                edge_property_loader=edge_property_loader,
+            )
+            for child in predicate.predicates
+        ]
         return _combine_masks(child_masks, operator="or")
 
     raise QueryError(f"Unsupported WHERE predicate type: {type(predicate)!r}")
+
+
+def _exists_pattern_mask(
+    table: pa.Table,
+    predicate: ExistsPatternPredicate,
+    *,
+    nodes: NodeBindingSource | None,
+    edges: EdgeBindingSource | None,
+    tabular: PyArrowTabularAdapter | None,
+    adjacency_by_source_loader: Callable[[str], pa.Table] | None,
+    node_property_loader: Callable[[str], pa.Table] | None,
+    edge_property_loader: Callable[[str], pa.Table] | None,
+) -> pa.Array:
+    """Evaluate EXISTS { pattern } as a correlated semi-join mask."""
+
+    if nodes is None or edges is None or tabular is None:
+        raise QueryError("EXISTS { ... } requires graph state during WHERE evaluation.")
+    if table.num_rows == 0:
+        return pa.array([], type=pa.bool_())
+
+    required_fields = _required_fields_for_match(
+        predicate.patterns,
+        predicate.where_predicate,
+        return_items=(),
+        order_by=None,
+    )
+    matched = _match_patterns_table(
+        nodes,
+        edges,
+        predicate.patterns,
+        tabular,
+        required_fields=required_fields,
+        adjacency_by_source_loader=adjacency_by_source_loader,
+        node_property_loader=node_property_loader,
+        edge_property_loader=edge_property_loader,
+    )
+    matched = _apply_where_predicate_table(
+        matched,
+        predicate.where_predicate,
+        nodes=nodes,
+        edges=edges,
+        tabular=tabular,
+        adjacency_by_source_loader=adjacency_by_source_loader,
+        node_property_loader=node_property_loader,
+        edge_property_loader=edge_property_loader,
+    )
+
+    outer_variables = _entity_variables_from_table(table)
+    pattern_variables = {
+        variable for pattern in predicate.patterns for variable in _pattern_variables(pattern)
+    }
+    shared_variables = tuple(sorted(outer_variables & pattern_variables))
+    if not shared_variables:
+        return pa.array([matched.num_rows > 0] * table.num_rows, type=pa.bool_())
+    if matched.num_rows == 0:
+        return pa.array([False] * table.num_rows, type=pa.bool_())
+
+    left_key = _binding_membership_key(table, shared_variables)
+    right_key = _binding_membership_key(matched, shared_variables)
+    return pc.fill_null(pc.is_in(left_key, value_set=right_key), False)
+
+
+def _binding_membership_key(
+    table: pa.Table,
+    variables: tuple[str, ...],
+) -> pa.ChunkedArray | pa.Array:
+    """Build the Arrow key used to correlate EXISTS subquery bindings."""
+
+    if len(variables) == 1:
+        return table[_binding_column_name(variables[0], "__join_id")]
+    columns = [
+        pc.cast(table[_binding_column_name(variable, "__join_id")], pa.string())
+        for variable in variables
+    ]
+    return pc.binary_join_element_wise(*columns, "|")
 
 
 def _combine_masks(masks: list[pa.Array], *, operator: str) -> pa.Array:
@@ -9956,6 +10996,29 @@ def _filter_table_with_masks(table: pa.Table, masks: list[pa.Array]) -> pa.Table
     for mask in masks[1:]:
         combined = pc.and_(combined, mask)
     return table.filter(pc.fill_null(combined, False))
+
+
+def _comparison_right_value(
+    table: pa.Table,
+    value: object,
+) -> object:
+    """Resolve property/scalar references used on the right side of comparisons."""
+
+    if isinstance(value, LiteralExpression):
+        return value.value
+    if isinstance(value, FieldExpression | BinaryExpression | FunctionExpression):
+        return _evaluate_scalar_expression_array(table, value)
+    if not isinstance(value, PropertyReferenceValue):
+        return value
+    resolved = _resolve_table_field_array(
+        table,
+        variable=value.variable,
+        field=value.field,
+    )
+    if resolved is None:
+        column_name = _binding_column_name(value.variable, value.field)
+        raise QueryError(f"WHERE references an unknown binding: {column_name}")
+    return resolved
 
 
 def _comparison_mask(column: pa.ChunkedArray, operator: str, value: object) -> pa.Array:

@@ -90,6 +90,7 @@ def assert_expected_storage_layout(
     edge_file: str,
     node_label_file: str,
     adjacency_file: str,
+    adjacency_by_dest_file: str | None = None,
     node_property_file: str | None = None,
     edge_property_file: str | None = None,
 ) -> None:
@@ -147,6 +148,7 @@ def assert_expected_local_storage_layout(
     edge_file: str,
     node_label_file: str,
     adjacency_file: str,
+    adjacency_by_dest_file: str | None = None,
     node_property_file: str | None = None,
     edge_property_file: str | None = None,
 ) -> None:
@@ -160,6 +162,8 @@ def assert_expected_local_storage_layout(
         f"{database_name}/{node_label_file}",
         f"{database_name}/{adjacency_file}",
     }
+    if adjacency_by_dest_file is not None:
+        expected_paths.add(f"{database_name}/{adjacency_by_dest_file}")
     if node_property_file is not None:
         expected_paths.add(f"{database_name}/{node_property_file}")
     if edge_property_file is not None:
@@ -173,6 +177,10 @@ def assert_expected_local_storage_layout(
     assert f"{database_name}/{adjacency_file}".startswith(
         f"{database_name}/derived/adjacency/by_source/"
     )
+    if adjacency_by_dest_file is not None:
+        assert f"{database_name}/{adjacency_by_dest_file}".startswith(
+            f"{database_name}/derived/adjacency/by_dest/"
+        )
     if node_property_file is not None:
         assert f"{database_name}/{node_property_file}".startswith(
             f"{database_name}/derived/node_properties/"

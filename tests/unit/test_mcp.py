@@ -15,6 +15,7 @@ from grapharrow.domain import (
     VersionedCatalog,
 )
 from grapharrow.interfaces.mcp import create_mcp_interface
+from grapharrow.interfaces.mcp_cypher import create_mcp_cypher_interface
 
 
 def test_mcp_lists_the_initial_five_tools(tmp_path: Path) -> None:
@@ -26,6 +27,15 @@ def test_mcp_lists_the_initial_five_tools(tmp_path: Path) -> None:
         "get_schema",
         "get_constraints",
         "get_indexes",
+    ]
+
+
+def test_mcp_cypher_interface_matches_backward_compatible_surface(tmp_path: Path) -> None:
+    legacy_interface = create_mcp_interface(tmp_path / "legacy-db")
+    cypher_interface = create_mcp_cypher_interface(tmp_path / "cypher-db")
+
+    assert [tool.name for tool in cypher_interface.list_tools()] == [
+        tool.name for tool in legacy_interface.list_tools()
     ]
 
 
@@ -179,6 +189,7 @@ def test_mcp_returns_schema_constraints_and_indexes(tmp_path: Path) -> None:
     node_labels = cast(list[dict[str, Any]], indexes["node_labels"])
     node_properties = cast(list[dict[str, Any]], indexes["node_properties"])
     adjacency_by_source = cast(list[dict[str, Any]], indexes["adjacency_by_source"])
+    adjacency_by_dest = cast(list[dict[str, Any]], indexes["adjacency_by_dest"])
     edge_properties = cast(list[dict[str, Any]], indexes["edge_properties"])
 
     assert schema == {
@@ -272,6 +283,18 @@ def test_mcp_returns_schema_constraints_and_indexes(tmp_path: Path) -> None:
         }
     ]
     assert adjacency_by_source[0]["checksum"] is not None
+    assert adjacency_by_dest == [
+        {
+            "relationship_type": "WORKS_AT",
+            "path": (f"derived/adjacency/by_dest/WORKS_AT/snapshot-{snapshot_id:06d}.parquet"),
+            "row_count": 1,
+            "checksum": adjacency_by_dest[0]["checksum"],
+            "checksum_algorithm": "sha256",
+            "min_key": 2,
+            "max_key": 2,
+        }
+    ]
+    assert adjacency_by_dest[0]["checksum"] is not None
     assert edge_properties == [
         {
             "relationship_type": "WORKS_AT",

@@ -194,7 +194,7 @@ class DatabaseAdminUseCase:
             node_labels=persisted.node_labels,
             node_properties=persisted.node_properties,
             adjacency_by_source=persisted.adjacency_by_source,
-            adjacency_by_dest=(),
+            adjacency_by_dest=persisted.adjacency_by_dest,
             edge_properties=persisted.edge_properties,
         )
         try:

@@ -35,8 +35,8 @@ def test_bolt_supports_local_disk_storage_end_to_end(
                     "RETURN a, b"
                 ).single()
                 assert create_record is not None
-                assert create_record["a"]["properties"]["name"] == "Alice"
-                assert create_record["b"]["properties"]["name"] == "Bob"
+                assert create_record["a"]["name"] == "Alice"
+                assert create_record["b"]["name"] == "Bob"
 
                 result = session.run(
                     "MATCH (a:Person)-[:KNOWS]->(b:Person) "
@@ -71,15 +71,18 @@ def test_bolt_supports_local_disk_storage_end_to_end(
     edges_payload = files_payload["edges"]
     node_labels_payload = files_payload["node_labels"]
     adjacency_payload = files_payload["adjacency_by_source"]
+    adjacency_by_dest_payload = files_payload["adjacency_by_dest"]
     assert isinstance(nodes_payload, list)
     assert isinstance(edges_payload, list)
     assert isinstance(node_labels_payload, list)
     assert isinstance(adjacency_payload, list)
+    assert isinstance(adjacency_by_dest_payload, list)
 
     node_file = str(nodes_payload[0]["path"])
     edge_file = str(edges_payload[0]["path"])
     node_label_file = str(node_labels_payload[0]["path"])
     adjacency_file = str(adjacency_payload[0]["path"])
+    adjacency_by_dest_file = str(adjacency_by_dest_payload[0]["path"])
     node_table = read_local_parquet_object(local_disk_database.database_dir, node_file)
     edge_table = read_local_parquet_object(local_disk_database.database_dir, edge_file)
     node_labels_table = read_local_parquet_object(
@@ -89,6 +92,10 @@ def test_bolt_supports_local_disk_storage_end_to_end(
     adjacency_table = read_local_parquet_object(
         local_disk_database.database_dir,
         adjacency_file,
+    )
+    adjacency_by_dest_table = read_local_parquet_object(
+        local_disk_database.database_dir,
+        adjacency_by_dest_file,
     )
 
     assert result == [{"a.name": "Alice", "b.name": "Bob"}]
@@ -112,11 +119,13 @@ def test_bolt_supports_local_disk_storage_end_to_end(
         edge_file=edge_file,
         node_label_file=node_label_file,
         adjacency_file=adjacency_file,
+        adjacency_by_dest_file=adjacency_by_dest_file,
     )
     assert has_local_parquet_magic(local_disk_database.database_dir, node_file) is True
     assert has_local_parquet_magic(local_disk_database.database_dir, edge_file) is True
     assert has_local_parquet_magic(local_disk_database.database_dir, node_label_file) is True
     assert has_local_parquet_magic(local_disk_database.database_dir, adjacency_file) is True
+    assert has_local_parquet_magic(local_disk_database.database_dir, adjacency_by_dest_file) is True
     assert node_table.to_pylist() == [
         {
             "node_id": 1,
@@ -140,3 +149,4 @@ def test_bolt_supports_local_disk_storage_end_to_end(
     ]
     assert node_labels_table.to_pylist() == [{"node_id": 1}, {"node_id": 2}]
     assert adjacency_table.to_pylist() == [{"src_id": 1, "dst_id": 2, "edge_id": 1}]
+    assert adjacency_by_dest_table.to_pylist() == [{"src_id": 1, "dst_id": 2, "edge_id": 1}]
