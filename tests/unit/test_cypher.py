@@ -2271,6 +2271,35 @@ def test_match_supports_labels_function_in_where_with_parameter(tmp_path: Path) 
     assert result.rows == ({"n.name": "Alice"},)
 
 
+def test_match_supports_label_predicates_in_where(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query(
+            "CREATE (:Character {name: 'Jon Snow'})-[:LOYAL_TO]->"
+            "(:Allegiance {name: 'Night Watch'}) RETURN *"
+        )
+        session.query(
+            "CREATE (:Character {name: 'Jon Snow'})-[:KILLED]->"
+            "(:Character {name: 'Orell'}) RETURN *"
+        )
+        session.query(
+            "CREATE (:Location {name: 'Castle Black'})-[:HAS]->"
+            "(:Allegiance {name: 'Night Watch'}) RETURN *"
+        )
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (n)-[e]->(m) "
+            "WHERE n:Character AND (m:Character OR m:Allegiance) "
+            "RETURN n, e, m"
+        )
+
+    assert len(result.rows) == 2
+    assert {row["e"]["type"] for row in result.rows} == {"KILLED", "LOYAL_TO"}
+    assert {row["n"]["properties"]["name"] for row in result.rows} == {"Jon Snow"}
+
+
 def test_match_supports_exists_for_node_properties(tmp_path: Path) -> None:
     database = Database(tmp_path / "example-db")
 
@@ -3656,6 +3685,7 @@ def test_memgraph_lab_show_metadata_statements_are_available(tmp_path: Path) -> 
         constraints = session.query("SHOW CONSTRAINT INFO")
         triggers = session.query("SHOW TRIGGERS")
         schema = session.query("SHOW SCHEMA INFO;")
+        unknown = session.query("SHOW METRICS INFO")
 
     assert {"name": "vertex_count", "value": 1} in storage.rows
     assert {"name": "edge_count", "value": 0} in storage_current.rows
@@ -3675,6 +3705,25 @@ def test_memgraph_lab_show_metadata_statements_are_available(tmp_path: Path) -> 
     assert triggers.rows == ()
     assert schema.columns == ("nodes", "relationships")
     assert schema.rows == ()
+    assert unknown.columns == ("name", "value")
+    assert unknown.rows == ()
+
+
+def test_memgraph_bfs_syntax_reports_clear_unsupported_error(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query(
+            "CREATE (:Character {name: 'Jon Snow'})-[:KILLED]->"
+            "(:Character {name: 'Orell'}) RETURN *"
+        )
+
+    with database.read_transaction() as session:
+        with pytest.raises(QueryError, match=r"Memgraph BFS relationship expansion"):
+            session.query(
+                'MATCH path=(:Character { name: "Jon Snow" })-[:KILLED *bfs]->'
+                "(:Character) RETURN path"
+            )
 
 
 def test_memgraph_lab_create_index_statement_is_noop_for_dataset_loader(

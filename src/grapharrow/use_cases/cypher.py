@@ -234,6 +234,12 @@ class NullPredicate:
 
 
 @dataclass(frozen=True, slots=True)
+class LabelPredicate:
+    variable: str
+    label: str
+
+
+@dataclass(frozen=True, slots=True)
 class NotPredicate:
     predicate: WherePredicate
 
@@ -255,6 +261,7 @@ WherePredicate = (
     | ExistsPatternPredicate
     | InPredicate
     | NullPredicate
+    | LabelPredicate
     | NotPredicate
     | AndPredicate
     | OrPredicate
@@ -516,6 +523,12 @@ class CypherQueryUseCase:
             )
             if schema_result is not None:
                 return schema_result
+
+        if _uses_memgraph_bfs_syntax(normalized):
+            raise QueryError(
+                "Memgraph BFS relationship expansion (*bfs) is not supported yet. "
+                "Use bounded openCypher variable-length syntax such as [:TYPE*1..5]."
+            )
 
         parse_tree = parse_cypher(query)
         compiled = _compile_query(parse_tree, parameters)
@@ -2147,7 +2160,12 @@ def _execute_show_compatibility_statement(
             rows=(),
         )
 
-    return None
+    return QueryResult(columns=("name", "value"), rows=())
+
+
+def _uses_memgraph_bfs_syntax(query: str) -> bool:
+    """Detect Memgraph's non-openCypher BFS expansion before the parser rejects it."""
+    return re.search(r"\*\s*bfs\b", query, flags=re.IGNORECASE) is not None
 
 
 def _execute_schema_compatibility_procedure(
@@ -4834,6 +4852,18 @@ def _compile_comparison_expression(
     if exists_predicate is not None:
         return exists_predicate
 
+    parenthesized_predicate = _compile_parenthesized_predicate(
+        left_operand,
+        params,
+        scope=scope,
+    )
+    if parenthesized_predicate is not None:
+        return parenthesized_predicate
+
+    label_predicate = _compile_label_predicate(left_operand, scope=scope)
+    if label_predicate is not None:
+        return label_predicate
+
     string_predicates = cast(
         list[CypherParser.OC_StringPredicateExpressionContext],
         left_operand.oC_StringPredicateExpression(),
@@ -4873,6 +4903,54 @@ def _compile_comparison_expression(
         )
 
     raise QueryError("Unsupported WHERE predicate.")
+
+
+def _compile_parenthesized_predicate(
+    predicate_ctx: Any,
+    params: dict[str, object],
+    *,
+    scope: Mapping[str, ScopeBindingKind] | None = None,
+) -> WherePredicate | None:
+    """Compile a parenthesized boolean expression inside WHERE."""
+    atom = _single_predicate_atom(predicate_ctx.oC_AddOrSubtractExpression())
+    if atom is None:
+        return None
+    parenthesized = atom.oC_ParenthesizedExpression()
+    if parenthesized is None:
+        return None
+    return _compile_or_expression(parenthesized.oC_Expression().oC_OrExpression(), params, scope)
+
+
+def _compile_label_predicate(
+    predicate_ctx: Any,
+    *,
+    scope: Mapping[str, ScopeBindingKind] | None = None,
+) -> LabelPredicate | None:
+    """Compile ``WHERE n:Label`` into a label-membership predicate."""
+    expression_ctx = predicate_ctx.oC_AddOrSubtractExpression()
+    multiply_contexts = expression_ctx.oC_MultiplyDivideModuloExpression()
+    if len(multiply_contexts) != 1:
+        return None
+    power_contexts = multiply_contexts[0].oC_PowerOfExpression()
+    if len(power_contexts) != 1:
+        return None
+    unary_contexts = power_contexts[0].oC_UnaryAddOrSubtractExpression()
+    if len(unary_contexts) != 1:
+        return None
+    non_arithmetic = unary_contexts[0].oC_NonArithmeticOperatorExpression()
+    labels_ctx = non_arithmetic.oC_NodeLabels()
+    if labels_ctx is None:
+        return None
+    atom = non_arithmetic.oC_Atom()
+    if atom is None or atom.oC_Variable() is None:
+        return None
+    variable = atom.oC_Variable().getText()
+    if scope is not None and scope.get(variable) == "scalar":
+        raise QueryError(f"Cannot use label predicate on scalar binding '{variable}'.")
+    labels = _compile_node_labels(labels_ctx)
+    if len(labels) != 1:
+        raise QueryError("WHERE label predicates support exactly one label.")
+    return LabelPredicate(variable=variable, label=labels[0])
 
 
 def _compile_exists_pattern_predicate(
@@ -10841,8 +10919,18 @@ def _predicate_mask(
                 pa.array([True] * table.num_rows, type=pa.bool_())
                 if predicate.is_null
                 else pa.array([False] * table.num_rows, type=pa.bool_())
-            )
+        )
         return _null_mask(column, predicate.is_null)
+
+    if isinstance(predicate, LabelPredicate):
+        column = _resolve_table_field_array(
+            table,
+            variable=predicate.variable,
+            field="labels",
+        )
+        if column is None:
+            return pa.array([False] * table.num_rows, type=pa.bool_())
+        return _label_membership_mask(column, predicate.label)
 
     if isinstance(predicate, NotPredicate):
         return pc.fill_null(
