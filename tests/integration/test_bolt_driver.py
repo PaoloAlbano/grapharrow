@@ -160,6 +160,7 @@ def test_bolt_server_exposes_common_summary_metadata_for_driver_consumers(
                 read_summary = session.run(
                     "MATCH (n:Person) RETURN DISTINCT n.name ORDER BY n.name"
                 ).consume()
+                memgraph_lab_metrics = session.run("SHOW METRICS INFO").data()
                 bookmarks = session.last_bookmarks()
         finally:
             driver.close()
@@ -179,6 +180,7 @@ def test_bolt_server_exposes_common_summary_metadata_for_driver_consumers(
     assert read_summary.counters.contains_updates is False
     assert read_summary.result_available_after == 0
     assert read_summary.result_consumed_after == 0
+    assert memgraph_lab_metrics == []
 
 
 @pytest.mark.integration
