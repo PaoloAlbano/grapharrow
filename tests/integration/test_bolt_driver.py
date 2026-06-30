@@ -439,6 +439,53 @@ def test_bolt_server_returns_native_graph_values_for_regular_return(
 
 
 @pytest.mark.integration
+def test_bolt_server_returns_native_graph_values_for_label_predicate_exploration(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "example-db"
+    settings = GraphArrowSettings(
+        database_path=database_path,
+        bolt_host="127.0.0.1",
+        bolt_port=0,
+        bolt_auth_token="secret",
+    )
+
+    with run_bolt_server(database_path, settings=settings) as handle:
+        driver = GraphDatabase.driver(
+            f"bolt://127.0.0.1:{handle.port}",
+            auth=basic_auth("neo4j", "secret"),
+        )
+        try:
+            with driver.session() as session:
+                session.run(
+                    "CREATE (jon:Character {name: 'Jon Snow'})-[:KILLED]->"
+                    "(wight:Character {name: 'Wight'}) RETURN jon"
+                ).consume()
+                session.run(
+                    "MATCH (jon:Character {name: 'Jon Snow'}) "
+                    "CREATE (jon)-[:LOYAL_TO]->"
+                    "(allegiance:Allegiance {name: 'Night Watch'}) RETURN jon"
+                ).consume()
+                records = list(
+                    session.run(
+                        "MATCH (n)-[e]->(m) "
+                        "WHERE n:Character AND (m:Character OR m:Allegiance) "
+                        "RETURN n, e, m "
+                        "ORDER BY type(e) ASC"
+                    )
+                )
+        finally:
+            driver.close()
+
+    assert len(records) == 2
+    assert all(isinstance(record["n"], Node) for record in records)
+    assert all(isinstance(record["e"], Relationship) for record in records)
+    assert all(isinstance(record["m"], Node) for record in records)
+    assert [record["e"].type for record in records] == ["KILLED", "LOYAL_TO"]
+    assert {records[0]["m"]["name"], records[1]["m"]["name"]} == {"Night Watch", "Wight"}
+
+
+@pytest.mark.integration
 def test_bolt_server_supports_unwind_with_create_loader_shape_without_return(
     tmp_path: Path,
 ) -> None:

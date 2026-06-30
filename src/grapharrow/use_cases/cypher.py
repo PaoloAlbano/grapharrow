@@ -266,6 +266,7 @@ WherePredicate = (
     | AndPredicate
     | OrPredicate
 )
+DistinctEndpointRangeShape: TypeAlias = tuple["PathPattern", "ReturnItem"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -524,12 +525,6 @@ class CypherQueryUseCase:
             if schema_result is not None:
                 return schema_result
 
-        if _uses_memgraph_bfs_syntax(normalized):
-            raise QueryError(
-                "Memgraph BFS relationship expansion (*bfs) is not supported yet. "
-                "Use bounded openCypher variable-length syntax such as [:TYPE*1..5]."
-            )
-
         parse_tree = parse_cypher(query)
         compiled = _compile_query(parse_tree, parameters)
 
@@ -749,6 +744,10 @@ class CypherQueryUseCase:
 
     def _execute_match(self, query: CompiledMatchQuery) -> QueryResult:
         """Execute this query shape and return the result needed by the caller."""
+        endpoint_range_result = self._try_execute_distinct_endpoint_range_match(query)
+        if endpoint_range_result is not None:
+            return endpoint_range_result
+
         logical_plan = (
             _build_match_logical_plan(query)
             if _cypher_planner_enabled()
@@ -783,6 +782,43 @@ class CypherQueryUseCase:
             skip=query.skip,
             limit=query.limit,
         )
+
+    def _try_execute_distinct_endpoint_range_match(
+        self,
+        query: CompiledMatchQuery,
+    ) -> QueryResult | None:
+        """Fast path for bounded variable-length queries returning only distinct endpoints."""
+        pushed_patterns, residual_predicate = _push_down_match_where_predicate(
+            query.patterns,
+            query.where_predicate,
+        )
+        if residual_predicate is not None:
+            return None
+        shape = _distinct_endpoint_range_shape(
+            replace(query, patterns=pushed_patterns, where_predicate=None)
+        )
+        if shape is None:
+            return None
+
+        pattern, return_item = shape
+        state = self._graph_service.load_tabular_state()
+        adjacency_loader = self._adjacency_loader_for_state(state)
+        node_property_loader = self._node_property_loader_for_state(state)
+        result_rows = _match_distinct_endpoint_range_table(
+            state.node_table,
+            pattern,
+            return_item,
+            self._tabular,
+            adjacency_by_source_loader=adjacency_loader,
+            node_property_loader=node_property_loader,
+        )
+        result_rows = self._apply_result_window(
+            result_rows,
+            order_by=query.order_by,
+            skip=query.skip,
+            limit=query.limit,
+        )
+        return _build_query_result_from_table(query.return_items, result_rows)
 
     def _execute_match_logical_plan(self, plan: MatchLogicalPlan) -> MatchLogicalPlanResult:
         """Execute this query shape and return the result needed by the caller."""
@@ -837,7 +873,7 @@ class CypherQueryUseCase:
                 labels=plan.labels,
                 properties=plan.properties,
             )
-            return _apply_node_pattern_filter(
+            scanned = _apply_node_pattern_filter(
                 _node_binding_table(
                     state.node_table,
                     plan.variable,
@@ -846,6 +882,16 @@ class CypherQueryUseCase:
                     node_property_loader=node_property_loader,
                 ),
                 pattern,
+            )
+            return _apply_where_predicate_table(
+                scanned,
+                cast(WherePredicate | None, plan.pushdown_predicate),
+                nodes=state.node_table,
+                edges=state.edge_table,
+                tabular=self._tabular,
+                adjacency_by_source_loader=adjacency_loader,
+                node_property_loader=node_property_loader,
+                edge_property_loader=edge_property_loader,
             )
         if isinstance(plan, ExpandPlan):
             input_table = self._execute_logical_plan_node(
@@ -875,6 +921,16 @@ class CypherQueryUseCase:
             )
             if not _uses_typed_adjacency_path(step, plan.edge_requested_fields):
                 edge_table = _apply_edge_pattern_filter(edge_table, plan.edge_variable, step)
+            edge_table = _apply_where_predicate_table(
+                edge_table,
+                cast(WherePredicate | None, plan.edge_pushdown_predicate),
+                nodes=state.node_table,
+                edges=state.edge_table,
+                tabular=self._tabular,
+                adjacency_by_source_loader=adjacency_loader,
+                node_property_loader=node_property_loader,
+                edge_property_loader=edge_property_loader,
+            )
             matched = self._tabular.inner_join(
                 input_table,
                 edge_table,
@@ -2161,11 +2217,6 @@ def _execute_show_compatibility_statement(
         )
 
     return QueryResult(columns=("name", "value"), rows=())
-
-
-def _uses_memgraph_bfs_syntax(query: str) -> bool:
-    """Detect Memgraph's non-openCypher BFS expansion before the parser rejects it."""
-    return re.search(r"\*\s*bfs\b", query, flags=re.IGNORECASE) is not None
 
 
 def _execute_schema_compatibility_procedure(
@@ -5684,6 +5735,14 @@ def _match_fixed_path_table(
             source_variable=current_variable,
             endpoint="source" if step.direction == "outgoing" else "target",
         )
+        matched = _filter_reused_relationships_in_fixed_path(
+            matched,
+            current_edge_prefix=edge_prefix,
+            previous_edge_prefixes=tuple(
+                pattern.steps[previous_index].variable or f"_edge_{previous_index}"
+                for previous_index in range(index)
+            ),
+        )
         if not _uses_typed_adjacency_path(step, edge_requested_fields):
             matched = _apply_edge_pattern_filter(matched, edge_prefix, step)
         if matched.num_rows == 0:
@@ -5724,6 +5783,25 @@ def _match_fixed_path_table(
             return _project_public_pattern_columns(matched, pattern)
 
     return _project_public_pattern_columns(matched, pattern)
+
+
+def _filter_reused_relationships_in_fixed_path(
+    table: pa.Table,
+    *,
+    current_edge_prefix: str,
+    previous_edge_prefixes: tuple[str, ...],
+) -> pa.Table:
+    """Apply Cypher relationship uniqueness for fixed-hop path patterns."""
+    current_column = f"{current_edge_prefix}.id"
+    if current_column not in table.column_names:
+        return table
+    masks: list[pa.Array] = []
+    for previous_edge_prefix in previous_edge_prefixes:
+        previous_column = f"{previous_edge_prefix}.id"
+        if previous_column not in table.column_names:
+            continue
+        masks.append(pc.not_equal(table[current_column], table[previous_column]))
+    return _filter_table_with_masks(table, masks)
 
 
 def _can_use_iterative_variable_length_match(pattern: CompiledPattern) -> bool:
@@ -5818,7 +5896,9 @@ def _match_single_variable_length_path_table(
             end_pattern=step.node,
             node_property_loader=node_property_loader,
         )
-    filtered_edges = filtered_edges.select([f"{edge_prefix}.source", f"{edge_prefix}.target"])
+    filtered_edges = filtered_edges.select(
+        [f"{edge_prefix}.id", f"{edge_prefix}.source", f"{edge_prefix}.target"]
+    )
 
     end_nodes = _node_binding_table(
         nodes,
@@ -5829,11 +5909,27 @@ def _match_single_variable_length_path_table(
     )
     result_tables: list[pa.Table] = []
     for hop_count in range(1, step.max_hops + 1):
+        current_edge_id_column = f"__varlen_edge_{hop_count - 1}.id"
         joined_edges = tabular.inner_join(
             frontier,
             filtered_edges,
             left_keys=current_id_column,
             right_keys=f"{edge_prefix}.source",
+        )
+        if joined_edges.num_rows == 0:
+            break
+        joined_edges = joined_edges.rename_columns(
+            [
+                current_edge_id_column if column_name == f"{edge_prefix}.id" else column_name
+                for column_name in joined_edges.column_names
+            ]
+        )
+        joined_edges = _filter_reused_relationships_in_variable_length_path(
+            joined_edges,
+            current_edge_id_column=current_edge_id_column,
+            previous_edge_id_columns=tuple(
+                f"__varlen_edge_{previous_hop}.id" for previous_hop in range(hop_count - 1)
+            ),
         )
         if joined_edges.num_rows == 0:
             break
@@ -5869,6 +5965,13 @@ def _match_single_variable_length_path_table(
                 current_id_column: joined_nodes[
                     _binding_column_name(step.node.variable, _NODE_ID_FIELD)
                 ],
+                **{
+                    edge_id_column: joined_nodes[edge_id_column]
+                    for edge_id_column in (
+                        f"__varlen_edge_{visited_hop}.id" for visited_hop in range(hop_count)
+                    )
+                    if edge_id_column in joined_nodes.column_names
+                },
             }
         )
 
@@ -5931,6 +6034,210 @@ def _with_variable_length_start_fields(
         left_keys=start_id_column,
         right_keys=_binding_column_name(start_variable, _NODE_ID_FIELD),
     )
+
+
+def _filter_reused_relationships_in_variable_length_path(
+    table: pa.Table,
+    *,
+    current_edge_id_column: str,
+    previous_edge_id_columns: tuple[str, ...],
+) -> pa.Table:
+    """Apply Cypher relationship uniqueness while expanding one variable-length path."""
+    if current_edge_id_column not in table.column_names:
+        return table
+    masks: list[pa.Array] = []
+    for previous_edge_id_column in previous_edge_id_columns:
+        if previous_edge_id_column not in table.column_names:
+            continue
+        masks.append(pc.not_equal(table[current_edge_id_column], table[previous_edge_id_column]))
+    return _filter_table_with_masks(table, masks)
+
+
+def _match_distinct_endpoint_range_table(
+    nodes: pa.Table,
+    pattern: PathPattern,
+    return_item: ReturnItem,
+    tabular: PyArrowTabularAdapter,
+    *,
+    adjacency_by_source_loader: Callable[[str], pa.Table] | None,
+    node_property_loader: Callable[[str], pa.Table] | None = None,
+) -> pa.Table:
+    """Return distinct endpoint projections for bounded variable-length traversals."""
+    assert return_item.field is not None
+    step = pattern.steps[0]
+    start_table = _apply_node_pattern_filter(
+        _node_binding_table(
+            nodes,
+            pattern.start.variable,
+            requested_fields={
+                _NODE_ID_FIELD,
+                *pattern.start.properties.keys(),
+            },
+            pattern=pattern.start,
+            node_property_loader=node_property_loader,
+        ),
+        pattern.start,
+    )
+    if start_table.num_rows == 0:
+        return pa.table({_binding_column_name(return_item.variable, return_item.field): []})
+
+    end_table = _apply_node_pattern_filter(
+        _node_binding_table(
+            nodes,
+            step.node.variable,
+            requested_fields={
+                _NODE_ID_FIELD,
+                return_item.field,
+                *step.node.properties.keys(),
+            },
+            pattern=step.node,
+            node_property_loader=node_property_loader,
+        ),
+        step.node,
+    )
+    if end_table.num_rows == 0:
+        return _project_return_items_table(end_table, (return_item,))
+
+    edge_prefix = "__endpoint_range_edge"
+    edge_table = _edge_match_table(
+        pa.table({}),
+        edge_prefix,
+        step,
+        requested_fields=set(),
+        adjacency_by_source_loader=adjacency_by_source_loader,
+    )
+    if edge_table.num_rows == 0:
+        return _project_return_items_table(end_table.slice(0, 0), (return_item,))
+
+    end_value_by_id = _endpoint_value_map_from_table(end_table, return_item=return_item)
+    allowed_end_ids = set(end_value_by_id)
+    start_ids = [
+        int(value)
+        for value in start_table[_binding_column_name(pattern.start.variable, _NODE_ID_FIELD)]
+        .combine_chunks()
+        .to_pylist()
+    ]
+
+    if step.min_hops == 1:
+        matched_endpoint_ids = _distinct_reachable_endpoint_ids(
+            start_ids=start_ids,
+            adjacency=_adjacency_targets_from_edge_table(edge_table, edge_prefix=edge_prefix),
+            allowed_end_ids=allowed_end_ids,
+            max_hops=step.max_hops,
+        )
+    else:
+        matched_endpoint_ids = _distinct_endpoint_ids_with_relationship_uniqueness(
+            start_ids=start_ids,
+            adjacency=_adjacency_map_from_edge_table(edge_table, edge_prefix=edge_prefix),
+            allowed_end_ids=allowed_end_ids,
+            min_hops=step.min_hops,
+            max_hops=step.max_hops,
+        )
+
+    if not matched_endpoint_ids:
+        return _project_return_items_table(end_table.slice(0, 0), (return_item,))
+
+    values = [end_value_by_id[node_id] for node_id in sorted(matched_endpoint_ids)]
+    projected = pa.table({_binding_column_name(return_item.variable, return_item.field): values})
+    return _apply_distinct_to_table(projected)
+
+
+def _distinct_reachable_endpoint_ids(
+    *,
+    start_ids: list[int],
+    adjacency: dict[int, tuple[int, ...]],
+    allowed_end_ids: set[int],
+    max_hops: int,
+) -> set[int]:
+    """Find distinct reachable endpoints for min-hop-one endpoint-only traversals."""
+    matched_endpoint_ids: set[int] = set()
+    frontier = set(start_ids)
+    seen_nodes = set(start_ids)
+    for _ in range(1, max_hops + 1):
+        next_frontier: set[int] = set()
+        for current_node_id in frontier:
+            for target_id in adjacency.get(current_node_id, ()):
+                if target_id in allowed_end_ids:
+                    matched_endpoint_ids.add(target_id)
+                next_frontier.add(target_id)
+        next_frontier.difference_update(seen_nodes)
+        if not next_frontier:
+            break
+        seen_nodes.update(next_frontier)
+        frontier = next_frontier
+    return matched_endpoint_ids
+
+
+def _distinct_endpoint_ids_with_relationship_uniqueness(
+    *,
+    start_ids: list[int],
+    adjacency: dict[int, tuple[tuple[int, int], ...]],
+    allowed_end_ids: set[int],
+    min_hops: int,
+    max_hops: int,
+) -> set[int]:
+    """Find endpoints while preserving relationship uniqueness for min-hop greater than one."""
+    matched_endpoint_ids: set[int] = set()
+    frontier: set[tuple[int, tuple[int, ...]]] = {(node_id, ()) for node_id in start_ids}
+    for hop_count in range(1, max_hops + 1):
+        next_frontier: set[tuple[int, tuple[int, ...]]] = set()
+        for current_node_id, visited_edge_ids in frontier:
+            for edge_id, target_id in adjacency.get(current_node_id, ()):
+                if edge_id in visited_edge_ids:
+                    continue
+                next_visited_edge_ids = (*visited_edge_ids, edge_id)
+                if hop_count >= min_hops and target_id in allowed_end_ids:
+                    matched_endpoint_ids.add(target_id)
+                if hop_count < max_hops:
+                    next_frontier.add((target_id, next_visited_edge_ids))
+        if not next_frontier:
+            break
+        frontier = next_frontier
+    return matched_endpoint_ids
+
+
+def _adjacency_map_from_edge_table(
+    edge_table: pa.Table,
+    *,
+    edge_prefix: str,
+) -> dict[int, tuple[tuple[int, int], ...]]:
+    """Build a compact source-id adjacency map for endpoint-only traversal."""
+    edge_ids = edge_table[f"{edge_prefix}.id"].combine_chunks().to_pylist()
+    source_ids = edge_table[f"{edge_prefix}.source"].combine_chunks().to_pylist()
+    target_ids = edge_table[f"{edge_prefix}.target"].combine_chunks().to_pylist()
+    adjacency_lists: dict[int, list[tuple[int, int]]] = {}
+    for edge_id, source_id, target_id in zip(edge_ids, source_ids, target_ids, strict=True):
+        adjacency_lists.setdefault(int(source_id), []).append((int(edge_id), int(target_id)))
+    return {source_id: tuple(targets) for source_id, targets in adjacency_lists.items()}
+
+
+def _adjacency_targets_from_edge_table(
+    edge_table: pa.Table,
+    *,
+    edge_prefix: str,
+) -> dict[int, tuple[int, ...]]:
+    """Build a compact source-id to target-ids map for reachability-only traversal."""
+    source_ids = edge_table[f"{edge_prefix}.source"].combine_chunks().to_pylist()
+    target_ids = edge_table[f"{edge_prefix}.target"].combine_chunks().to_pylist()
+    adjacency_lists: dict[int, list[int]] = {}
+    for source_id, target_id in zip(source_ids, target_ids, strict=True):
+        adjacency_lists.setdefault(int(source_id), []).append(int(target_id))
+    return {source_id: tuple(targets) for source_id, targets in adjacency_lists.items()}
+
+
+def _endpoint_value_map_from_table(
+    table: pa.Table,
+    *,
+    return_item: ReturnItem,
+) -> dict[int, Any]:
+    """Map endpoint node ids to the scalar value returned by the optimized endpoint path."""
+    assert return_item.field is not None
+    node_ids = table[_binding_column_name(return_item.variable, _NODE_ID_FIELD)].combine_chunks()
+    values = table[_binding_column_name(return_item.variable, return_item.field)].combine_chunks()
+    return {
+        int(node_id): value
+        for node_id, value in zip(node_ids.to_pylist(), values.to_pylist(), strict=True)
+    }
 
 
 def _empty_endpoint_range_projection_table(
@@ -6511,6 +6818,49 @@ def _can_apply_projected_distinct_window(
     return all((item.variable, item.field) in projected_fields for item in order_by)
 
 
+def _distinct_endpoint_range_shape(
+    query: CompiledMatchQuery,
+) -> DistinctEndpointRangeShape | None:
+    """Detect bounded variable-length endpoint queries that can avoid full path materialization."""
+    if not query.distinct or len(query.patterns) != 1 or len(query.return_items) != 1:
+        return None
+    if query.skip is not None:
+        return None
+    return_item = query.return_items[0]
+    if (
+        return_item.field is None
+        or return_item.scalar_expression is not None
+        or return_item.aggregate is not None
+    ):
+        return None
+    if query.order_by is not None and not all(
+        item.variable == return_item.variable
+        and item.field == return_item.field
+        and not item.descending
+        for item in query.order_by
+    ):
+        return None
+    pattern = query.patterns[0]
+    if not isinstance(pattern, PathPattern) or len(pattern.steps) != 1:
+        return None
+    step = pattern.steps[0]
+    if (
+        step.min_hops == 1
+        and step.max_hops == 1
+        or step.variable is not None
+        or step.direction != "outgoing"
+        or step.rel_type is None
+        or len(step.rel_type_alternatives) > 1
+        or step.properties
+        or pattern.start.variable == step.node.variable
+        or return_item.variable != step.node.variable
+    ):
+        return None
+    if step.max_hops > 5:
+        return None
+    return (pattern, return_item)
+
+
 def _match_with_query_has_exists_pattern(query: CompiledMatchWithQuery) -> bool:
     """Return true when a MATCH/WITH query uses EXISTS { pattern } predicates."""
 
@@ -6589,6 +6939,10 @@ def _build_match_logical_plan(query: CompiledMatchQuery) -> MatchLogicalPlan | N
     )
     if root is None:
         return None
+    residual_predicate = _residual_predicate_after_bound_pushdowns(
+        pushed_pattern,
+        residual_predicate,
+    )
     if residual_predicate is not None:
         root = FilterPlan(input=root, predicate=residual_predicate)
 
@@ -6866,6 +7220,10 @@ def _build_scan_filter_plan(
     )
     if root is None:
         return None
+    residual_predicate = _residual_predicate_after_bound_pushdowns(
+        pushed_patterns[0],
+        residual_predicate,
+    )
     if residual_predicate is not None:
         root = FilterPlan(input=root, predicate=residual_predicate)
     return root
@@ -6934,6 +7292,10 @@ def _build_match_scan_plan(
             labels=pattern.labels,
             properties=pattern.properties,
             requested_fields=_requested_fields_for_variable(required_fields, pattern.variable),
+            pushdown_predicate=_pushdown_predicate_for_bound_variable(
+                where_predicate,
+                pattern.variable,
+            ),
         )
     root: LogicalPlan = NodeScanPlan(
         variable=pattern.start.variable,
@@ -6941,6 +7303,10 @@ def _build_match_scan_plan(
         properties=pattern.start.properties,
         requested_fields=_requested_fields_for_variable(
             required_fields,
+            pattern.start.variable,
+        ),
+        pushdown_predicate=_pushdown_predicate_for_bound_variable(
+            where_predicate,
             pattern.start.variable,
         ),
     )
@@ -6973,6 +7339,10 @@ def _build_match_scan_plan(
             end_requested_fields=_requested_fields_for_variable(
                 required_fields,
                 step.node.variable,
+            ),
+            edge_pushdown_predicate=_pushdown_predicate_for_bound_variable(
+                where_predicate,
+                edge_variable,
             ),
             end_pushdown_predicate=_pushdown_predicate_for_bound_variable(
                 where_predicate,
@@ -7142,6 +7512,25 @@ def _pushdown_predicate_for_bound_variable(
         if _is_single_variable_pushdown_predicate(conjunct, variable)
     )
     return _combine_and_predicates(pushable)
+
+
+def _residual_predicate_after_bound_pushdowns(
+    pattern: CompiledPattern,
+    predicate: WherePredicate | None,
+) -> WherePredicate | None:
+    """Remove single-variable predicates already applied by scan/expand operators."""
+    if predicate is None:
+        return None
+    pattern_variables = set(_pattern_variables(pattern))
+    residual = tuple(
+        conjunct
+        for conjunct in _flatten_and_predicates(predicate)
+        if not any(
+            _is_single_variable_pushdown_predicate(conjunct, variable)
+            for variable in pattern_variables
+        )
+    )
+    return _combine_and_predicates(residual)
 
 
 def _is_single_variable_pushdown_predicate(
@@ -10261,6 +10650,7 @@ def _typed_adjacency_binding_table(
     """Support the current Cypher compilation or execution step."""
     if adjacency_table.num_rows == 0:
         empty_columns: dict[str, pa.Array] = {
+            f"{edge_prefix}.id": pa.array([], type=pa.int64()),
             f"{edge_prefix}.source": pa.array([], type=pa.int64()),
             f"{edge_prefix}.target": pa.array([], type=pa.int64()),
         }
@@ -10268,6 +10658,7 @@ def _typed_adjacency_binding_table(
             empty_columns[f"{edge_prefix}.type"] = pa.array([], type=pa.string())
         return pa.table(empty_columns)
     columns: dict[str, pa.Array | pa.ChunkedArray] = {
+        f"{edge_prefix}.id": adjacency_table["edge_id"],
         f"{edge_prefix}.source": adjacency_table["src_id"],
         f"{edge_prefix}.target": adjacency_table["dst_id"],
     }
@@ -10919,7 +11310,7 @@ def _predicate_mask(
                 pa.array([True] * table.num_rows, type=pa.bool_())
                 if predicate.is_null
                 else pa.array([False] * table.num_rows, type=pa.bool_())
-        )
+            )
         return _null_mask(column, predicate.is_null)
 
     if isinstance(predicate, LabelPredicate):

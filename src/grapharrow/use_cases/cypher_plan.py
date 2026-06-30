@@ -12,6 +12,7 @@ class NodeScanPlan:
     labels: tuple[str, ...]
     properties: dict[str, object]
     requested_fields: set[str] | None
+    pushdown_predicate: object | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +27,7 @@ class ExpandPlan:
     end_labels: tuple[str, ...]
     end_properties: dict[str, object]
     end_requested_fields: set[str] | None
+    edge_pushdown_predicate: object | None = None
     end_pushdown_predicate: object | None = None
 
 
