@@ -195,6 +195,12 @@ def build_queries() -> dict[str, str]:
             "ORDER BY n.score DESC, n.external_id ASC "
             "LIMIT 100"
         ),
+        "node_property_inline_point_lookup": (
+            "MATCH (n:Person {external_id: 'person-000123'}) RETURN n.external_id, n.score"
+        ),
+        "node_property_where_point_lookup": (
+            "MATCH (n:Person) WHERE n.external_id = 'person-000123' RETURN n.external_id, n.score"
+        ),
         "text_prefix_filter_sort_limit": (
             "MATCH (n:Person) "
             "WHERE n.external_id STARTS WITH 'person-000' "

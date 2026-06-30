@@ -4,6 +4,7 @@ from grapharrow.core.errors import CatalogError
 from grapharrow.domain import (
     CatalogVersion,
     ConstraintDefinition,
+    IndexDefinition,
     LabelDefinition,
     LabelId,
     PropertyDefinition,
@@ -64,3 +65,33 @@ def test_catalog_can_filter_properties_by_owner() -> None:
     properties = catalog.properties_for_owner(owner_kind="label", owner_name="Person")
 
     assert [definition.name for definition in properties] == ["name"]
+
+
+def test_catalog_can_resolve_and_filter_indexes() -> None:
+    catalog = VersionedCatalog(
+        version=CatalogVersion(1),
+        indexes=(
+            IndexDefinition(
+                name="person_name_idx",
+                kind="range",
+                owner_kind="label",
+                owner_name="Person",
+                property_names=("name",),
+            ),
+            IndexDefinition(
+                name="knows_since_idx",
+                kind="range",
+                owner_kind="relationship_type",
+                owner_name="KNOWS",
+                property_names=("since",),
+            ),
+        ),
+    )
+
+    indexes = catalog.indexes_for_owner(owner_kind="label", owner_name="Person")
+
+    assert catalog.get_index("person_name_idx").property_names == ("name",)
+    assert [definition.name for definition in indexes] == ["person_name_idx"]
+
+    with pytest.raises(CatalogError, match="Unknown index"):
+        catalog.get_index("missing_idx")

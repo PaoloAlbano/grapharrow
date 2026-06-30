@@ -14,6 +14,9 @@ from grapharrow.core.errors import TransactionError
 from grapharrow.domain import (
     CatalogVersion,
     CurrentSnapshotPointer,
+    IndexDefinition,
+    IndexKind,
+    PropertyOwnerKind,
     SnapshotId,
     SnapshotManifest,
     VersionedCatalog,
@@ -236,6 +239,39 @@ class Database:
         """Persist a catalog version directly through the embedded repository surface."""
 
         return self._app.repositories.catalog.write(catalog)
+
+    def list_indexes(self) -> tuple[IndexDefinition, ...]:
+        """Return logical index declarations stored in the current catalog."""
+
+        return self._app.use_cases.indexes.list_indexes()
+
+    def create_index(
+        self,
+        *,
+        name: str,
+        kind: IndexKind,
+        owner_kind: PropertyOwnerKind,
+        owner_name: str,
+        property_names: tuple[str, ...],
+        if_not_exists: bool = False,
+        case_sensitive: bool = True,
+    ) -> IndexDefinition:
+        """Declare a logical index through the shared index use case."""
+
+        return self._app.use_cases.indexes.create_index(
+            name=name,
+            kind=kind,
+            owner_kind=owner_kind,
+            owner_name=owner_name,
+            property_names=property_names,
+            if_not_exists=if_not_exists,
+            case_sensitive=case_sensitive,
+        )
+
+    def drop_index(self, *, name: str, if_exists: bool = False) -> IndexDefinition | None:
+        """Remove a logical index declaration through the shared index use case."""
+
+        return self._app.use_cases.indexes.drop_index(name=name, if_exists=if_exists)
 
     def load_current_snapshot_pointer(self) -> CurrentSnapshotPointer:
         """Load the snapshot pointer that readers currently treat as the visible head state."""

@@ -10,6 +10,8 @@ from grapharrow.domain.ids import CatalogVersion, LabelId, RelationshipTypeId
 
 PropertyOwnerKind = Literal["label", "relationship_type"]
 ConstraintKind = Literal["primary_key", "unique", "required", "endpoint", "nullability"]
+IndexKind = Literal["range", "text", "fulltext", "vector", "lookup"]
+IndexStatus = Literal["declared", "building", "ready", "stale"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +55,21 @@ class ConstraintDefinition:
 
 
 @dataclass(frozen=True, slots=True)
+class IndexDefinition:
+    """Catalog entry describing a logical index declaration."""
+
+    name: str
+    kind: IndexKind
+    owner_kind: PropertyOwnerKind
+    owner_name: str
+    property_names: tuple[str, ...] = ()
+    status: IndexStatus = "declared"
+    backend: str = "metadata"
+    case_sensitive: bool = True
+    options: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class VersionedCatalog:
     """Immutable, versioned in-memory representation of the catalog."""
 
@@ -61,6 +78,7 @@ class VersionedCatalog:
     relationship_types: tuple[RelationshipTypeDefinition, ...] = field(default_factory=tuple)
     properties: tuple[PropertyDefinition, ...] = field(default_factory=tuple)
     constraints: tuple[ConstraintDefinition, ...] = field(default_factory=tuple)
+    indexes: tuple[IndexDefinition, ...] = field(default_factory=tuple)
 
     @classmethod
     def empty(cls, *, version: CatalogVersion) -> VersionedCatalog:
@@ -113,3 +131,26 @@ class VersionedCatalog:
             for definition in self.constraints
             if definition.owner_kind == owner_kind and definition.owner_name == owner_name
         )
+
+    def indexes_for_owner(
+        self,
+        *,
+        owner_kind: PropertyOwnerKind,
+        owner_name: str,
+    ) -> tuple[IndexDefinition, ...]:
+        """Return logical indexes registered for a label or relationship type."""
+
+        return tuple(
+            definition
+            for definition in self.indexes
+            if definition.owner_kind == owner_kind and definition.owner_name == owner_name
+        )
+
+    def get_index(self, name: str) -> IndexDefinition:
+        """Return the index definition matching ``name``."""
+
+        for index in self.indexes:
+            if index.name == name:
+                return index
+
+        raise CatalogError(f"Unknown index: {name}")

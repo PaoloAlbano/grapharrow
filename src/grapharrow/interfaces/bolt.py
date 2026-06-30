@@ -410,6 +410,7 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
         state.transaction_cypher = CypherQueryUseCase(
             graph_service=cast(Any, transaction),
             tabular_adapter=server.bolt_app.grapharrow.adapters.tabular,
+            index_service=server.bolt_app.grapharrow.use_cases.indexes,
         )
         _send_success(self.request, self.codec, {})
 
