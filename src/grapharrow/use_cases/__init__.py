@@ -9,6 +9,7 @@ from grapharrow.use_cases.admin import (
 from grapharrow.use_cases.cypher import CypherQueryUseCase
 from grapharrow.use_cases.cypher_plan import MatchLogicalPlan
 from grapharrow.use_cases.graph import GraphStateUseCase, GraphTransactionUseCase, QueryResult
+from grapharrow.use_cases.indexes import IndexCatalogUseCase
 
 __all__ = [
     "CypherQueryUseCase",
@@ -16,6 +17,7 @@ __all__ = [
     "GraphStateUseCase",
     "GraphTransactionUseCase",
     "InitializationResult",
+    "IndexCatalogUseCase",
     "MatchLogicalPlan",
     "QueryResult",
     "RecoveryReport",

@@ -39,6 +39,136 @@ def test_cli_show_catalog_prints_current_catalog(
     assert exit_code == 0
     assert payload["version"] == 1
     assert payload["labels"] == []
+    assert payload["indexes"] == []
+
+
+def test_cli_create_and_list_indexes(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database_path = tmp_path / "example-db"
+    main(["init", str(database_path)])
+    capsys.readouterr()
+
+    exit_code = main(
+        [
+            "create-index",
+            str(database_path),
+            "person_name_idx",
+            "--kind",
+            "text",
+            "--label",
+            "Person",
+            "--property",
+            "name",
+            "--case-insensitive",
+        ]
+    )
+    created = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert created["catalog_version"] == 2
+    assert created["index"]["name"] == "person_name_idx"
+    assert created["index"]["kind"] == "text"
+    assert created["index"]["owner_kind"] == "label"
+    assert created["index"]["owner_name"] == "Person"
+    assert created["index"]["property_names"] == ["name"]
+    assert created["index"]["case_sensitive"] is False
+
+    exit_code = main(["list-indexes", str(database_path)])
+    listed = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert listed["version"] == 2
+    assert listed["indexes"] == [created["index"]]
+
+    exit_code = main(["show-catalog", str(database_path)])
+    catalog = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert catalog["indexes"] == [created["index"]]
+
+
+def test_cli_create_index_if_not_exists_is_idempotent(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database_path = tmp_path / "example-db"
+    main(["init", str(database_path)])
+    capsys.readouterr()
+
+    first_exit_code = main(
+        [
+            "create-index",
+            str(database_path),
+            "knows_since_idx",
+            "--relationship-type",
+            "KNOWS",
+            "--property",
+            "since",
+        ]
+    )
+    first = json.loads(capsys.readouterr().out)
+    second_exit_code = main(
+        [
+            "create-index",
+            str(database_path),
+            "knows_since_idx",
+            "--relationship-type",
+            "KNOWS",
+            "--property",
+            "since",
+            "--if-not-exists",
+        ]
+    )
+    second = json.loads(capsys.readouterr().out)
+
+    assert first_exit_code == 0
+    assert second_exit_code == 0
+    assert first["catalog_version"] == 2
+    assert second["catalog_version"] == 2
+    assert second["index"] == first["index"]
+
+
+def test_cli_drop_index_removes_catalog_declaration(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database_path = tmp_path / "example-db"
+    main(["init", str(database_path)])
+    capsys.readouterr()
+    main(
+        [
+            "create-index",
+            str(database_path),
+            "person_name_idx",
+            "--label",
+            "Person",
+            "--property",
+            "name",
+        ]
+    )
+    created = json.loads(capsys.readouterr().out)
+
+    exit_code = main(["drop-index", str(database_path), "person_name_idx"])
+    dropped = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert dropped["catalog_version"] == 3
+    assert dropped["dropped_index"] == created["index"]
+
+    exit_code = main(["list-indexes", str(database_path)])
+    listed = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert listed["indexes"] == []
+
+    exit_code = main(["drop-index", str(database_path), "person_name_idx", "--if-exists"])
+    idempotent = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert idempotent["catalog_version"] == 3
+    assert idempotent["dropped_index"] is None
 
 
 def test_cli_show_snapshot_prints_the_current_snapshot(

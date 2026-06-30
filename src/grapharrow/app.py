@@ -19,6 +19,7 @@ from grapharrow.use_cases import (
     CypherQueryUseCase,
     DatabaseAdminUseCase,
     GraphStateUseCase,
+    IndexCatalogUseCase,
 )
 
 
@@ -49,6 +50,7 @@ class GraphArrowUseCases:
     admin: DatabaseAdminUseCase
     graph: GraphStateUseCase
     cypher: CypherQueryUseCase
+    indexes: IndexCatalogUseCase
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,14 +107,17 @@ def build_application(
         snapshot_store=repositories.snapshot,
         graph_store=repositories.graph,
     )
+    index_use_case = IndexCatalogUseCase(catalog_store=repositories.catalog)
     cypher_use_case = CypherQueryUseCase(
         graph_service=graph_use_case,
         tabular_adapter=adapters.tabular,
+        index_service=index_use_case,
     )
     use_cases = GraphArrowUseCases(
         admin=admin_use_case,
         graph=graph_use_case,
         cypher=cypher_use_case,
+        indexes=index_use_case,
     )
     return GraphArrowApplication(
         settings=resolved_settings,

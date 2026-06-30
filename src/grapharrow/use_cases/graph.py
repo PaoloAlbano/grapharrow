@@ -829,6 +829,7 @@ class GraphStateUseCase:
             relationship_types=tuple(relationship_type_definitions),
             properties=catalog.properties,
             constraints=catalog.constraints,
+            indexes=catalog.indexes,
         )
 
     def _validate_new_nodes(

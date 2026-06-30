@@ -10,7 +10,7 @@ from pathlib import Path
 import pyarrow.csv as pacsv  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
-from grapharrow.domain import DatasetFile
+from grapharrow.domain import DatasetFile, IndexDefinition, PropertyOwnerKind
 from grapharrow.interfaces.embedded import Database
 
 
@@ -28,6 +28,60 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the current catalog as formatted JSON.",
     )
     show_catalog_parser.add_argument("path", help="Database directory to inspect.")
+
+    list_indexes_parser = subparsers.add_parser(
+        "list-indexes",
+        help="Print logical index declarations as formatted JSON.",
+    )
+    list_indexes_parser.add_argument("path", help="Database directory to inspect.")
+
+    create_index_parser = subparsers.add_parser(
+        "create-index",
+        help="Declare a logical index in the catalog.",
+    )
+    create_index_parser.add_argument("path", help="Database directory to update.")
+    create_index_parser.add_argument("name", help="Index name.")
+    create_index_parser.add_argument(
+        "--kind",
+        choices=("range", "text", "fulltext", "vector", "lookup"),
+        default="range",
+        help="Logical index kind to declare.",
+    )
+    owner_group = create_index_parser.add_mutually_exclusive_group(required=True)
+    owner_group.add_argument("--label", help="Node label the index belongs to.")
+    owner_group.add_argument(
+        "--relationship-type",
+        help="Relationship type the index belongs to.",
+    )
+    create_index_parser.add_argument(
+        "--property",
+        dest="properties",
+        action="append",
+        default=[],
+        help="Property included in the index. Repeat for composite indexes.",
+    )
+    create_index_parser.add_argument(
+        "--if-not-exists",
+        action="store_true",
+        help="Return the existing matching index instead of failing.",
+    )
+    create_index_parser.add_argument(
+        "--case-insensitive",
+        action="store_true",
+        help="Declare a case-insensitive textual index.",
+    )
+
+    drop_index_parser = subparsers.add_parser(
+        "drop-index",
+        help="Remove a logical index declaration from the catalog.",
+    )
+    drop_index_parser.add_argument("path", help="Database directory to update.")
+    drop_index_parser.add_argument("name", help="Index name.")
+    drop_index_parser.add_argument(
+        "--if-exists",
+        action="store_true",
+        help="Succeed when the index is already absent.",
+    )
 
     show_snapshot_parser = subparsers.add_parser(
         "show-snapshot",
@@ -205,6 +259,47 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
                 for definition in catalog.constraints
             ],
+            "indexes": [_index_payload(definition) for definition in catalog.indexes],
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "list-indexes":
+        database = Database(args.path)
+        catalog = database.load_catalog()
+        payload = {
+            "version": catalog.version.value,
+            "indexes": [_index_payload(definition) for definition in database.list_indexes()],
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "create-index":
+        database = Database(args.path)
+        owner_kind: PropertyOwnerKind = "label" if args.label is not None else "relationship_type"
+        owner_name = str(args.label if args.label is not None else args.relationship_type)
+        index = database.create_index(
+            name=args.name,
+            kind=args.kind,
+            owner_kind=owner_kind,
+            owner_name=owner_name,
+            property_names=tuple(args.properties),
+            if_not_exists=args.if_not_exists,
+            case_sensitive=not args.case_insensitive,
+        )
+        payload = {
+            "catalog_version": database.load_catalog().version.value,
+            "index": _index_payload(index),
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "drop-index":
+        database = Database(args.path)
+        removed = database.drop_index(name=args.name, if_exists=args.if_exists)
+        payload = {
+            "catalog_version": database.load_catalog().version.value,
+            "dropped_index": None if removed is None else _index_payload(removed),
         }
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
@@ -399,6 +494,21 @@ def _dataset_file_payload(dataset_file: DatasetFile) -> dict[str, object]:
         "checksum_algorithm": dataset_file.checksum_algorithm,
         "min_key": dataset_file.min_key,
         "max_key": dataset_file.max_key,
+    }
+
+
+def _index_payload(definition: IndexDefinition) -> dict[str, object]:
+    """Serialize one logical index declaration for CLI JSON output."""
+    return {
+        "name": definition.name,
+        "kind": definition.kind,
+        "owner_kind": definition.owner_kind,
+        "owner_name": definition.owner_name,
+        "property_names": list(definition.property_names),
+        "status": definition.status,
+        "backend": definition.backend,
+        "case_sensitive": definition.case_sensitive,
+        "options": dict(definition.options),
     }
 
 

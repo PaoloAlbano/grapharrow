@@ -15,6 +15,7 @@ def test_build_application_wires_core_components(tmp_path: Path) -> None:
     assert app.use_cases.admin is not None
     assert app.use_cases.graph is not None
     assert app.use_cases.cypher is not None
+    assert app.use_cases.indexes is not None
 
 
 def test_settings_can_be_provided_explicitly(tmp_path: Path) -> None:

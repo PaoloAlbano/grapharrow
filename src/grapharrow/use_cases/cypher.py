@@ -14,7 +14,8 @@ import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.compute as pc  # type: ignore[import-untyped]
 
 from grapharrow.adapters import PyArrowTabularAdapter, parse_cypher
-from grapharrow.core.errors import QueryError
+from grapharrow.core.errors import CatalogError, QueryError
+from grapharrow.domain import IndexKind, PropertyOwnerKind
 from grapharrow.interfaces.opencypher.generated.vendor.opencypher.CypherParser import CypherParser
 from grapharrow.repositories import EdgeRecord, NodeRecord
 from grapharrow.use_cases.cypher_plan import (
@@ -41,6 +42,7 @@ from grapharrow.use_cases.graph import (
     GraphTransactionUseCase,
     QueryResult,
 )
+from grapharrow.use_cases.indexes import IndexCatalogUseCase
 
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _INTERNAL_VARIABLE_PREFIX = "__varhop_"
@@ -476,6 +478,26 @@ class _CompilerState:
         return f"_anon_{self.anonymous_index}"
 
 
+@dataclass(frozen=True, slots=True)
+class _ParsedIndexDeclaration:
+    """Index declaration extracted from client DDL syntax before Cypher parsing."""
+
+    name: str
+    kind: IndexKind
+    owner_kind: PropertyOwnerKind
+    owner_name: str
+    property_names: tuple[str, ...]
+    if_not_exists: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedDropIndexStatement:
+    """DROP INDEX statement extracted before Cypher parsing."""
+
+    name: str
+    if_exists: bool = False
+
+
 class CypherQueryUseCase:
     """Execute a narrow but useful subset of Cypher statements."""
 
@@ -483,10 +505,12 @@ class CypherQueryUseCase:
         self,
         graph_service: GraphStateUseCase,
         tabular_adapter: PyArrowTabularAdapter | None = None,
+        index_service: IndexCatalogUseCase | None = None,
     ) -> None:
         """Store the services that the Cypher compiler and executor use at runtime."""
         self._graph_service = graph_service
         self._tabular = tabular_adapter or PyArrowTabularAdapter()
+        self._index_service = index_service
 
     def execute(self, query: str, params: dict[str, object] | None = None) -> QueryResult:
         """Execute ``query`` against the current graph state."""
@@ -496,7 +520,7 @@ class CypherQueryUseCase:
             raise QueryError("Query string cannot be empty.")
 
         parameters = params or {}
-        ddl_result = _execute_ddl_compatibility_statement(normalized)
+        ddl_result = self._execute_ddl_statement(normalized)
         if ddl_result is not None:
             return ddl_result
 
@@ -551,6 +575,42 @@ class CypherQueryUseCase:
         if isinstance(compiled, CompiledMatchWithQuery):
             return self._execute_match_with(compiled)
         return self._execute_match(compiled)
+
+    def _execute_ddl_statement(self, query: str) -> QueryResult | None:
+        """Handle index DDL before the ANTLR parser sees client-specific syntax."""
+
+        normalized = _normalize_compatibility_statement(query)
+        drop_statement = _parse_drop_index_statement(normalized)
+        if drop_statement is not None:
+            if self._index_service is None:
+                return QueryResult(columns=(), rows=())
+            try:
+                self._index_service.drop_index(
+                    name=drop_statement.name,
+                    if_exists=drop_statement.if_exists,
+                )
+            except CatalogError as exc:
+                raise QueryError(str(exc)) from exc
+            return QueryResult(columns=(), rows=())
+
+        declaration = _parse_create_index_statement(normalized)
+        if declaration is None:
+            return None
+        if self._index_service is None:
+            return QueryResult(columns=(), rows=())
+
+        try:
+            self._index_service.create_index(
+                name=declaration.name,
+                kind=declaration.kind,
+                owner_kind=declaration.owner_kind,
+                owner_name=declaration.owner_name,
+                property_names=declaration.property_names,
+                if_not_exists=declaration.if_not_exists,
+            )
+        except CatalogError as exc:
+            raise QueryError(str(exc)) from exc
+        return QueryResult(columns=(), rows=())
 
     def _adjacency_loader_for_state(
         self,
@@ -880,6 +940,7 @@ class CypherQueryUseCase:
                     requested_fields=plan.requested_fields,
                     pattern=pattern,
                     node_property_loader=node_property_loader,
+                    pushdown_predicate=cast(WherePredicate | None, plan.pushdown_predicate),
                 ),
                 pattern,
             )
@@ -2038,15 +2099,105 @@ class CypherQueryUseCase:
         return self._tabular.sort_table(sorted_table, sort_keys)
 
 
-def _execute_ddl_compatibility_statement(query: str) -> QueryResult | None:
-    """Accept Neo4j/Memgraph DDL statements that GraphArrow treats as no-ops for now."""
-    normalized = _normalize_compatibility_statement(query)
-    lower = normalized.lower()
-    if re.fullmatch(r"create\s+index\s+on\s+.+", lower):
-        return QueryResult(columns=(), rows=())
-    if re.fullmatch(r"drop\s+index\s+.+", lower):
-        return QueryResult(columns=(), rows=())
-    return None
+def _parse_drop_index_statement(query: str) -> _ParsedDropIndexStatement | None:
+    """Parse common Neo4j/Memgraph DROP INDEX forms outside the Cypher grammar."""
+
+    legacy = re.fullmatch(
+        r"drop\s+index\s+on\s+:(?P<label>[A-Za-z_][A-Za-z0-9_]*)"
+        r"\s*\(\s*(?P<property>[A-Za-z_][A-Za-z0-9_]*)\s*\)",
+        query,
+        flags=re.IGNORECASE,
+    )
+    if legacy is not None:
+        label = legacy.group("label")
+        property_name = legacy.group("property")
+        return _ParsedDropIndexStatement(
+            name=f"{label}_{property_name}_idx",
+            if_exists=True,
+        )
+
+    modern = re.fullmatch(
+        r"drop\s+index\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+        r"(?:\s+(?P<if_exists>if\s+exists))?",
+        query,
+        flags=re.IGNORECASE,
+    )
+    if modern is None:
+        return None
+    return _ParsedDropIndexStatement(
+        name=modern.group("name"),
+        if_exists=modern.group("if_exists") is not None,
+    )
+
+
+def _parse_create_index_statement(query: str) -> _ParsedIndexDeclaration | None:
+    """Parse common Neo4j/Memgraph CREATE INDEX forms outside the Cypher grammar."""
+
+    legacy = re.fullmatch(
+        r"create\s+index\s+on\s+:(?P<label>[A-Za-z_][A-Za-z0-9_]*)"
+        r"\s*\(\s*(?P<property>[A-Za-z_][A-Za-z0-9_]*)\s*\)",
+        query,
+        flags=re.IGNORECASE,
+    )
+    if legacy is not None:
+        label = legacy.group("label")
+        property_name = legacy.group("property")
+        return _ParsedIndexDeclaration(
+            name=f"{label}_{property_name}_idx",
+            kind="range",
+            owner_kind="label",
+            owner_name=label,
+            property_names=(property_name,),
+            if_not_exists=True,
+        )
+
+    modern = re.fullmatch(
+        r"create\s+(?P<kind>text\s+)?index\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)?"
+        r"\s*(?P<if_not_exists>if\s+not\s+exists\s+)?"
+        r"for\s*\(\s*(?P<variable>[A-Za-z_][A-Za-z0-9_]*)"
+        r"\s*:\s*(?P<label>[A-Za-z_][A-Za-z0-9_]*)\s*\)"
+        r"\s*on\s*\(\s*(?P<properties>.+)\s*\)",
+        query,
+        flags=re.IGNORECASE,
+    )
+    if modern is None:
+        return None
+
+    variable = modern.group("variable")
+    owner_name = modern.group("label")
+    property_names = _parse_index_property_list(
+        modern.group("properties"),
+        variable=variable,
+    )
+    kind: IndexKind = "text" if modern.group("kind") else "range"
+    name = modern.group("name") or f"{owner_name}_{'_'.join(property_names)}_{kind}_idx"
+    return _ParsedIndexDeclaration(
+        name=name,
+        kind=kind,
+        owner_kind="label",
+        owner_name=owner_name,
+        property_names=property_names,
+        if_not_exists=modern.group("if_not_exists") is not None,
+    )
+
+
+def _parse_index_property_list(properties_text: str, *, variable: str) -> tuple[str, ...]:
+    """Extract ``n.property`` items from a CREATE INDEX ON clause."""
+
+    properties: list[str] = []
+    for raw_item in _split_top_level_items(properties_text):
+        item = raw_item.strip()
+        match = re.fullmatch(
+            rf"{re.escape(variable)}\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)",
+            item,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            raise QueryError(f"Unsupported CREATE INDEX property expression: {item}")
+        properties.append(match.group(1))
+    if not properties:
+        raise QueryError("CREATE INDEX requires at least one property.")
+    return tuple(properties)
 
 
 def _normalize_compatibility_statement(query: str) -> str:
@@ -2195,7 +2346,7 @@ def _execute_show_compatibility_statement(
     if lower == "show index info":
         return QueryResult(
             columns=("index_type", "label", "property", "count", "identifier"),
-            rows=(),
+            rows=tuple(_show_index_info_rows(state)),
         )
 
     if lower == "show constraint info":
@@ -2335,6 +2486,29 @@ def _is_schema_compatibility_procedure(normalized_lower_query: str) -> bool:
             "call db.schema.visualization",
         )
     )
+
+
+def _show_index_info_rows(state: GraphState) -> tuple[dict[str, Any], ...]:
+    """Build Memgraph-compatible rows from logical catalog index declarations."""
+
+    rows: list[dict[str, Any]] = []
+    for index in state.catalog.indexes:
+        if index.owner_kind == "label":
+            count = sum(1 for node in state.nodes if index.owner_name in node.labels)
+            label = index.owner_name
+        else:
+            count = sum(1 for edge in state.edges if edge.rel_type == index.owner_name)
+            label = index.owner_name
+        rows.append(
+            {
+                "index_type": index.kind,
+                "label": label,
+                "property": ",".join(index.property_names),
+                "count": count,
+                "identifier": index.name,
+            }
+        )
+    return tuple(rows)
 
 
 def _schema_node_type_property_rows(state: GraphState) -> tuple[dict[str, Any], ...]:
@@ -10677,6 +10851,7 @@ def _node_binding_table(
     requested_fields: set[str] | None = None,
     pattern: NodePattern | None = None,
     node_property_loader: Callable[[str], pa.Table] | None = None,
+    pushdown_predicate: WherePredicate | None = None,
 ) -> pa.Table:
     """Handle node-specific matching, projection, or lookup logic for Cypher."""
     if isinstance(nodes, pa.Table):
@@ -10698,6 +10873,7 @@ def _node_binding_table(
                     pattern=pattern,
                     requested_fields=requested_fields,
                     property_table=property_table,
+                    pushdown_predicate=pushdown_predicate,
                 )
         return _node_binding_table_from_canonical_table(
             nodes,
@@ -10873,8 +11049,21 @@ def _node_binding_table_from_property_projection(
     pattern: NodePattern,
     requested_fields: set[str],
     property_table: pa.Table,
+    pushdown_predicate: WherePredicate | None = None,
 ) -> pa.Table:
     """Handle node-specific matching, projection, or lookup logic for Cypher."""
+    restrict_candidates = _node_property_projection_restricts_candidates(
+        property_table,
+        variable=variable,
+        pattern=pattern,
+        predicate=pushdown_predicate,
+    )
+    property_table = _apply_node_property_table_pattern_filter(property_table, pattern)
+    property_table = _apply_node_property_table_pushdown(
+        property_table,
+        variable=variable,
+        predicate=pushdown_predicate,
+    )
     label_mask = _canonical_labels_contains_all_mask(canonical_table["labels"], pattern.labels)
     filtered = canonical_table.filter(label_mask)
     if filtered.num_rows == 0:
@@ -10899,6 +11088,18 @@ def _node_binding_table_from_property_projection(
             ),
         }
     )
+    if restrict_candidates:
+        if property_table.num_rows == 0:
+            return base.slice(0, 0)
+        base = base.join(
+            property_table.select(["node_id"]),
+            keys=_binding_column_name(variable, _NODE_ID_FIELD),
+            right_keys="node_id",
+            join_type="inner",
+        )
+        base = base.select(
+            [column_name for column_name in base.column_names if column_name != "node_id"]
+        )
     if property_table.num_rows == 0:
         projected = base
     else:
@@ -10939,6 +11140,118 @@ def _node_binding_table_from_property_projection(
         column_name for column_name in projected.column_names if column_name not in drop_columns
     ]
     return projected.select(kept_columns)
+
+
+def _node_property_projection_restricts_candidates(
+    property_table: pa.Table,
+    *,
+    variable: str,
+    pattern: NodePattern,
+    predicate: WherePredicate | None,
+) -> bool:
+    """Return true when property-side filters can reduce candidate node ids early."""
+
+    if pattern.properties:
+        return True
+    if predicate is None:
+        return False
+    return any(
+        _node_property_table_predicate_mask(
+            property_table,
+            variable=variable,
+            predicate=conjunct,
+        )
+        is not None
+        for conjunct in _flatten_and_predicates(predicate)
+    )
+
+
+def _apply_node_property_table_pattern_filter(
+    property_table: pa.Table,
+    pattern: NodePattern,
+) -> pa.Table:
+    """Filter per-label property projections before joining them back to node bindings."""
+
+    masks: list[pa.Array] = []
+    for key, value in pattern.properties.items():
+        if key not in property_table.column_names:
+            return property_table.slice(0, 0)
+        masks.append(_comparison_mask(property_table[key], "=", value))
+    return _filter_table_with_masks(property_table, masks)
+
+
+def _apply_node_property_table_pushdown(
+    property_table: pa.Table,
+    *,
+    variable: str,
+    predicate: WherePredicate | None,
+) -> pa.Table:
+    """Apply single-node predicates directly on property projection tables."""
+
+    if predicate is None:
+        return property_table
+    masks: list[pa.Array] = []
+    for conjunct in _flatten_and_predicates(predicate):
+        mask = _node_property_table_predicate_mask(
+            property_table,
+            variable=variable,
+            predicate=conjunct,
+        )
+        if mask is None:
+            continue
+        masks.append(mask)
+    return _filter_table_with_masks(property_table, masks)
+
+
+def _node_property_table_predicate_mask(
+    property_table: pa.Table,
+    *,
+    variable: str,
+    predicate: WherePredicate,
+) -> pa.Array | None:
+    """Return a property-table mask for predicates that do not need full node bindings."""
+
+    if isinstance(predicate, Comparison):
+        if predicate.variable != variable or predicate.left_expression is not None:
+            return None
+        if isinstance(predicate.value, PropertyReferenceValue | ScalarExpression):
+            return None
+        if predicate.field not in property_table.column_names:
+            return None
+        return _comparison_mask(
+            property_table[predicate.field],
+            predicate.operator,
+            predicate.value,
+        )
+    if isinstance(predicate, StringPredicate):
+        if predicate.variable != variable:
+            return None
+        if predicate.field not in property_table.column_names:
+            return None
+        return _string_predicate_mask(
+            property_table[predicate.field],
+            predicate.operator,
+            predicate.value,
+        )
+    if isinstance(predicate, ExistsPredicate):
+        if predicate.variable != variable:
+            return None
+        if predicate.field not in property_table.column_names:
+            return None
+        return _exists_mask(property_table[predicate.field])
+    if isinstance(predicate, InPredicate):
+        if predicate.variable != variable:
+            return None
+        if predicate.field not in property_table.column_names:
+            return None
+        return _in_mask(property_table[predicate.field], predicate.values)
+    if isinstance(predicate, NullPredicate):
+        if predicate.variable != variable:
+            return None
+        if predicate.field not in property_table.column_names:
+            return None
+        return _null_mask(property_table[predicate.field], predicate.is_null)
+    return None
 
 
 def _can_project_requested_node_fields(

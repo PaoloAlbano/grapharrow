@@ -20,6 +20,9 @@ from grapharrow.domain import (
 from grapharrow.domain.catalog import (
     ConstraintDefinition,
     ConstraintKind,
+    IndexDefinition,
+    IndexKind,
+    IndexStatus,
     PropertyDefinition,
     PropertyOwnerKind,
 )
@@ -121,6 +124,7 @@ class CatalogRepository:
             ],
             "properties": [asdict(item) for item in catalog.properties],
             "constraints": [asdict(item) for item in catalog.constraints],
+            "indexes": [asdict(item) for item in catalog.indexes],
         }
 
     def _serialize_label(self, definition: LabelDefinition) -> dict[str, Any]:
@@ -184,6 +188,22 @@ class CatalogRepository:
                     target_labels=tuple(str(label) for label in item.get("target_labels", [])),
                 )
                 for item in payload.get("constraints", [])
+            ),
+            indexes=tuple(
+                IndexDefinition(
+                    name=str(item["name"]),
+                    kind=cast(IndexKind, item["kind"]),
+                    owner_kind=cast(PropertyOwnerKind, item["owner_kind"]),
+                    owner_name=str(item["owner_name"]),
+                    property_names=tuple(
+                        str(property_name) for property_name in item.get("property_names", [])
+                    ),
+                    status=cast(IndexStatus, item.get("status", "declared")),
+                    backend=str(item.get("backend", "metadata")),
+                    case_sensitive=bool(item.get("case_sensitive", True)),
+                    options=dict(cast(dict[str, object], item.get("options", {}))),
+                )
+                for item in payload.get("indexes", [])
             ),
         )
 

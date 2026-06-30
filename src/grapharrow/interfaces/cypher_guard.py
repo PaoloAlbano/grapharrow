@@ -50,7 +50,7 @@ def _is_ddl_compatibility_statement(query: str) -> bool:
     """Recognize DDL statements handled outside the openCypher parser."""
     normalized = " ".join(query.strip().rstrip(";").split())
     return bool(
-        re.fullmatch(r"create\s+index\s+on\s+.+", normalized, flags=re.IGNORECASE)
+        re.fullmatch(r"create\s+(text\s+)?index\s+.+", normalized, flags=re.IGNORECASE)
         or re.fullmatch(r"drop\s+index\s+.+", normalized, flags=re.IGNORECASE)
     )
 

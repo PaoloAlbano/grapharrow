@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pyarrow as pa  # type: ignore[import-untyped]
 import pytest
 
 from grapharrow import Database
@@ -7,16 +8,19 @@ from grapharrow.adapters import parse_cypher
 from grapharrow.core.errors import QueryError, TransactionError
 from grapharrow.interfaces.cypher_guard import query_requires_write
 from grapharrow.use_cases.cypher import (
+    Comparison,
     CompiledMatchOptionalQuery,
     CompiledMatchQuery,
     CompiledMatchWithQuery,
     CompiledOptionalMatchQuery,
+    NodePattern,
     StringPredicate,
     _build_match_logical_plan,
     _build_match_optional_logical_plan,
     _build_match_with_logical_plan,
     _build_optional_match_logical_plan,
     _compile_query,
+    _node_binding_table,
 )
 from grapharrow.use_cases.cypher_plan import (
     AggregateCountPlan,
@@ -68,6 +72,82 @@ def test_match_logical_plan_pushes_text_predicate_into_node_scan() -> None:
     node_scan = plan.root.input.input
     assert isinstance(node_scan.pushdown_predicate, StringPredicate)
     assert node_scan.pushdown_predicate.operator == "starts_with"
+
+
+def test_node_property_projection_applies_where_pushdown_before_join() -> None:
+    canonical = pa.table(
+        {
+            "node_id": pa.array([1, 2, 3], type=pa.int64()),
+            "labels": pa.array([["Person"], ["Person"], ["Person"]], type=pa.list_(pa.string())),
+            "properties_json": pa.array(["{}", "{}", "{}"], type=pa.string()),
+        }
+    )
+    property_table = pa.table(
+        {
+            "node_id": pa.array([1, 2, 3], type=pa.int64()),
+            "name": pa.array(["Alice", "Bob", "Alice"], type=pa.string()),
+        }
+    )
+
+    bindings = _node_binding_table(
+        canonical,
+        "n",
+        requested_fields={"name", "__id"},
+        pattern=NodePattern(variable="n", labels=("Person",), properties={}),
+        node_property_loader=lambda label: property_table,
+        pushdown_predicate=Comparison(variable="n", field="name", operator="=", value="Bob"),
+    )
+
+    assert bindings.to_pylist() == [
+        {
+            "n.__entity_id": 2,
+            "n.__id": 2,
+            "n.__join_id": 2,
+            "n.labels": '["Person"]',
+            "n.name": "Bob",
+        }
+    ]
+
+
+def test_node_property_projection_applies_inline_property_filter_before_join() -> None:
+    canonical = pa.table(
+        {
+            "node_id": pa.array([1, 2, 3], type=pa.int64()),
+            "labels": pa.array([["Person"], ["Person"], ["Person"]], type=pa.list_(pa.string())),
+            "properties_json": pa.array(["{}", "{}", "{}"], type=pa.string()),
+        }
+    )
+    property_table = pa.table(
+        {
+            "node_id": pa.array([1, 2, 3], type=pa.int64()),
+            "name": pa.array(["Alice", "Bob", "Alice"], type=pa.string()),
+        }
+    )
+
+    bindings = _node_binding_table(
+        canonical,
+        "n",
+        requested_fields={"name", "__id"},
+        pattern=NodePattern(variable="n", labels=("Person",), properties={"name": "Alice"}),
+        node_property_loader=lambda label: property_table,
+    )
+
+    assert bindings.to_pylist() == [
+        {
+            "n.__entity_id": 1,
+            "n.__id": 1,
+            "n.__join_id": 1,
+            "n.labels": '["Person"]',
+            "n.name": "Alice",
+        },
+        {
+            "n.__entity_id": 3,
+            "n.__id": 3,
+            "n.__join_id": 3,
+            "n.labels": '["Person"]',
+            "n.name": "Alice",
+        },
+    ]
 
 
 def test_match_logical_plan_pushes_text_predicate_into_expand_edge_scan() -> None:
@@ -3946,7 +4026,7 @@ def test_memgraph_lab_show_metadata_statements_are_available(tmp_path: Path) -> 
     assert unknown.rows == ()
 
 
-def test_memgraph_lab_create_index_statement_is_noop_for_dataset_loader(
+def test_memgraph_lab_create_index_statement_declares_catalog_index(
     tmp_path: Path,
 ) -> None:
     database = Database(tmp_path / "example-db")
@@ -3954,10 +4034,120 @@ def test_memgraph_lab_create_index_statement_is_noop_for_dataset_loader(
     with database.write_transaction() as session:
         result = session.query("CREATE INDEX ON :Death(character)")
 
+    catalog = database.load_catalog()
+
     assert result.columns == ()
     assert result.rows == ()
+    assert len(catalog.indexes) == 1
+    assert catalog.indexes[0].name == "Death_character_idx"
+    assert catalog.indexes[0].kind == "range"
+    assert catalog.indexes[0].owner_kind == "label"
+    assert catalog.indexes[0].owner_name == "Death"
+    assert catalog.indexes[0].property_names == ("character",)
     assert query_requires_write("CREATE INDEX ON :Death(character)") is True
     assert query_requires_write("MATCH (n:Death) REMOVE n.temp") is True
+
+
+def test_cypher_create_named_text_index_declares_catalog_index(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        result = session.query(
+            "CREATE TEXT INDEX person_name_idx IF NOT EXISTS "
+            "FOR (n:Person) ON (n.first_name, n.last_name)"
+        )
+
+    catalog = database.load_catalog()
+
+    assert result.columns == ()
+    assert result.rows == ()
+    assert len(catalog.indexes) == 1
+    assert catalog.indexes[0].name == "person_name_idx"
+    assert catalog.indexes[0].kind == "text"
+    assert catalog.indexes[0].owner_kind == "label"
+    assert catalog.indexes[0].owner_name == "Person"
+    assert catalog.indexes[0].property_names == ("first_name", "last_name")
+    assert (
+        query_requires_write(
+            "CREATE TEXT INDEX person_name_idx IF NOT EXISTS FOR (n:Person) ON (n.first_name)"
+        )
+        is True
+    )
+
+
+def test_show_index_info_reports_catalog_indexes(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query("CREATE (n:Person {name: 'Alice'}) RETURN n")
+        session.query("CREATE (n:Person {name: 'Bob'}) RETURN n")
+        session.query("CREATE INDEX person_name_idx FOR (n:Person) ON (n.name)")
+        indexes = session.query("SHOW INDEX INFO")
+
+    assert indexes.columns == ("index_type", "label", "property", "count", "identifier")
+    assert indexes.rows == (
+        {
+            "index_type": "range",
+            "label": "Person",
+            "property": "name",
+            "count": 2,
+            "identifier": "person_name_idx",
+        },
+    )
+
+
+def test_cypher_drop_named_index_removes_catalog_index(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query("CREATE INDEX person_name_idx FOR (n:Person) ON (n.name)")
+        result = session.query("DROP INDEX person_name_idx")
+        indexes = session.query("SHOW INDEX INFO")
+
+    assert result.columns == ()
+    assert result.rows == ()
+    assert database.load_catalog().indexes == ()
+    assert indexes.rows == ()
+    assert query_requires_write("DROP INDEX person_name_idx") is True
+
+
+def test_cypher_drop_index_if_exists_is_idempotent(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        result = session.query("DROP INDEX missing_idx IF EXISTS")
+
+    assert result.columns == ()
+    assert result.rows == ()
+    assert database.load_catalog().indexes == ()
+
+
+def test_memgraph_lab_drop_legacy_index_removes_catalog_index(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.query("CREATE INDEX ON :Death(character)")
+        result = session.query("DROP INDEX ON :Death(character)")
+
+    assert result.rows == ()
+    assert database.load_catalog().indexes == ()
+
+
+def test_cypher_drop_missing_index_raises_without_if_exists(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        with pytest.raises(QueryError, match="Unknown index"):
+            session.query("DROP INDEX missing_idx")
+
+
+def test_create_index_requires_write_session(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+    database.initialize()
+
+    with database.read_transaction() as session:
+        with pytest.raises(TransactionError, match="Write queries require a write transaction"):
+            session.query("CREATE INDEX person_name_idx FOR (n:Person) ON (n.name)")
 
 
 def test_memgraph_lab_drop_index_and_remove_bootstrap_markers(tmp_path: Path) -> None:
