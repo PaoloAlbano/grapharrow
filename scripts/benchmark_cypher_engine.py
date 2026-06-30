@@ -195,6 +195,13 @@ def build_queries() -> dict[str, str]:
             "ORDER BY n.score DESC, n.external_id ASC "
             "LIMIT 100"
         ),
+        "text_prefix_filter_sort_limit": (
+            "MATCH (n:Person) "
+            "WHERE n.external_id STARTS WITH 'person-000' "
+            "RETURN n.external_id "
+            "ORDER BY n.external_id ASC "
+            "LIMIT 500"
+        ),
         "relationship_property_filter_sort_limit": (
             "MATCH (a:Person)-[r:KNOWS]->(b:Person) "
             "WHERE r.weight >= 0.8 "
@@ -245,6 +252,11 @@ def build_queries() -> dict[str, str]:
             "RETURN a.external_id, b.external_id "
             "ORDER BY a.external_id ASC, b.external_id ASC "
             "LIMIT 500"
+        ),
+        "relationship_type_text_filter_count": (
+            "MATCH (a:Person)-[r]->(b:Person) "
+            "WHERE type(r) STARTS WITH 'KN' "
+            "RETURN count(r) AS total"
         ),
         "abs_arithmetic_similarity_filter": (
             "MATCH (a:Person)-[r1:KNOWS]->(b:Person)<-[r2:KNOWS]-(c:Person) "
@@ -311,11 +323,34 @@ def build_queries() -> dict[str, str]:
             "WHERE d.score >= 0.5 "
             "RETURN COUNT(*) AS total"
         ),
+        "recommendation_common_neighbors_collect_count": (
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)<-[:KNOWS]-(rec:Person) "
+            "WHERE a.anchor = true "
+            "WITH rec, collect(b.country) AS commonCountries, count(*) AS commonNeighbors "
+            "RETURN rec.external_id, commonCountries, commonNeighbors "
+            "ORDER BY commonNeighbors DESC, rec.external_id ASC "
+            "LIMIT 100"
+        ),
+        "multi_match_where_graph_return": (
+            "MATCH (a:Person) "
+            "WHERE a.anchor = true "
+            "MATCH (a)-[r:KNOWS]->(b:Person) "
+            "WHERE b.active = true "
+            "RETURN a, r, b "
+            "LIMIT 100"
+        ),
         "three_hop_wildcard_projection_order_limit": (
             "MATCH (a:Person)-[*3]->(d:Person) "
             "WHERE a.anchor = true "
             "RETURN a.external_id, d.external_id "
             "ORDER BY a.external_id ASC, d.external_id ASC "
+            "LIMIT 500"
+        ),
+        "range_hop_typed_distinct_projection_order_limit": (
+            "MATCH (a:Person)-[:KNOWS*1..5]->(d:Person) "
+            "WHERE a.anchor = true "
+            "RETURN DISTINCT d.external_id "
+            "ORDER BY d.external_id ASC "
             "LIMIT 500"
         ),
         "range_hop_wildcard_projection_order_limit": (
