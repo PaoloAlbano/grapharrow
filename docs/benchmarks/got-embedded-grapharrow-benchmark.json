@@ -1,0 +1,165 @@
+{
+  "config": {
+    "engine": "grapharrow-embedded",
+    "query_set": "got",
+    "database_path": "/tmp/grapharrow-db-D",
+    "repeats": 5,
+    "warmups": 2,
+    "created_at": "2026-06-30T16:41:52.035757+00:00"
+  },
+  "results": [
+    {
+      "query": "got_schema_labels",
+      "status": "ok",
+      "median_seconds": 0.008716833079233766,
+      "best_seconds": 0.008606709074229002,
+      "worst_seconds": 0.020636333152651787,
+      "runs": [
+        0.008917249972000718,
+        0.008716833079233766,
+        0.00861545791849494,
+        0.008606709074229002,
+        0.020636333152651787
+      ],
+      "row_count": 6,
+      "checksum": "3ae3acba4603fbdb40f376c504dc7b90b744c5c422fbb82deba5884591bd1a23",
+      "error": null
+    },
+    {
+      "query": "got_schema_relationship_types",
+      "status": "ok",
+      "median_seconds": 0.030133791966363788,
+      "best_seconds": 0.02940483298152685,
+      "worst_seconds": 0.04146441607736051,
+      "runs": [
+        0.030133791966363788,
+        0.02940483298152685,
+        0.02955870795994997,
+        0.030380292097106576,
+        0.04146441607736051
+      ],
+      "row_count": 6,
+      "checksum": "3d01257bd978de8a87729a22c8a9441dcefff43607f6a8e8d37ecbde7d3e10b9",
+      "error": null
+    },
+    {
+      "query": "got_episode_deaths",
+      "status": "ok",
+      "median_seconds": 0.01760216592811048,
+      "best_seconds": 0.016947041964158416,
+      "worst_seconds": 0.01858404092490673,
+      "runs": [
+        0.016947041964158416,
+        0.01760216592811048,
+        0.017397375078871846,
+        0.017734917113557458,
+        0.01858404092490673
+      ],
+      "row_count": 69,
+      "checksum": "779a72897c67779e19e14bbed5148999f7a8fd9931df1db27459eb0a16688e65",
+      "error": null
+    },
+    {
+      "query": "got_season_deaths",
+      "status": "ok",
+      "median_seconds": 0.01939174998551607,
+      "best_seconds": 0.018076834036037326,
+      "worst_seconds": 0.019733540946617723,
+      "runs": [
+        0.01939174998551607,
+        0.019385999999940395,
+        0.019612875068560243,
+        0.019733540946617723,
+        0.018076834036037326
+      ],
+      "row_count": 8,
+      "checksum": "02c525d5b01703b5929e36381dac36e657f5e86752abaca8472eb83c992efd04",
+      "error": null
+    },
+    {
+      "query": "got_location_deaths",
+      "status": "ok",
+      "median_seconds": 0.03276816685684025,
+      "best_seconds": 0.03135224990546703,
+      "worst_seconds": 0.033123499946668744,
+      "runs": [
+        0.03220170782878995,
+        0.033008167054504156,
+        0.03135224990546703,
+        0.03276816685684025,
+        0.033123499946668744
+      ],
+      "row_count": 41,
+      "checksum": "d5f1b8198acb0cfac0503b891a52f22ee59c9d3c4afe70888238bb4adc94f757",
+      "error": null
+    },
+    {
+      "query": "got_castle_location_text_filter",
+      "status": "ok",
+      "median_seconds": 0.033036042004823685,
+      "best_seconds": 0.03182029095478356,
+      "worst_seconds": 0.03507695812731981,
+      "runs": [
+        0.03295212495140731,
+        0.033036042004823685,
+        0.03182029095478356,
+        0.03507695812731981,
+        0.034180291928350925
+      ],
+      "row_count": 1,
+      "checksum": "61c30d5b35e9c49b5a43b64426927cba7b044ad1150868861fbaa0077413d584",
+      "error": null
+    },
+    {
+      "query": "got_episode_avg_rating",
+      "status": "ok",
+      "median_seconds": 0.01869258307851851,
+      "best_seconds": 0.017668165965005755,
+      "worst_seconds": 0.02125404099933803,
+      "runs": [
+        0.01809045788832009,
+        0.017668165965005755,
+        0.019529375014826655,
+        0.02125404099933803,
+        0.01869258307851851
+      ],
+      "row_count": 8,
+      "checksum": "060aaad72845e7404ad9706409f7d1050ca52fcdcb63e39e66a826d6439f4cba",
+      "error": null
+    },
+    {
+      "query": "got_visual_death_location",
+      "status": "ok",
+      "median_seconds": 0.032805124996230006,
+      "best_seconds": 0.03200958319939673,
+      "worst_seconds": 0.033263334073126316,
+      "runs": [
+        0.03200958319939673,
+        0.032805124996230006,
+        0.032251209020614624,
+        0.033263334073126316,
+        0.033073792001232505
+      ],
+      "row_count": 50,
+      "checksum": "dedbe20f3f3f07701f66e95526475e89e634c9a47e5f4c3663c8a5170ea07151",
+      "error": null
+    },
+    {
+      "query": "got_jon_snow_death_locations",
+      "status": "ok",
+      "median_seconds": 0.09464879101142287,
+      "best_seconds": 0.08718904200941324,
+      "worst_seconds": 0.10059304209426045,
+      "runs": [
+        0.10059304209426045,
+        0.08823133306577802,
+        0.09464879101142287,
+        0.099792166845873,
+        0.08718904200941324
+      ],
+      "row_count": 51,
+      "checksum": "820ebe1d8c85d2c74f734f44aa19509fa3f891d9a808056be5ea398e66928b99",
+      "error": null
+    }
+  ]
+}

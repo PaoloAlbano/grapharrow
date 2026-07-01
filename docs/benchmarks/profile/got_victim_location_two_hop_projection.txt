@@ -1,0 +1,38 @@
+         99553 function calls (99409 primitive calls) in 0.027 seconds
+
+   Ordered by: cumulative time
+   List reduced from 589 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.000    0.000    0.027    0.027 embedded.py:66(query)
+        1    0.000    0.000    0.027    0.027 cypher.py:517(execute)
+        1    0.000    0.000    0.024    0.024 cypher.py:835(_execute_match)
+        1    0.000    0.000    0.024    0.024 cypher.py:912(_execute_match_logical_plan)
+      6/1    0.000    0.000    0.022    0.022 cypher.py:949(_execute_logical_plan_node)
+        3    0.000    0.000    0.018    0.006 cypher.py:11184(_node_binding_table)
+        2    0.000    0.000    0.011    0.005 cypher.py:11414(_node_binding_table_from_property_projection)
+        2    0.000    0.000    0.009    0.004 cypher.py:11727(_canonical_labels_contains_all_mask)
+        2    0.005    0.002    0.009    0.004 cypher.py:11740(_canonical_label_membership_mask)
+        1    0.003    0.003    0.007    0.007 cypher.py:11330(_node_binding_table_from_canonical_table)
+     5557    0.001    0.000    0.004    0.000 {built-in method builtins.any}
+     8049    0.002    0.000    0.004    0.000 cypher.py:10864(_cypher_name)
+    10708    0.001    0.000    0.004    0.000 cypher.py:11744(<genexpr>)
+     3016    0.000    0.000    0.003    0.000 __init__.py:183(dumps)
+        1    0.000    0.000    0.003    0.003 opencypher.py:34(parse_cypher)
+        1    0.000    0.000    0.003    0.003 opencypher.py:18(parse)
+        1    0.000    0.000    0.003    0.003 CypherParser.py:1036(oC_Cypher)
+        1    0.000    0.000    0.003    0.003 CypherParser.py:1111(oC_Statement)
+        1    0.000    0.000    0.003    0.003 CypherParser.py:1155(oC_Query)
+        1    0.000    0.000    0.003    0.003 CypherParser.py:1221(oC_RegularQuery)
+        1    0.000    0.000    0.003    0.003 CypherParser.py:1375(oC_SingleQuery)
+     3016    0.001    0.000    0.002    0.000 encoder.py:183(encode)
+        6    0.002    0.000    0.002    0.000 acero.py:82(_perform_join)
+        1    0.000    0.000    0.002    0.002 CypherParser.py:1448(oC_SinglePartQuery)
+       12    0.002    0.000    0.002    0.000 parquet.py:40(read_dataset_table)
+        4    0.000    0.000    0.002    0.000 tabular.py:47(inner_join)
+        1    0.000    0.000    0.002    0.002 graph.py:102(load_tabular_state)
+        1    0.000    0.000    0.002    0.002 CypherParser.py:3166(oC_Return)
+        1    0.000    0.000    0.001    0.001 CypherParser.py:3229(oC_ProjectionBody)
+     3007    0.001    0.000    0.001    0.000 encoder.py:205(iterencode)
+
+

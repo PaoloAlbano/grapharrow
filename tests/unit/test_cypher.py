@@ -14,13 +14,16 @@ from grapharrow.use_cases.cypher import (
     CompiledMatchWithQuery,
     CompiledOptionalMatchQuery,
     NodePattern,
+    RelationshipStep,
     StringPredicate,
     _build_match_logical_plan,
     _build_match_optional_logical_plan,
     _build_match_with_logical_plan,
     _build_optional_match_logical_plan,
     _compile_query,
+    _edge_match_table,
     _node_binding_table,
+    _normalize_property_table_schema,
 )
 from grapharrow.use_cases.cypher_plan import (
     AggregateCountPlan,
@@ -52,6 +55,99 @@ def test_match_logical_plan_uses_node_scan_for_single_node_match() -> None:
     assert isinstance(plan.root.input, SortPlan)
     assert isinstance(plan.root.input.input, ProjectPlan)
     assert isinstance(plan.root.input.input.input, NodeScanPlan)
+
+
+def test_incoming_typed_edge_match_falls_back_when_dest_adjacency_is_missing() -> None:
+    edges = pa.table(
+        {
+            "edge_id": pa.array([10], type=pa.int64()),
+            "rel_type": pa.array(["HAPPENED_IN"], type=pa.string()),
+            "src_id": pa.array([1], type=pa.int64()),
+            "dst_id": pa.array([2], type=pa.int64()),
+            "properties_json": pa.array(["{}"], type=pa.string()),
+        }
+    )
+
+    def load_adjacency_by_source(_rel_type: str) -> pa.Table:
+        return pa.table(
+            {
+                "edge_id": pa.array([10], type=pa.int64()),
+                "src_id": pa.array([1], type=pa.int64()),
+                "dst_id": pa.array([2], type=pa.int64()),
+            }
+        )
+
+    def load_adjacency_by_dest(_rel_type: str) -> pa.Table:
+        return pa.table(
+            {
+                "edge_id": pa.array([], type=pa.int64()),
+                "src_id": pa.array([], type=pa.int64()),
+                "dst_id": pa.array([], type=pa.int64()),
+            }
+        )
+
+    load_adjacency_by_source.by_dest = load_adjacency_by_dest  # type: ignore[attr-defined]
+    step = RelationshipStep(
+        variable=None,
+        rel_type="HAPPENED_IN",
+        properties={},
+        node=NodePattern(variable="d", labels=("Death",), properties={}),
+        direction="incoming",
+    )
+
+    table = _edge_match_table(
+        edges,
+        "h",
+        step,
+        requested_fields={"type"},
+        adjacency_by_source_loader=load_adjacency_by_source,
+    )
+
+    assert table.to_pylist() == [
+        {
+            "h.id": 10,
+            "h.source": 1,
+            "h.target": 2,
+            "h.type": "HAPPENED_IN",
+        }
+    ]
+
+
+def test_node_property_projection_normalizes_escaped_property_columns() -> None:
+    nodes = pa.table(
+        {
+            "node_id": pa.array([1], type=pa.int64()),
+            "labels": pa.array([["`Character`"]], type=pa.list_(pa.string())),
+            "properties_json": pa.array(['{"`name`": "Jon Snow"}'], type=pa.string()),
+        }
+    )
+    property_table = pa.table(
+        {
+            "node_id": pa.array([1], type=pa.int64()),
+            "`name`": pa.array(["Jon Snow"], type=pa.string()),
+        }
+    )
+
+    def load_property_table(_label: str, _property_fields: set[str] | None = None) -> pa.Table:
+        return _normalize_property_table_schema(property_table)
+
+    table = _node_binding_table(
+        nodes,
+        "c",
+        requested_fields={"name"},
+        pattern=NodePattern(variable="c", labels=("Character",), properties={}),
+        node_property_loader=load_property_table,
+    )
+
+    assert table.to_pylist() == [
+        {
+            "c.__entity_id": 1,
+            "c.__id": 1,
+            "c.__join_id": 1,
+            "c.labels": '["`Character`"]',
+            "c.name": "Jon Snow",
+        }
+    ]
 
 
 def test_match_logical_plan_pushes_text_predicate_into_node_scan() -> None:
@@ -89,15 +185,22 @@ def test_node_property_projection_applies_where_pushdown_before_join() -> None:
         }
     )
 
+    requested_property_fields: list[set[str] | None] = []
+
+    def load_property_table(_label: str, property_fields: set[str] | None = None) -> pa.Table:
+        requested_property_fields.append(property_fields)
+        return property_table
+
     bindings = _node_binding_table(
         canonical,
         "n",
         requested_fields={"name", "__id"},
         pattern=NodePattern(variable="n", labels=("Person",), properties={}),
-        node_property_loader=lambda label: property_table,
+        node_property_loader=load_property_table,
         pushdown_predicate=Comparison(variable="n", field="name", operator="=", value="Bob"),
     )
 
+    assert requested_property_fields == [{"name"}]
     assert bindings.to_pylist() == [
         {
             "n.__entity_id": 2,
@@ -129,7 +232,7 @@ def test_node_property_projection_applies_inline_property_filter_before_join() -
         "n",
         requested_fields={"name", "__id"},
         pattern=NodePattern(variable="n", labels=("Person",), properties={"name": "Alice"}),
-        node_property_loader=lambda label: property_table,
+        node_property_loader=lambda _label, _property_fields=None: property_table,
     )
 
     assert bindings.to_pylist() == [
@@ -207,6 +310,51 @@ def test_match_logical_plan_uses_nested_expands_for_multi_hop_path() -> None:
     assert isinstance(plan.root.input.input, ExpandPlan)
     assert isinstance(plan.root.input.input.input, ExpandPlan)
     assert isinstance(plan.root.input.input.input.input, NodeScanPlan)
+
+
+def test_match_logical_plan_uses_expand_for_incoming_path() -> None:
+    compiled = _compile_query(
+        parse_cypher(
+            "MATCH (b:Person)<-[:KNOWS]-(a:Person) "
+            "WHERE b.anchor = true "
+            "RETURN b.external_id, a.external_id ORDER BY b.external_id ASC"
+        ),
+        {},
+    )
+
+    assert isinstance(compiled, CompiledMatchQuery)
+    plan = _build_match_logical_plan(compiled)
+
+    assert plan is not None
+    assert isinstance(plan.root, SortPlan)
+    assert isinstance(plan.root.input, ProjectPlan)
+    assert isinstance(plan.root.input.input, ExpandPlan)
+    assert plan.root.input.input.direction == "incoming"
+
+
+def test_match_logical_plan_uses_nested_expands_for_outgoing_incoming_pattern() -> None:
+    compiled = _compile_query(
+        parse_cypher(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)<-[:KNOWS]-(rec:Person) "
+            "WHERE a.anchor = true "
+            "WITH rec, collect(b.country) AS commonCountries, count(*) AS commonNeighbors "
+            "RETURN rec.external_id, commonCountries, commonNeighbors "
+            "ORDER BY commonNeighbors DESC, rec.external_id ASC LIMIT 100"
+        ),
+        {},
+    )
+
+    assert isinstance(compiled, CompiledMatchWithQuery)
+    plan = _build_match_with_logical_plan(compiled)
+
+    assert plan is not None
+    assert isinstance(plan.root, SlicePlan)
+    assert isinstance(plan.root.input, SortPlan)
+    assert isinstance(plan.root.input.input, WithAggregatePlan)
+    assert isinstance(plan.root.input.input.input, ExpandPlan)
+    assert plan.root.input.input.input.direction == "incoming"
+    assert isinstance(plan.root.input.input.input.input, ExpandPlan)
+    assert plan.root.input.input.input.input.direction == "outgoing"
 
 
 def test_multi_match_logical_plan_fuses_linear_path_with_where() -> None:
@@ -1048,6 +1196,42 @@ def test_match_supports_three_hop_projection_order_by_and_limit(tmp_path: Path) 
 
     assert result.columns == ("a.external_id", "d.external_id")
     assert result.rows == ({"a.external_id": "alice", "d.external_id": "dave"},)
+
+
+def test_match_multi_hop_does_not_reuse_same_relationship(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        alice = session.add_node(labels=["Person"], properties={"name": "Alice"})
+        session.add_edge(src=alice["id"], rel_type="KNOWS", dst=alice["id"], properties={})
+
+    with database.read_transaction() as session:
+        count_result = session.query(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN COUNT(*) AS total"
+        )
+        projection_result = session.query(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) "
+            "RETURN a.name, b.name, c.name"
+        )
+
+    assert count_result.rows == ({"total": 0},)
+    assert projection_result.rows == ()
+
+
+def test_match_multi_hop_can_use_distinct_parallel_relationships(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        alice = session.add_node(labels=["Person"], properties={"name": "Alice"})
+        session.add_edge(src=alice["id"], rel_type="KNOWS", dst=alice["id"], properties={})
+        session.add_edge(src=alice["id"], rel_type="KNOWS", dst=alice["id"], properties={})
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN COUNT(*) AS total"
+        )
+
+    assert result.rows == ({"total": 2},)
 
 
 def test_match_where_pushdown_preserves_three_hop_results(

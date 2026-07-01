@@ -53,8 +53,10 @@ _JOIN_JSON_PREFIX = "__grapharrow_join_json__:"
 _FULL_ENTITY_FIELDS = "*"
 _DISABLE_PLANNER_ENV = "GRAPHARROW_DISABLE_CYPHER_PLANNER"
 _UNRESOLVED_REFERENCE = object()
+_INCREMENTAL_MATCH_MAX_INPUT_ROWS = 256
 NodeBindingSource: TypeAlias = tuple[NodeRecord, ...] | pa.Table
 EdgeBindingSource: TypeAlias = tuple[EdgeRecord, ...] | pa.Table
+PropertyTableLoader: TypeAlias = Callable[[str, set[str] | None], pa.Table]
 
 
 @dataclass(frozen=True, slots=True)
@@ -660,26 +662,40 @@ class CypherQueryUseCase:
     def _node_property_loader_for_state(
         self,
         state: GraphState | GraphTabularState,
-    ) -> Callable[[str], pa.Table] | None:
+    ) -> PropertyTableLoader | None:
         """Handle node-specific matching, projection, or lookup logic for Cypher."""
         if isinstance(self._graph_service, GraphTransactionUseCase):
             return None
-        cache: dict[str, pa.Table] = {}
+        cache: dict[tuple[str, tuple[str, ...] | None], pa.Table] = {}
 
-        def load(label: str) -> pa.Table:
+        def load(label: str, property_fields: set[str] | None = None) -> pa.Table:
             """Load and cache the derived table needed by the current execution step."""
-            table = cache.get(label)
+            columns = _node_property_projection_columns(property_fields)
+            escaped_columns = _escaped_property_projection_columns(columns)
+            cache_key = (label, tuple(columns) if columns is not None else None)
+            table = cache.get(cache_key)
             if table is None:
-                table = self._graph_service.load_node_property_table(
-                    snapshot=state.snapshot,
-                    label=label,
+                table = _load_property_table_with_column_fallback(
+                    lambda selected_columns: self._graph_service.load_node_property_table(
+                        snapshot=state.snapshot,
+                        label=label,
+                        columns=selected_columns,
+                    ),
+                    columns=columns,
+                    escaped_columns=escaped_columns,
                 )
                 if table.num_rows == 0:
-                    table = self._graph_service.load_node_property_table(
-                        snapshot=state.snapshot,
-                        label=f"`{label}`",
+                    table = _load_property_table_with_column_fallback(
+                        lambda selected_columns: self._graph_service.load_node_property_table(
+                            snapshot=state.snapshot,
+                            label=f"`{label}`",
+                            columns=selected_columns,
+                        ),
+                        columns=columns,
+                        escaped_columns=escaped_columns,
                     )
-                cache[label] = table
+                table = _normalize_property_table_schema(table)
+                cache[cache_key] = table
             return table
 
         return load
@@ -687,26 +703,40 @@ class CypherQueryUseCase:
     def _edge_property_loader_for_state(
         self,
         state: GraphState | GraphTabularState,
-    ) -> Callable[[str], pa.Table] | None:
+    ) -> PropertyTableLoader | None:
         """Handle edge-specific matching, projection, or lookup logic for Cypher."""
         if isinstance(self._graph_service, GraphTransactionUseCase):
             return None
-        cache: dict[str, pa.Table] = {}
+        cache: dict[tuple[str, tuple[str, ...] | None], pa.Table] = {}
 
-        def load(rel_type: str) -> pa.Table:
+        def load(rel_type: str, property_fields: set[str] | None = None) -> pa.Table:
             """Load and cache the derived table needed by the current execution step."""
-            table = cache.get(rel_type)
+            columns = _edge_property_projection_columns(property_fields)
+            escaped_columns = _escaped_property_projection_columns(columns)
+            cache_key = (rel_type, tuple(columns) if columns is not None else None)
+            table = cache.get(cache_key)
             if table is None:
-                table = self._graph_service.load_edge_property_table(
-                    snapshot=state.snapshot,
-                    rel_type=rel_type,
+                table = _load_property_table_with_column_fallback(
+                    lambda selected_columns: self._graph_service.load_edge_property_table(
+                        snapshot=state.snapshot,
+                        rel_type=rel_type,
+                        columns=selected_columns,
+                    ),
+                    columns=columns,
+                    escaped_columns=escaped_columns,
                 )
                 if table.num_rows == 0:
-                    table = self._graph_service.load_edge_property_table(
-                        snapshot=state.snapshot,
-                        rel_type=f"`{rel_type}`",
+                    table = _load_property_table_with_column_fallback(
+                        lambda selected_columns: self._graph_service.load_edge_property_table(
+                            snapshot=state.snapshot,
+                            rel_type=f"`{rel_type}`",
+                            columns=selected_columns,
+                        ),
+                        columns=columns,
+                        escaped_columns=escaped_columns,
                     )
-                cache[rel_type] = table
+                table = _normalize_property_table_schema(table)
+                cache[cache_key] = table
             return table
 
         return load
@@ -812,7 +842,6 @@ class CypherQueryUseCase:
             _build_match_logical_plan(query)
             if _cypher_planner_enabled()
             and not _predicate_has_exists_pattern(query.where_predicate)
-            and not _patterns_have_relationship_type_alternatives(query.patterns)
             else None
         )
         if logical_plan is not None:
@@ -923,8 +952,8 @@ class CypherQueryUseCase:
         *,
         state: GraphTabularState,
         adjacency_loader: Callable[[str], pa.Table] | None,
-        edge_property_loader: Callable[[str], pa.Table] | None,
-        node_property_loader: Callable[[str], pa.Table] | None,
+        edge_property_loader: PropertyTableLoader | None,
+        node_property_loader: PropertyTableLoader | None,
     ) -> pa.Table:
         """Execute this query shape and return the result needed by the caller."""
         if isinstance(plan, NodeScanPlan):
@@ -971,6 +1000,8 @@ class CypherQueryUseCase:
                     labels=plan.end_labels,
                     properties=plan.end_properties,
                 ),
+                direction=plan.direction,
+                rel_type_alternatives=plan.rel_type_alternatives,
             )
             edge_table = _edge_match_table(
                 state.edge_table,
@@ -980,7 +1011,9 @@ class CypherQueryUseCase:
                 adjacency_by_source_loader=adjacency_loader,
                 edge_property_loader=edge_property_loader,
             )
-            if not _uses_typed_adjacency_path(step, plan.edge_requested_fields):
+            if not _uses_typed_adjacency_path(
+                step, plan.edge_requested_fields
+            ) or _has_relationship_type_alternatives(step):
                 edge_table = _apply_edge_pattern_filter(edge_table, plan.edge_variable, step)
             edge_table = _apply_where_predicate_table(
                 edge_table,
@@ -992,19 +1025,33 @@ class CypherQueryUseCase:
                 node_property_loader=node_property_loader,
                 edge_property_loader=edge_property_loader,
             )
+            current_edge_key = (
+                f"{plan.edge_variable}.source"
+                if plan.direction == "outgoing"
+                else f"{plan.edge_variable}.target"
+            )
+            next_edge_key = (
+                f"{plan.edge_variable}.target"
+                if plan.direction == "outgoing"
+                else f"{plan.edge_variable}.source"
+            )
             matched = self._tabular.inner_join(
                 input_table,
                 edge_table,
                 left_keys=_binding_column_name(plan.start_variable, _NODE_ID_FIELD),
-                right_keys=f"{plan.edge_variable}.source",
+                right_keys=current_edge_key,
             )
             matched = _ensure_edge_source_column(
                 matched,
                 edge_prefix=plan.edge_variable,
                 source_variable=plan.start_variable,
+                endpoint="source" if plan.direction == "outgoing" else "target",
             )
-            if matched.num_rows == 0:
-                return matched
+            matched = _filter_reused_relationships_in_fixed_path(
+                matched,
+                current_edge_prefix=plan.edge_variable,
+                previous_edge_prefixes=plan.previous_edge_variables,
+            )
             next_nodes = _node_binding_table(
                 state.node_table,
                 plan.end_variable,
@@ -1015,7 +1062,7 @@ class CypherQueryUseCase:
             matched = self._tabular.inner_join(
                 matched,
                 next_nodes,
-                left_keys=f"{plan.edge_variable}.target",
+                left_keys=next_edge_key,
                 right_keys=_binding_column_name(plan.end_variable, "__join_id"),
             )
             matched = _apply_node_pattern_filter(matched, step.node)
@@ -1705,9 +1752,7 @@ class CypherQueryUseCase:
         """Execute this query shape and return the result needed by the caller."""
         logical_plan = (
             _build_match_with_logical_plan(query)
-            if _cypher_planner_enabled()
-            and not _match_with_query_has_exists_pattern(query)
-            and not _match_with_query_has_relationship_type_alternatives(query)
+            if _cypher_planner_enabled() and not _match_with_query_has_exists_pattern(query)
             else None
         )
         if logical_plan is not None:
@@ -5368,7 +5413,7 @@ def _match_nodes_table(
     pattern: NodePattern,
     *,
     requested_fields: set[str] | None = None,
-    node_property_loader: Callable[[str], pa.Table] | None = None,
+    node_property_loader: PropertyTableLoader | None = None,
 ) -> pa.Table:
     """Produce binding rows for this pattern against the current graph state."""
     table = _node_binding_table(
@@ -5389,8 +5434,8 @@ def _match_patterns_table(
     *,
     required_fields: Mapping[str, set[str]] | None = None,
     adjacency_by_source_loader: Callable[[str], pa.Table] | None = None,
-    node_property_loader: Callable[[str], pa.Table] | None = None,
-    edge_property_loader: Callable[[str], pa.Table] | None = None,
+    node_property_loader: PropertyTableLoader | None = None,
+    edge_property_loader: PropertyTableLoader | None = None,
     where_pushdown_predicate: WherePredicate | None = None,
 ) -> pa.Table:
     """Produce binding rows for this pattern against the current graph state."""
@@ -5412,6 +5457,23 @@ def _match_patterns_table(
     allow_disconnected_cross_join = _is_bounded_node_lookup_pattern(patterns[0])
 
     for pattern in patterns[1:]:
+        pattern_variables = set(_pattern_variables(pattern))
+        if _can_match_path_pattern_from_input_table(matched, pattern, bound_variables):
+            matched = _match_fixed_path_from_input_table(
+                matched,
+                nodes,
+                edges,
+                cast(PathPattern, pattern),
+                tabular,
+                required_fields=required_fields,
+                adjacency_by_source_loader=adjacency_by_source_loader,
+                node_property_loader=node_property_loader,
+                edge_property_loader=edge_property_loader,
+                where_pushdown_predicate=where_pushdown_predicate,
+            )
+            bound_variables.update(pattern_variables)
+            continue
+
         next_table = _match_single_pattern_table(
             nodes,
             edges,
@@ -5423,7 +5485,6 @@ def _match_patterns_table(
             edge_property_loader=edge_property_loader,
             where_pushdown_predicate=where_pushdown_predicate,
         )
-        pattern_variables = set(_pattern_variables(pattern))
         shared_variables = tuple(sorted(bound_variables & pattern_variables))
         if not shared_variables:
             if not allow_disconnected_cross_join or not _is_bounded_node_lookup_pattern(pattern):
@@ -5459,6 +5520,118 @@ def _is_bounded_node_lookup_pattern(pattern: CompiledPattern) -> bool:
     return isinstance(pattern, NodePattern) and bool(pattern.properties)
 
 
+def _can_match_path_pattern_from_input_table(
+    input_table: pa.Table,
+    pattern: CompiledPattern,
+    bound_variables: set[str],
+) -> bool:
+    """Return true when a path can extend already-bound rows directly."""
+
+    if input_table.num_rows > _INCREMENTAL_MATCH_MAX_INPUT_ROWS:
+        return False
+    if not isinstance(pattern, PathPattern):
+        return False
+    if pattern.start.variable not in bound_variables:
+        return False
+    if pattern.start.labels or pattern.start.properties:
+        return False
+    return all(step.min_hops == 1 and step.max_hops == 1 for step in pattern.steps)
+
+
+def _match_fixed_path_from_input_table(
+    input_table: pa.Table,
+    nodes: NodeBindingSource,
+    edges: EdgeBindingSource,
+    pattern: PathPattern,
+    tabular: PyArrowTabularAdapter,
+    *,
+    required_fields: Mapping[str, set[str]] | None = None,
+    adjacency_by_source_loader: Callable[[str], pa.Table] | None = None,
+    node_property_loader: PropertyTableLoader | None = None,
+    edge_property_loader: PropertyTableLoader | None = None,
+    where_pushdown_predicate: WherePredicate | None = None,
+) -> pa.Table:
+    """Extend existing bindings with one fixed-hop path pattern."""
+
+    matched = input_table
+    for index, step in enumerate(pattern.steps):
+        edge_prefix = step.variable or f"_edge_{index}"
+        current_variable = (
+            pattern.start.variable if index == 0 else pattern.steps[index - 1].node.variable
+        )
+        current_edge_key = (
+            f"{edge_prefix}.source" if step.direction == "outgoing" else f"{edge_prefix}.target"
+        )
+        next_edge_key = (
+            f"{edge_prefix}.target" if step.direction == "outgoing" else f"{edge_prefix}.source"
+        )
+        edge_requested_fields = _requested_fields_for_edge_step(required_fields, edge_prefix, step)
+        edge_table = _edge_match_table(
+            edges,
+            edge_prefix,
+            step,
+            requested_fields=edge_requested_fields,
+            adjacency_by_source_loader=adjacency_by_source_loader,
+            edge_property_loader=edge_property_loader,
+        )
+        matched = tabular.inner_join(
+            matched,
+            edge_table,
+            left_keys=_binding_column_name(current_variable, _NODE_ID_FIELD),
+            right_keys=current_edge_key,
+        )
+        matched = _ensure_edge_source_column(
+            matched,
+            edge_prefix=edge_prefix,
+            source_variable=current_variable,
+            endpoint="source" if step.direction == "outgoing" else "target",
+        )
+        if not _uses_typed_adjacency_path(
+            step, edge_requested_fields
+        ) or _has_relationship_type_alternatives(step):
+            matched = _apply_edge_pattern_filter(matched, edge_prefix, step)
+        if matched.num_rows == 0:
+            return matched
+
+        target_id_column = _binding_column_name(step.node.variable, _NODE_ID_FIELD)
+        if target_id_column in matched.column_names:
+            matched = _apply_existing_binding_filter(
+                matched,
+                edge_target_column=next_edge_key,
+                pattern=step.node,
+            )
+            if matched.num_rows == 0:
+                return matched
+            continue
+
+        next_nodes = _node_binding_table(
+            nodes,
+            step.node.variable,
+            requested_fields=_requested_fields_for_variable(required_fields, step.node.variable),
+            pattern=step.node,
+            node_property_loader=node_property_loader,
+        )
+        matched = tabular.inner_join(
+            matched,
+            next_nodes,
+            left_keys=next_edge_key,
+            right_keys=_binding_column_name(step.node.variable, "__join_id"),
+        )
+        matched = _apply_node_pattern_filter(matched, step.node)
+        matched = _apply_where_predicate_table(
+            matched,
+            _pushdown_predicate_for_bound_variable(
+                where_pushdown_predicate,
+                step.node.variable,
+            ),
+        )
+        matched = _ensure_join_id_column(matched, step.node.variable)
+        if matched.num_rows == 0:
+            return matched
+
+    return matched
+
+
 def _match_patterns_from_input_table(
     input_table: pa.Table,
     nodes: NodeBindingSource,
@@ -5468,8 +5641,8 @@ def _match_patterns_from_input_table(
     *,
     required_fields: Mapping[str, set[str]] | None = None,
     adjacency_by_source_loader: Callable[[str], pa.Table] | None = None,
-    node_property_loader: Callable[[str], pa.Table] | None = None,
-    edge_property_loader: Callable[[str], pa.Table] | None = None,
+    node_property_loader: PropertyTableLoader | None = None,
+    edge_property_loader: PropertyTableLoader | None = None,
     where_pushdown_predicate: WherePredicate | None = None,
 ) -> pa.Table:
     """Produce binding rows for this pattern against the current graph state."""
@@ -5527,8 +5700,8 @@ def _optional_match_patterns_from_input_table(
     *,
     required_fields: Mapping[str, set[str]] | None = None,
     adjacency_by_source_loader: Callable[[str], pa.Table] | None = None,
-    node_property_loader: Callable[[str], pa.Table] | None = None,
-    edge_property_loader: Callable[[str], pa.Table] | None = None,
+    node_property_loader: PropertyTableLoader | None = None,
+    edge_property_loader: PropertyTableLoader | None = None,
 ) -> pa.Table:
     """Produce optional-match rows while preserving left-side bindings when needed."""
     if input_table.num_rows == 0:
@@ -5628,8 +5801,8 @@ def _optional_match_single_path_from_input_table(
     *,
     required_fields: Mapping[str, set[str]] | None = None,
     adjacency_by_source_loader: Callable[[str], pa.Table] | None = None,
-    node_property_loader: Callable[[str], pa.Table] | None = None,
-    edge_property_loader: Callable[[str], pa.Table] | None = None,
+    node_property_loader: PropertyTableLoader | None = None,
+    edge_property_loader: PropertyTableLoader | None = None,
 ) -> pa.Table:
     """Produce optional-match rows while preserving left-side bindings when needed."""
     shared_variables = {pattern.start.variable}
@@ -5648,7 +5821,9 @@ def _optional_match_single_path_from_input_table(
             adjacency_by_source_loader=adjacency_by_source_loader,
             edge_property_loader=edge_property_loader,
         )
-        if not _uses_typed_adjacency_path(step, edge_requested_fields):
+        if not _uses_typed_adjacency_path(
+            step, edge_requested_fields
+        ) or _has_relationship_type_alternatives(step):
             edge_table = _apply_edge_pattern_filter(edge_table, edge_prefix, step)
         matched = tabular.left_join(
             matched,
@@ -5802,8 +5977,8 @@ def _match_single_pattern_table(
     *,
     required_fields: Mapping[str, set[str]] | None = None,
     adjacency_by_source_loader: Callable[[str], pa.Table] | None = None,
-    node_property_loader: Callable[[str], pa.Table] | None = None,
-    edge_property_loader: Callable[[str], pa.Table] | None = None,
+    node_property_loader: PropertyTableLoader | None = None,
+    edge_property_loader: PropertyTableLoader | None = None,
     where_pushdown_predicate: WherePredicate | None = None,
 ) -> pa.Table:
     """Produce binding rows for this pattern against the current graph state."""
@@ -5858,8 +6033,8 @@ def _match_fixed_path_table(
     *,
     required_fields: Mapping[str, set[str]] | None = None,
     adjacency_by_source_loader: Callable[[str], pa.Table] | None = None,
-    node_property_loader: Callable[[str], pa.Table] | None = None,
-    edge_property_loader: Callable[[str], pa.Table] | None = None,
+    node_property_loader: PropertyTableLoader | None = None,
+    edge_property_loader: PropertyTableLoader | None = None,
     where_pushdown_predicate: WherePredicate | None = None,
 ) -> pa.Table:
     """Produce binding rows for this pattern against the current graph state."""
@@ -5917,7 +6092,9 @@ def _match_fixed_path_table(
                 for previous_index in range(index)
             ),
         )
-        if not _uses_typed_adjacency_path(step, edge_requested_fields):
+        if not _uses_typed_adjacency_path(
+            step, edge_requested_fields
+        ) or _has_relationship_type_alternatives(step):
             matched = _apply_edge_pattern_filter(matched, edge_prefix, step)
         if matched.num_rows == 0:
             return _project_public_pattern_columns(matched, pattern)
@@ -6002,8 +6179,8 @@ def _match_single_variable_length_path_table(
     *,
     required_fields: Mapping[str, set[str]] | None = None,
     adjacency_by_source_loader: Callable[[str], pa.Table] | None = None,
-    node_property_loader: Callable[[str], pa.Table] | None = None,
-    edge_property_loader: Callable[[str], pa.Table] | None = None,
+    node_property_loader: PropertyTableLoader | None = None,
+    edge_property_loader: PropertyTableLoader | None = None,
 ) -> pa.Table:
     """Produce binding rows for this pattern against the current graph state."""
     step = pattern.steps[0]
@@ -6059,7 +6236,9 @@ def _match_single_variable_length_path_table(
         adjacency_by_source_loader=adjacency_by_source_loader,
         edge_property_loader=edge_property_loader,
     )
-    if not _uses_typed_adjacency_path(step, edge_requested_fields):
+    if not _uses_typed_adjacency_path(
+        step, edge_requested_fields
+    ) or _has_relationship_type_alternatives(step):
         filtered_edges = _apply_edge_pattern_filter(filtered_edges, edge_prefix, step)
     if filtered_edges.num_rows == 0:
         return _empty_public_path_table(
@@ -6168,7 +6347,7 @@ def _empty_public_path_table(
     end_variable: str,
     required_fields: Mapping[str, set[str]] | None = None,
     end_pattern: NodePattern | None = None,
-    node_property_loader: Callable[[str], pa.Table] | None = None,
+    node_property_loader: PropertyTableLoader | None = None,
 ) -> pa.Table:
     """Build an empty typed result used by edge cases and fallback paths."""
     start_columns = {
@@ -6234,7 +6413,7 @@ def _match_distinct_endpoint_range_table(
     tabular: PyArrowTabularAdapter,
     *,
     adjacency_by_source_loader: Callable[[str], pa.Table] | None,
-    node_property_loader: Callable[[str], pa.Table] | None = None,
+    node_property_loader: PropertyTableLoader | None = None,
 ) -> pa.Table:
     """Return distinct endpoint projections for bounded variable-length traversals."""
     assert return_item.field is not None
@@ -7485,11 +7664,12 @@ def _build_match_scan_plan(
         ),
     )
     seen_variables = {pattern.start.variable}
+    seen_edge_variables: tuple[str, ...] = ()
     current_variable = pattern.start.variable
     for index, step in enumerate(pattern.steps):
         if step.min_hops != 1 or step.max_hops != 1:
             return None
-        if step.direction != "outgoing":
+        if step.direction not in {"outgoing", "incoming"}:
             return None
         edge_variable = step.variable or f"_edge_{index}"
         if edge_variable in seen_variables or step.node.variable in seen_variables:
@@ -7500,7 +7680,10 @@ def _build_match_scan_plan(
             input=root,
             start_variable=current_variable,
             edge_variable=edge_variable,
+            previous_edge_variables=seen_edge_variables,
+            direction=step.direction,
             rel_type=step.rel_type,
+            rel_type_alternatives=step.rel_type_alternatives,
             edge_properties=step.properties,
             edge_requested_fields=_requested_fields_for_edge_step(
                 required_fields,
@@ -7523,6 +7706,7 @@ def _build_match_scan_plan(
                 step.node.variable,
             ),
         )
+        seen_edge_variables = (*seen_edge_variables, edge_variable)
         current_variable = step.node.variable
     return root
 
@@ -10127,6 +10311,86 @@ def _normalize_property_map(properties: Mapping[str, Any]) -> dict[str, Any]:
     return {_cypher_name(str(key)): value for key, value in properties.items()}
 
 
+def _normalize_property_table_schema(table: pa.Table) -> pa.Table:
+    """Normalize escaped property-column names from derived Parquet datasets."""
+
+    normalized_names = [_cypher_name(column_name) for column_name in table.column_names]
+    if normalized_names == table.column_names:
+        return table
+    return table.rename_columns(normalized_names)
+
+
+def _node_property_projection_columns(property_fields: set[str] | None) -> list[str] | None:
+    """Return the minimal node property-table columns needed by one scan."""
+
+    if property_fields is None:
+        return None
+    return ["node_id", *sorted(property_fields)]
+
+
+def _edge_property_projection_columns(property_fields: set[str] | None) -> list[str] | None:
+    """Return the minimal relationship property-table columns needed by one scan."""
+
+    if property_fields is None:
+        return None
+    return ["edge_id", "src_id", "dst_id", *sorted(property_fields)]
+
+
+def _escaped_property_projection_columns(columns: list[str] | None) -> list[str] | None:
+    """Map logical property columns to their escaped Parquet names for imported datasets."""
+
+    if columns is None:
+        return None
+    structural_columns = {"node_id", "edge_id", "src_id", "dst_id"}
+    return [
+        column if column in structural_columns or column.startswith("`") else f"`{column}`"
+        for column in columns
+    ]
+
+
+def _load_property_table_with_column_fallback(
+    load: Callable[[list[str] | None], pa.Table],
+    *,
+    columns: list[str] | None,
+    escaped_columns: list[str] | None,
+) -> pa.Table:
+    """Read a projected property table, retrying escaped property names when needed."""
+
+    try:
+        return load(columns)
+    except (pa.ArrowInvalid, KeyError):
+        if escaped_columns is None or escaped_columns == columns:
+            return load(None)
+        try:
+            return load(escaped_columns)
+        except (pa.ArrowInvalid, KeyError):
+            return load(None)
+
+
+def _predicate_property_fields_for_variable(
+    predicate: WherePredicate | None,
+    variable: str,
+) -> set[str]:
+    """Return property fields referenced by a predicate for one variable."""
+
+    if predicate is None:
+        return set()
+    if isinstance(predicate, Comparison):
+        return {predicate.field} if predicate.variable == variable else set()
+    if isinstance(predicate, (StringPredicate, ExistsPredicate, InPredicate, NullPredicate)):
+        return {predicate.field} if predicate.variable == variable else set()
+    if isinstance(predicate, LabelPredicate):
+        return set()
+    if isinstance(predicate, NotPredicate):
+        return _predicate_property_fields_for_variable(predicate.predicate, variable)
+    if isinstance(predicate, (AndPredicate, OrPredicate)):
+        fields: set[str] = set()
+        for child in predicate.predicates:
+            fields.update(_predicate_property_fields_for_variable(child, variable))
+        return fields
+    return set()
+
+
 def _property_keys_from_record(record: Mapping[str, Any], variable: str) -> list[str]:
     """Return non-null property names for a bound node or relationship row."""
     prefix = f"{variable}."
@@ -10774,7 +11038,14 @@ def _uses_typed_adjacency_path(
     """Support the current Cypher compilation or execution step."""
     if requested_fields is None:
         return False
-    return step.rel_type is not None and not step.properties and requested_fields.issubset({"type"})
+    has_typed_relationship = step.rel_type is not None or len(step.rel_type_alternatives) > 1
+    return has_typed_relationship and not step.properties and requested_fields.issubset({"type"})
+
+
+def _has_relationship_type_alternatives(step: RelationshipStep) -> bool:
+    """Return true when a relationship step can match more than one concrete type."""
+
+    return len(step.rel_type_alternatives) > 1
 
 
 def _edge_match_table(
@@ -10784,26 +11055,41 @@ def _edge_match_table(
     *,
     requested_fields: set[str] | None,
     adjacency_by_source_loader: Callable[[str], pa.Table] | None = None,
-    edge_property_loader: Callable[[str], pa.Table] | None = None,
+    edge_property_loader: PropertyTableLoader | None = None,
 ) -> pa.Table:
     """Handle edge-specific matching, projection, or lookup logic for Cypher."""
     if (
         _uses_typed_adjacency_path(step, requested_fields)
         and adjacency_by_source_loader is not None
     ):
-        assert step.rel_type is not None
-        rel_type = step.rel_type
         load_adjacency = adjacency_by_source_loader
         if step.direction == "incoming":
             load_adjacency = cast(
                 Callable[[str], pa.Table],
                 getattr(adjacency_by_source_loader, "by_dest", adjacency_by_source_loader),
             )
-        return _typed_adjacency_binding_table(
-            load_adjacency(rel_type),
-            edge_prefix,
-            rel_type=rel_type,
-            include_type=requested_fields is not None and "type" in requested_fields,
+        rel_types = (
+            step.rel_type_alternatives
+            if len(step.rel_type_alternatives) > 1
+            else (cast(str, step.rel_type),)
+        )
+        adjacency_tables = tuple(load_adjacency(rel_type) for rel_type in rel_types)
+        if step.direction == "incoming" and any(table.num_rows == 0 for table in adjacency_tables):
+            return _edge_binding_table(
+                edges,
+                edge_prefix,
+                requested_fields=requested_fields,
+                step=step,
+                edge_property_loader=edge_property_loader,
+            )
+        return _typed_adjacency_binding_table_for_loaded_types(
+            adjacency_tables,
+            edge_prefix=edge_prefix,
+            rel_types=rel_types,
+            include_type=(
+                requested_fields is not None
+                and ("type" in requested_fields or len(step.rel_type_alternatives) > 1)
+            ),
         )
     return _edge_binding_table(
         edges,
@@ -10811,6 +11097,57 @@ def _edge_match_table(
         requested_fields=requested_fields,
         step=step,
         edge_property_loader=edge_property_loader,
+    )
+
+
+def _typed_adjacency_binding_table_for_loaded_types(
+    adjacency_tables: tuple[pa.Table, ...],
+    *,
+    edge_prefix: str,
+    rel_types: tuple[str, ...],
+    include_type: bool,
+) -> pa.Table:
+    """Build an edge binding table from already loaded typed adjacency tables."""
+
+    tables = [
+        _typed_adjacency_binding_table(
+            adjacency_table,
+            edge_prefix,
+            rel_type=rel_type,
+            include_type=include_type,
+        )
+        for adjacency_table, rel_type in zip(adjacency_tables, rel_types, strict=True)
+    ]
+    if not tables:
+        return _typed_adjacency_binding_table(
+            pa.table(
+                {
+                    "edge_id": pa.array([], type=pa.int64()),
+                    "src_id": pa.array([], type=pa.int64()),
+                    "dst_id": pa.array([], type=pa.int64()),
+                }
+            ),
+            edge_prefix,
+            rel_type="",
+            include_type=include_type,
+        )
+    return pa.concat_tables(tables)
+
+
+def _typed_adjacency_binding_table_for_types(
+    load_adjacency: Callable[[str], pa.Table],
+    *,
+    edge_prefix: str,
+    rel_types: tuple[str, ...],
+    include_type: bool,
+) -> pa.Table:
+    """Build an edge binding table by reading one typed adjacency table per relationship type."""
+
+    return _typed_adjacency_binding_table_for_loaded_types(
+        tuple(load_adjacency(rel_type) for rel_type in rel_types),
+        edge_prefix=edge_prefix,
+        rel_types=rel_types,
+        include_type=include_type,
     )
 
 
@@ -10850,7 +11187,7 @@ def _node_binding_table(
     *,
     requested_fields: set[str] | None = None,
     pattern: NodePattern | None = None,
-    node_property_loader: Callable[[str], pa.Table] | None = None,
+    node_property_loader: PropertyTableLoader | None = None,
     pushdown_predicate: WherePredicate | None = None,
 ) -> pa.Table:
     """Handle node-specific matching, projection, or lookup logic for Cypher."""
@@ -10860,13 +11197,18 @@ def _node_binding_table(
             and node_property_loader is not None
             and _can_use_node_property_projection(pattern, requested_fields)
         ):
-            property_table = node_property_loader(pattern.labels[0])
+            assert requested_fields is not None
+            property_fields = _requested_node_property_fields(
+                pattern,
+                requested_fields,
+                pushdown_predicate,
+            )
+            property_table = node_property_loader(pattern.labels[0], property_fields)
             if _can_project_requested_node_fields(
                 pattern=pattern,
                 requested_fields=requested_fields,
                 property_table=property_table,
             ):
-                assert requested_fields is not None
                 return _node_binding_table_from_property_projection(
                     nodes,
                     variable,
@@ -10920,7 +11262,7 @@ def _edge_binding_table(
     *,
     requested_fields: set[str] | None = None,
     step: RelationshipStep | None = None,
-    edge_property_loader: Callable[[str], pa.Table] | None = None,
+    edge_property_loader: PropertyTableLoader | None = None,
 ) -> pa.Table:
     """Handle edge-specific matching, projection, or lookup logic for Cypher."""
     if isinstance(edges, pa.Table):
@@ -10930,7 +11272,9 @@ def _edge_binding_table(
             and _can_use_edge_property_projection(step, requested_fields)
         ):
             assert step.rel_type is not None
-            property_table = edge_property_loader(step.rel_type)
+            assert requested_fields is not None
+            property_fields = _requested_edge_property_fields(step, requested_fields)
+            property_table = edge_property_loader(step.rel_type, property_fields)
             if _can_project_requested_edge_fields(
                 step=step,
                 requested_fields=requested_fields,
@@ -10993,18 +11337,27 @@ def _node_binding_table_from_canonical_table(
     labels_values = [
         [_cypher_name(label) for label in (labels or [])] for labels in table["labels"].to_pylist()
     ]
-    properties = [
-        _normalize_property_map(json.loads(value)) for value in table["properties_json"].to_pylist()
-    ]
     reserved_fields = {_NODE_ID_FIELD, _ENTITY_ID_FIELD, "__join_id", "labels"}
     if requested_fields is None:
+        properties = [
+            _normalize_property_map(json.loads(value))
+            for value in table["properties_json"].to_pylist()
+        ]
         property_names = sorted({key for item in properties for key in item})
     else:
+        requested_property_fields = sorted(
+            field for field in requested_fields if field not in reserved_fields
+        )
+        if requested_property_fields:
+            properties = [
+                _normalize_property_map(json.loads(value))
+                for value in table["properties_json"].to_pylist()
+            ]
+        else:
+            properties = []
         available_properties = {key for item in properties for key in item}
         property_names = sorted(
-            field
-            for field in requested_fields
-            if field not in reserved_fields and field in available_properties
+            field for field in requested_property_fields if field in available_properties
         )
 
     columns: dict[str, pa.Array | pa.ChunkedArray] = {
@@ -11040,6 +11393,22 @@ def _can_use_node_property_projection(
     if pattern.properties:
         property_fields.update(pattern.properties)
     return bool(property_fields)
+
+
+def _requested_node_property_fields(
+    pattern: NodePattern,
+    requested_fields: set[str],
+    pushdown_predicate: WherePredicate | None,
+) -> set[str]:
+    """Return the logical node property columns needed by a property projection."""
+
+    reserved_fields = {_NODE_ID_FIELD, _ENTITY_ID_FIELD, "__join_id", "labels"}
+    property_fields = {field for field in requested_fields if field not in reserved_fields}
+    property_fields.update(pattern.properties)
+    property_fields.update(
+        _predicate_property_fields_for_variable(pushdown_predicate, pattern.variable)
+    )
+    return property_fields
 
 
 def _node_binding_table_from_property_projection(
@@ -11291,6 +11660,18 @@ def _can_use_edge_property_projection(
     return bool(property_fields or requested_fields.intersection({"id", "source", "target"}))
 
 
+def _requested_edge_property_fields(
+    step: RelationshipStep,
+    requested_fields: set[str],
+) -> set[str]:
+    """Return the logical relationship property columns needed by a property projection."""
+
+    reserved_fields = {"id", "type", "source", "target"}
+    property_fields = {field for field in requested_fields if field not in reserved_fields}
+    property_fields.update(step.properties)
+    return property_fields
+
+
 def _can_project_requested_edge_fields(
     *,
     step: RelationshipStep,
@@ -11374,18 +11755,27 @@ def _edge_binding_table_from_canonical_table(
     requested_fields: set[str] | None,
 ) -> pa.Table:
     """Handle edge-specific matching, projection, or lookup logic for Cypher."""
-    properties = [
-        _normalize_property_map(json.loads(value)) for value in table["properties_json"].to_pylist()
-    ]
     reserved_fields = {"id", "type", "source", "target"}
     if requested_fields is None:
+        properties = [
+            _normalize_property_map(json.loads(value))
+            for value in table["properties_json"].to_pylist()
+        ]
         property_names = sorted({key for item in properties for key in item})
     else:
+        requested_property_fields = sorted(
+            field for field in requested_fields if field not in reserved_fields
+        )
+        if requested_property_fields:
+            properties = [
+                _normalize_property_map(json.loads(value))
+                for value in table["properties_json"].to_pylist()
+            ]
+        else:
+            properties = []
         available_properties = {key for item in properties for key in item}
         property_names = sorted(
-            field
-            for field in requested_fields
-            if field not in reserved_fields and field in available_properties
+            field for field in requested_property_fields if field in available_properties
         )
 
     columns: dict[str, pa.Array | pa.ChunkedArray] = {
@@ -11455,7 +11845,10 @@ def _apply_edge_pattern_filter(table: pa.Table, prefix: str, step: RelationshipS
     """Apply this transformation or predicate inside the Cypher pipeline."""
     masks: list[pa.Array] = []
     if len(step.rel_type_alternatives) > 1:
-        raise QueryError("Relationship type alternatives must be expanded before execution.")
+        type_column = f"{prefix}.type"
+        if type_column not in table.column_names:
+            raise QueryError("Relationship type alternatives require relationship type bindings.")
+        masks.append(pc.is_in(table[type_column], value_set=pa.array(step.rel_type_alternatives)))
     if step.rel_type is not None:
         masks.append(_comparison_mask(table[f"{prefix}.type"], "=", step.rel_type))
 
@@ -11514,8 +11907,8 @@ def _apply_where_predicate_table(
     edges: EdgeBindingSource | None = None,
     tabular: PyArrowTabularAdapter | None = None,
     adjacency_by_source_loader: Callable[[str], pa.Table] | None = None,
-    node_property_loader: Callable[[str], pa.Table] | None = None,
-    edge_property_loader: Callable[[str], pa.Table] | None = None,
+    node_property_loader: PropertyTableLoader | None = None,
+    edge_property_loader: PropertyTableLoader | None = None,
 ) -> pa.Table:
     """Apply this transformation or predicate inside the Cypher pipeline."""
     if predicate is None:
@@ -11547,8 +11940,8 @@ def _predicate_mask(
     edges: EdgeBindingSource | None = None,
     tabular: PyArrowTabularAdapter | None = None,
     adjacency_by_source_loader: Callable[[str], pa.Table] | None = None,
-    node_property_loader: Callable[[str], pa.Table] | None = None,
-    edge_property_loader: Callable[[str], pa.Table] | None = None,
+    node_property_loader: PropertyTableLoader | None = None,
+    edge_property_loader: PropertyTableLoader | None = None,
 ) -> pa.Array:
     """Support the current Cypher compilation or execution step."""
     if isinstance(predicate, Comparison):
@@ -11696,8 +12089,8 @@ def _exists_pattern_mask(
     edges: EdgeBindingSource | None,
     tabular: PyArrowTabularAdapter | None,
     adjacency_by_source_loader: Callable[[str], pa.Table] | None,
-    node_property_loader: Callable[[str], pa.Table] | None,
-    edge_property_loader: Callable[[str], pa.Table] | None,
+    node_property_loader: PropertyTableLoader | None,
+    edge_property_loader: PropertyTableLoader | None,
 ) -> pa.Array:
     """Evaluate EXISTS { pattern } as a correlated semi-join mask."""
 

@@ -119,22 +119,29 @@ class GraphStateUseCase:
         *,
         snapshot: SnapshotManifest,
         label: str,
+        columns: list[str] | None = None,
     ) -> pa.Table:
         """Load the property-columnar dataset for ``label``."""
 
-        return self._graph_store.load_node_property_table(snapshot.node_properties, label=label)
+        return self._graph_store.load_node_property_table(
+            snapshot.node_properties,
+            label=label,
+            columns=columns,
+        )
 
     def load_edge_property_table(
         self,
         *,
         snapshot: SnapshotManifest,
         rel_type: str,
+        columns: list[str] | None = None,
     ) -> pa.Table:
         """Load the property-columnar dataset for ``rel_type``."""
 
         return self._graph_store.load_edge_property_table(
             snapshot.edge_properties,
             rel_type=rel_type,
+            columns=columns,
         )
 
     def load_adjacency_by_source_table(

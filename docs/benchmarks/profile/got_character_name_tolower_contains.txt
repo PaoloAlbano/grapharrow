@@ -1,0 +1,38 @@
+         40589 function calls (40452 primitive calls) in 0.011 seconds
+
+   Ordered by: cumulative time
+   List reduced from 568 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.000    0.000    0.011    0.011 embedded.py:66(query)
+        1    0.000    0.000    0.011    0.011 cypher.py:517(execute)
+        1    0.000    0.000    0.008    0.008 cypher.py:835(_execute_match)
+        1    0.000    0.000    0.008    0.008 cypher.py:912(_execute_match_logical_plan)
+      3/1    0.000    0.000    0.007    0.007 cypher.py:949(_execute_logical_plan_node)
+        1    0.000    0.000    0.006    0.006 cypher.py:11184(_node_binding_table)
+        1    0.000    0.000    0.006    0.006 cypher.py:11414(_node_binding_table_from_property_projection)
+        1    0.000    0.000    0.005    0.005 cypher.py:11727(_canonical_labels_contains_all_mask)
+        1    0.003    0.003    0.005    0.005 cypher.py:11740(_canonical_label_membership_mask)
+     2822    0.000    0.000    0.002    0.000 {built-in method builtins.any}
+        1    0.000    0.000    0.002    0.002 opencypher.py:34(parse_cypher)
+        1    0.000    0.000    0.002    0.002 opencypher.py:18(parse)
+        1    0.000    0.000    0.002    0.002 CypherParser.py:1036(oC_Cypher)
+        1    0.000    0.000    0.002    0.002 CypherParser.py:1111(oC_Statement)
+        1    0.000    0.000    0.002    0.002 CypherParser.py:1155(oC_Query)
+        1    0.000    0.000    0.002    0.002 CypherParser.py:1221(oC_RegularQuery)
+        1    0.000    0.000    0.002    0.002 CypherParser.py:1375(oC_SingleQuery)
+     5354    0.000    0.000    0.002    0.000 cypher.py:11744(<genexpr>)
+        1    0.000    0.000    0.002    0.002 CypherParser.py:1448(oC_SinglePartQuery)
+     2685    0.001    0.000    0.002    0.000 cypher.py:10864(_cypher_name)
+        1    0.000    0.000    0.001    0.001 graph.py:102(load_tabular_state)
+        6    0.001    0.000    0.001    0.000 parquet.py:40(read_dataset_table)
+      4/3    0.000    0.000    0.001    0.000 CypherParser.py:5263(oC_Expression)
+      4/3    0.000    0.000    0.001    0.000 CypherParser.py:5318(oC_OrExpression)
+      4/3    0.000    0.000    0.001    0.000 CypherParser.py:5390(oC_XorExpression)
+      4/3    0.000    0.000    0.001    0.000 CypherParser.py:5462(oC_AndExpression)
+      4/3    0.000    0.000    0.001    0.000 CypherParser.py:5531(oC_NotExpression)
+      4/3    0.000    0.000    0.001    0.000 CypherParser.py:5603(oC_ComparisonExpression)
+      4/3    0.000    0.000    0.001    0.000 CypherParser.py:5821(oC_StringListNullPredicateExpression)
+        1    0.000    0.000    0.001    0.001 CypherParser.py:3166(oC_Return)
+
+

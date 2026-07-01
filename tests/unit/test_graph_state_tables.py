@@ -25,3 +25,23 @@ def test_graph_state_exposes_arrow_tables_alongside_records(tmp_path: Path) -> N
     )
     assert len(state.nodes) == 2
     assert len(state.edges) == 1
+
+
+def test_graph_property_table_loader_can_project_columns(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+
+    with database.write_transaction() as session:
+        session.add_node(
+            labels=["Person"],
+            properties={"name": "Alice", "age": 30, "country": "IT"},
+        )
+
+    state = database._app.use_cases.graph.load_tabular_state()
+    table = database._app.use_cases.graph.load_node_property_table(
+        snapshot=state.snapshot,
+        label="Person",
+        columns=["node_id", "name"],
+    )
+
+    assert table.column_names == ["node_id", "name"]
+    assert table.to_pylist() == [{"node_id": 1, "name": "Alice"}]

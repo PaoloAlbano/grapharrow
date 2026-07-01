@@ -1,0 +1,207 @@
+{
+  "config": {
+    "nodes": 20000,
+    "edges": 120000,
+    "seed": 42,
+    "seed_mode": "disabled",
+    "repeats": 5,
+    "warmups": 2,
+    "create_lookup_indexes": false,
+    "engines": [
+      {
+        "name": "grapharrow",
+        "uri": "bolt://127.0.0.1:18080",
+        "user": null,
+        "password": null,
+        "seed": false
+      },
+      {
+        "name": "neo4j",
+        "uri": "bolt://127.0.0.1:7687",
+        "user": "neo4j",
+        "password": "password",
+        "seed": false
+      },
+      {
+        "name": "memgraph",
+        "uri": "bolt://127.0.0.1:7688",
+        "user": null,
+        "password": null,
+        "seed": false
+      }
+    ]
+  },
+  "results": [
+    {
+      "engine": "grapharrow",
+      "query": "incoming_typed_projection_order_limit",
+      "status": "ok",
+      "median_seconds": 0.09914116701111197,
+      "best_seconds": 0.09842416690662503,
+      "worst_seconds": 0.12546050013042986,
+      "runs": [
+        0.12546050013042986,
+        0.10185437509790063,
+        0.09914116701111197,
+        0.09842416690662503,
+        0.09886804199777544
+      ],
+      "row_count": 500,
+      "checksum": "48675a352b12a29fa43dc3e61a50e7ce7e7cdb91deefa2070321f2f654e8bb39",
+      "semantic_checksum": "4ad80f4a70cece846cc9793a0ba4bd02ba4335124c4eb6c69820c15f92743e3b",
+      "error": null
+    },
+    {
+      "engine": "grapharrow",
+      "query": "recommendation_common_neighbors_collect_count",
+      "status": "ok",
+      "median_seconds": 0.18374491692520678,
+      "best_seconds": 0.17158845788799226,
+      "worst_seconds": 0.18762287497520447,
+      "runs": [
+        0.18374491692520678,
+        0.17158845788799226,
+        0.1858127498999238,
+        0.17453033290803432,
+        0.18762287497520447
+      ],
+      "row_count": 100,
+      "checksum": "cbf7abeafb575ef0fb90072286cdcefc04f9dafe0d6b4f1e81dcbce65d3a4f58",
+      "semantic_checksum": "bbca70a4c911561ee4216967311112bd8086713f6e27473f62504aaa24d7b57b",
+      "error": null
+    },
+    {
+      "engine": "grapharrow",
+      "query": "multi_match_where_graph_return",
+      "status": "ok",
+      "median_seconds": 0.3181657500099391,
+      "best_seconds": 0.316120499977842,
+      "worst_seconds": 0.32259087497368455,
+      "runs": [
+        0.3181657500099391,
+        0.32259087497368455,
+        0.3162926249206066,
+        0.316120499977842,
+        0.3181961248628795
+      ],
+      "row_count": 100,
+      "checksum": "706d8d4052382cdad4c1471216b2678d9f022461eac6454023fba14453c49a5b",
+      "semantic_checksum": "d135fe0f5b0b4e39d86ffa381fde1d652de730e0adbea927df0375bd48a2850f",
+      "error": null
+    },
+    {
+      "engine": "neo4j",
+      "query": "incoming_typed_projection_order_limit",
+      "status": "ok",
+      "median_seconds": 0.011883291881531477,
+      "best_seconds": 0.010852792067453265,
+      "worst_seconds": 0.012553541921079159,
+      "runs": [
+        0.012553541921079159,
+        0.01212487486191094,
+        0.011883291881531477,
+        0.011654583970084786,
+        0.010852792067453265
+      ],
+      "row_count": 500,
+      "checksum": "48675a352b12a29fa43dc3e61a50e7ce7e7cdb91deefa2070321f2f654e8bb39",
+      "semantic_checksum": "4ad80f4a70cece846cc9793a0ba4bd02ba4335124c4eb6c69820c15f92743e3b",
+      "error": null
+    },
+    {
+      "engine": "neo4j",
+      "query": "recommendation_common_neighbors_collect_count",
+      "status": "ok",
+      "median_seconds": 0.01714858296327293,
+      "best_seconds": 0.015448749996721745,
+      "worst_seconds": 0.04341370798647404,
+      "runs": [
+        0.01658837520517409,
+        0.015448749996721745,
+        0.01714858296327293,
+        0.04341370798647404,
+        0.031164875021204352
+      ],
+      "row_count": 100,
+      "checksum": "cbf7abeafb575ef0fb90072286cdcefc04f9dafe0d6b4f1e81dcbce65d3a4f58",
+      "semantic_checksum": "bbca70a4c911561ee4216967311112bd8086713f6e27473f62504aaa24d7b57b",
+      "error": null
+    },
+    {
+      "engine": "neo4j",
+      "query": "multi_match_where_graph_return",
+      "status": "ok",
+      "median_seconds": 0.032645541010424495,
+      "best_seconds": 0.030597625067457557,
+      "worst_seconds": 0.09162783389911056,
+      "runs": [
+        0.03274054196663201,
+        0.032645541010424495,
+        0.032560457941144705,
+        0.030597625067457557,
+        0.09162783389911056
+      ],
+      "row_count": 100,
+      "checksum": "b7ec9c0af165f06c2b402e53e728dbcb0aa43f8a0158c77a9f5a4dcafc9269b1",
+      "semantic_checksum": "d135fe0f5b0b4e39d86ffa381fde1d652de730e0adbea927df0375bd48a2850f",
+      "error": null
+    },
+    {
+      "engine": "memgraph",
+      "query": "incoming_typed_projection_order_limit",
+      "status": "ok",
+      "median_seconds": 0.01269616698846221,
+      "best_seconds": 0.008324667112901807,
+      "worst_seconds": 0.02008804213255644,
+      "runs": [
+        0.01269616698846221,
+        0.013055749936029315,
+        0.00863670906983316,
+        0.008324667112901807,
+        0.02008804213255644
+      ],
+      "row_count": 500,
+      "checksum": "48675a352b12a29fa43dc3e61a50e7ce7e7cdb91deefa2070321f2f654e8bb39",
+      "semantic_checksum": "4ad80f4a70cece846cc9793a0ba4bd02ba4335124c4eb6c69820c15f92743e3b",
+      "error": null
+    },
+    {
+      "engine": "memgraph",
+      "query": "recommendation_common_neighbors_collect_count",
+      "status": "ok",
+      "median_seconds": 0.04914279212243855,
+      "best_seconds": 0.025379166938364506,
+      "worst_seconds": 0.056930165970698,
+      "runs": [
+        0.04914279212243855,
+        0.028683624928817153,
+        0.05072991596534848,
+        0.056930165970698,
+        0.025379166938364506
+      ],
+      "row_count": 100,
+      "checksum": "cbf7abeafb575ef0fb90072286cdcefc04f9dafe0d6b4f1e81dcbce65d3a4f58",
+      "semantic_checksum": "bbca70a4c911561ee4216967311112bd8086713f6e27473f62504aaa24d7b57b",
+      "error": null
+    },
+    {
+      "engine": "memgraph",
+      "query": "multi_match_where_graph_return",
+      "status": "ok",
+      "median_seconds": 0.00876345788128674,
+      "best_seconds": 0.007908334024250507,
+      "worst_seconds": 0.009535332908853889,
+      "runs": [
+        0.009535332908853889,
+        0.00876345788128674,
+        0.008142958860844374,
+        0.00896008382551372,
+        0.007908334024250507
+      ],
+      "row_count": 100,
+      "checksum": "207db6aef9cca69ae4cfe6a5b0c7d846b49f3f3b7093884c59f3681636f33ade",
+      "semantic_checksum": "d135fe0f5b0b4e39d86ffa381fde1d652de730e0adbea927df0375bd48a2850f",
+      "error": null
+    }
+  ]
+}
