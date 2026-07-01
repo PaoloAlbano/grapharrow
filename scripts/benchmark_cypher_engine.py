@@ -15,7 +15,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import pyarrow as pa  # type: ignore[import-untyped]
@@ -343,6 +343,7 @@ def build_queries() -> dict[str, str]:
             "MATCH (a)-[r:KNOWS]->(b:Person) "
             "WHERE b.active = true "
             "RETURN a, r, b "
+            "ORDER BY a.external_id ASC, b.external_id ASC, r.weight ASC "
             "LIMIT 100"
         ),
         "three_hop_wildcard_projection_order_limit": (
@@ -445,7 +446,7 @@ def prepare_database(
 
     _log(f"Generating synthetic dataset in {database_path}.")
     rng = np.random.default_rng(seed)
-    node_ids = np.arange(1, node_count + 1, dtype=np.int64)
+    node_ids: Any = np.arange(1, node_count + 1, dtype=np.int64)
     anchor_count = min(500, node_count)
 
     node_table = pa.table(
@@ -463,7 +464,7 @@ def prepare_database(
     src_random = rng.integers(1, node_count + 1, size=max(random_edges, 0), dtype=np.int64)
     dst_random = rng.integers(1, node_count + 1, size=max(random_edges, 0), dtype=np.int64)
 
-    controlled_sources = np.repeat(np.arange(1, anchor_count + 1, dtype=np.int64), 3)
+    controlled_sources: Any = np.repeat(np.arange(1, anchor_count + 1, dtype=np.int64), 3)
     controlled_targets = np.concatenate(
         [
             controlled_sources + 1,
@@ -558,6 +559,12 @@ def measure_query(
     ]
     rss_delta_runs = tuple(run["rss_delta_mb"] for run in memory_runs)
     arrow_peak_runs = tuple(run["arrow_peak_mb"] for run in memory_runs)
+    median_rss_delta_mb = statistics.median(rss_delta_runs) if rss_delta_runs else 0.0
+    best_rss_delta_mb = min(rss_delta_runs) if rss_delta_runs else 0.0
+    worst_rss_delta_mb = max(rss_delta_runs) if rss_delta_runs else 0.0
+    median_arrow_peak_mb = statistics.median(arrow_peak_runs) if arrow_peak_runs else 0.0
+    best_arrow_peak_mb = min(arrow_peak_runs) if arrow_peak_runs else 0.0
+    worst_arrow_peak_mb = max(arrow_peak_runs) if arrow_peak_runs else 0.0
 
     return BenchmarkResult(
         query=name,
@@ -567,13 +574,13 @@ def measure_query(
         runs=tuple(runs),
         row_count=final_row_count,
         checksum=final_checksum,
-        median_rss_delta_mb=statistics.median(rss_delta_runs),
-        best_rss_delta_mb=min(rss_delta_runs),
-        worst_rss_delta_mb=max(rss_delta_runs),
+        median_rss_delta_mb=median_rss_delta_mb,
+        best_rss_delta_mb=best_rss_delta_mb,
+        worst_rss_delta_mb=worst_rss_delta_mb,
         rss_delta_runs=rss_delta_runs,
-        median_arrow_peak_mb=statistics.median(arrow_peak_runs),
-        best_arrow_peak_mb=min(arrow_peak_runs),
-        worst_arrow_peak_mb=max(arrow_peak_runs),
+        median_arrow_peak_mb=median_arrow_peak_mb,
+        best_arrow_peak_mb=best_arrow_peak_mb,
+        worst_arrow_peak_mb=worst_arrow_peak_mb,
         arrow_peak_runs=arrow_peak_runs,
     )
 

@@ -134,7 +134,13 @@ class GraphRepository:
             schema=ADJACENCY_BY_SOURCE_SCHEMA,
         )
 
-    def load_node_property_table(self, files: tuple[DatasetFile, ...], *, label: str) -> pa.Table:
+    def load_node_property_table(
+        self,
+        files: tuple[DatasetFile, ...],
+        *,
+        label: str,
+        columns: list[str] | None = None,
+    ) -> pa.Table:
         """Load the property-projection dataset for ``label``."""
 
         selected_files = tuple(
@@ -144,6 +150,7 @@ class GraphRepository:
         )
         return self._parquet.read_dataset_table(
             [self._absolute_location(dataset_file.path) for dataset_file in selected_files],
+            columns=columns,
         )
 
     def load_edge_property_table(
@@ -151,6 +158,7 @@ class GraphRepository:
         files: tuple[DatasetFile, ...],
         *,
         rel_type: str,
+        columns: list[str] | None = None,
     ) -> pa.Table:
         """Load the property-projection dataset for ``rel_type``."""
 
@@ -161,6 +169,7 @@ class GraphRepository:
         )
         return self._parquet.read_dataset_table(
             [self._absolute_location(dataset_file.path) for dataset_file in selected_files],
+            columns=columns,
         )
 
     def load_nodes(self, files: tuple[DatasetFile, ...]) -> list[NodeRecord]:

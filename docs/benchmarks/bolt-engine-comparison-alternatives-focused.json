@@ -1,0 +1,93 @@
+{
+  "config": {
+    "nodes": 20000,
+    "edges": 120000,
+    "seed": 42,
+    "seed_mode": "disabled",
+    "repeats": 5,
+    "warmups": 2,
+    "create_lookup_indexes": false,
+    "engines": [
+      {
+        "name": "grapharrow",
+        "uri": "bolt://127.0.0.1:18080",
+        "user": null,
+        "password": null,
+        "seed": false
+      },
+      {
+        "name": "neo4j",
+        "uri": "bolt://127.0.0.1:7687",
+        "user": "neo4j",
+        "password": "password",
+        "seed": false
+      },
+      {
+        "name": "memgraph",
+        "uri": "bolt://127.0.0.1:7688",
+        "user": null,
+        "password": null,
+        "seed": false
+      }
+    ]
+  },
+  "results": [
+    {
+      "engine": "grapharrow",
+      "query": "relationship_type_alternatives_projection",
+      "status": "ok",
+      "median_seconds": 0.10723670898005366,
+      "best_seconds": 0.10536183416843414,
+      "worst_seconds": 0.1082495420705527,
+      "runs": [
+        0.1082495420705527,
+        0.10723670898005366,
+        0.10643808380700648,
+        0.10536183416843414,
+        0.10734099987894297
+      ],
+      "row_count": 500,
+      "checksum": "dabcd70a5ec5ce5bfcb3c6829cf599d0949d0bbe102fb8eb688e995e27d6e692",
+      "semantic_checksum": "dabcd70a5ec5ce5bfcb3c6829cf599d0949d0bbe102fb8eb688e995e27d6e692",
+      "error": null
+    },
+    {
+      "engine": "neo4j",
+      "query": "relationship_type_alternatives_projection",
+      "status": "ok",
+      "median_seconds": 0.02226416696794331,
+      "best_seconds": 0.014087000163272023,
+      "worst_seconds": 0.04851654195226729,
+      "runs": [
+        0.014087000163272023,
+        0.014727874891832471,
+        0.02226416696794331,
+        0.04851654195226729,
+        0.033353874925523996
+      ],
+      "row_count": 500,
+      "checksum": "dabcd70a5ec5ce5bfcb3c6829cf599d0949d0bbe102fb8eb688e995e27d6e692",
+      "semantic_checksum": "dabcd70a5ec5ce5bfcb3c6829cf599d0949d0bbe102fb8eb688e995e27d6e692",
+      "error": null
+    },
+    {
+      "engine": "memgraph",
+      "query": "relationship_type_alternatives_projection",
+      "status": "ok",
+      "median_seconds": 0.009762125089764595,
+      "best_seconds": 0.00903054210357368,
+      "worst_seconds": 0.016891458071768284,
+      "runs": [
+        0.00929937488399446,
+        0.009762125089764595,
+        0.00903054210357368,
+        0.016891458071768284,
+        0.011928708059713244
+      ],
+      "row_count": 500,
+      "checksum": "dabcd70a5ec5ce5bfcb3c6829cf599d0949d0bbe102fb8eb688e995e27d6e692",
+      "semantic_checksum": "dabcd70a5ec5ce5bfcb3c6829cf599d0949d0bbe102fb8eb688e995e27d6e692",
+      "error": null
+    }
+  ]
+}

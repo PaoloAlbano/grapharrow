@@ -1,0 +1,38 @@
+         843444 function calls (843253 primitive calls) in 0.144 seconds
+
+   Ordered by: cumulative time
+   List reduced from 579 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.000    0.000    0.144    0.144 embedded.py:66(query)
+        1    0.000    0.000    0.144    0.144 cypher.py:517(execute)
+        1    0.000    0.000    0.139    0.139 cypher.py:835(_execute_match)
+        1    0.000    0.000    0.137    0.137 cypher.py:2010(_match_rows)
+        1    0.000    0.000    0.135    0.135 cypher.py:5429(_match_patterns_table)
+        2    0.000    0.000    0.104    0.052 cypher.py:5541(_match_fixed_path_from_input_table)
+        4    0.000    0.000    0.070    0.018 cypher.py:11051(_edge_match_table)
+        2    0.000    0.000    0.069    0.035 cypher.py:11259(_edge_binding_table)
+        2    0.020    0.010    0.069    0.035 cypher.py:11751(_edge_binding_table_from_canonical_table)
+        4    0.000    0.000    0.060    0.015 cypher.py:11184(_node_binding_table)
+        4    0.018    0.004    0.060    0.015 cypher.py:11330(_node_binding_table_from_canonical_table)
+    34803    0.009    0.000    0.045    0.000 __init__.py:299(loads)
+    34803    0.016    0.000    0.032    0.000 decoder.py:333(decode)
+        1    0.000    0.000    0.031    0.031 cypher.py:5972(_match_single_pattern_table)
+        1    0.000    0.000    0.031    0.031 cypher.py:6028(_match_fixed_path_table)
+    47960    0.014    0.000    0.025    0.000 cypher.py:10864(_cypher_name)
+    34642    0.006    0.000    0.016    0.000 cypher.py:10309(_normalize_property_map)
+    10720    0.001    0.000    0.010    0.000 __init__.py:183(dumps)
+    10720    0.003    0.000    0.009    0.000 encoder.py:183(encode)
+    69606    0.007    0.000    0.007    0.000 {method 'match' of 're.Pattern' objects}
+    85062    0.006    0.000    0.006    0.000 {method 'startswith' of 'str' objects}
+    34803    0.004    0.000    0.004    0.000 decoder.py:344(raw_decode)
+        1    0.000    0.000    0.004    0.004 opencypher.py:34(parse_cypher)
+        1    0.000    0.000    0.004    0.004 opencypher.py:18(parse)
+        1    0.000    0.000    0.004    0.004 CypherParser.py:1036(oC_Cypher)
+        1    0.000    0.000    0.004    0.004 CypherParser.py:1111(oC_Statement)
+        1    0.000    0.000    0.004    0.004 CypherParser.py:1155(oC_Query)
+    10708    0.004    0.000    0.004    0.000 encoder.py:205(iterencode)
+        1    0.000    0.000    0.004    0.004 CypherParser.py:1221(oC_RegularQuery)
+        1    0.000    0.000    0.004    0.004 CypherParser.py:1375(oC_SingleQuery)
+
+

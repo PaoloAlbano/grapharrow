@@ -1,0 +1,53 @@
+{
+  "queries": [
+    {
+      "query": "got_character_name_projection",
+      "rows": 100,
+      "median_seconds": 0.005508917151018977,
+      "best_seconds": 0.005204624962061644,
+      "profile_file": "docs/benchmarks/profile/got_character_name_projection.txt"
+    },
+    {
+      "query": "got_character_name_tolower_contains",
+      "rows": 1,
+      "median_seconds": 0.005761332809925079,
+      "best_seconds": 0.005623875185847282,
+      "profile_file": "docs/benchmarks/profile/got_character_name_tolower_contains.txt"
+    },
+    {
+      "query": "got_location_deaths",
+      "rows": 41,
+      "median_seconds": 0.013022374827414751,
+      "best_seconds": 0.012697500176727772,
+      "profile_file": "docs/benchmarks/profile/got_location_deaths.txt"
+    },
+    {
+      "query": "got_killed_method_text_filter_count",
+      "rows": 1,
+      "median_seconds": 0.02331433305516839,
+      "best_seconds": 0.022803332889452577,
+      "profile_file": "docs/benchmarks/profile/got_killed_method_text_filter_count.txt"
+    },
+    {
+      "query": "got_victim_location_two_hop_projection",
+      "rows": 100,
+      "median_seconds": 0.015624250052496791,
+      "best_seconds": 0.015428415965288877,
+      "profile_file": "docs/benchmarks/profile/got_victim_location_two_hop_projection.txt"
+    },
+    {
+      "query": "got_visual_death_location",
+      "rows": 50,
+      "median_seconds": 0.03143570804968476,
+      "best_seconds": 0.029012000188231468,
+      "profile_file": "docs/benchmarks/profile/got_visual_death_location.txt"
+    },
+    {
+      "query": "got_jon_snow_death_locations",
+      "rows": 51,
+      "median_seconds": 0.0665295000653714,
+      "best_seconds": 0.06232233392074704,
+      "profile_file": "docs/benchmarks/profile/got_jon_snow_death_locations.txt"
+    }
+  ]
+}

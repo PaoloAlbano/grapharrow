@@ -1,0 +1,38 @@
+         427332 function calls (427196 primitive calls) in 0.072 seconds
+
+   Ordered by: cumulative time
+   List reduced from 562 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.000    0.000    0.072    0.072 embedded.py:66(query)
+        1    0.000    0.000    0.072    0.072 cypher.py:517(execute)
+        1    0.000    0.000    0.069    0.069 cypher.py:835(_execute_match)
+        1    0.000    0.000    0.068    0.068 cypher.py:912(_execute_match_logical_plan)
+      4/1    0.000    0.000    0.067    0.067 cypher.py:949(_execute_logical_plan_node)
+        1    0.000    0.000    0.034    0.034 cypher.py:11051(_edge_match_table)
+        1    0.000    0.000    0.034    0.034 cypher.py:11259(_edge_binding_table)
+        1    0.010    0.010    0.034    0.034 cypher.py:11751(_edge_binding_table_from_canonical_table)
+        2    0.000    0.000    0.030    0.015 cypher.py:11184(_node_binding_table)
+        2    0.009    0.005    0.030    0.015 cypher.py:11330(_node_binding_table_from_canonical_table)
+    17429    0.004    0.000    0.022    0.000 __init__.py:299(loads)
+    17429    0.008    0.000    0.016    0.000 decoder.py:333(decode)
+    24003    0.007    0.000    0.013    0.000 cypher.py:10864(_cypher_name)
+    17321    0.003    0.000    0.008    0.000 cypher.py:10309(_normalize_property_map)
+     5360    0.001    0.000    0.005    0.000 __init__.py:183(dumps)
+     5360    0.002    0.000    0.004    0.000 encoder.py:183(encode)
+    34858    0.003    0.000    0.003    0.000 {method 'match' of 're.Pattern' objects}
+    42665    0.003    0.000    0.003    0.000 {method 'startswith' of 'str' objects}
+        1    0.000    0.000    0.002    0.002 opencypher.py:34(parse_cypher)
+        1    0.000    0.000    0.002    0.002 opencypher.py:18(parse)
+    17429    0.002    0.000    0.002    0.000 decoder.py:344(raw_decode)
+        1    0.000    0.000    0.002    0.002 CypherParser.py:1036(oC_Cypher)
+        1    0.000    0.000    0.002    0.002 CypherParser.py:1111(oC_Statement)
+        1    0.000    0.000    0.002    0.002 CypherParser.py:1155(oC_Query)
+        1    0.000    0.000    0.002    0.002 CypherParser.py:1221(oC_RegularQuery)
+        1    0.000    0.000    0.002    0.002 CypherParser.py:1375(oC_SingleQuery)
+    46048    0.002    0.000    0.002    0.000 {method 'get' of 'dict' objects}
+     5354    0.002    0.000    0.002    0.000 encoder.py:205(iterencode)
+        1    0.000    0.000    0.002    0.002 CypherParser.py:1448(oC_SinglePartQuery)
+    23941    0.002    0.000    0.002    0.000 {method 'endswith' of 'str' objects}
+
+

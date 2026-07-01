@@ -1,0 +1,496 @@
+{
+  "config": {
+    "query_set": "got",
+    "nodes": 20000,
+    "edges": 120000,
+    "seed": 42,
+    "seed_mode": "disabled",
+    "repeats": 3,
+    "warmups": 1,
+    "create_lookup_indexes": false,
+    "engines": [
+      {
+        "name": "grapharrow",
+        "uri": "bolt://127.0.0.1:18080",
+        "user": null,
+        "password": null,
+        "seed": false
+      },
+      {
+        "name": "neo4j",
+        "uri": "bolt://127.0.0.1:7687",
+        "user": "neo4j",
+        "password": "password",
+        "seed": false
+      },
+      {
+        "name": "memgraph",
+        "uri": "bolt://127.0.0.1:7688",
+        "user": null,
+        "password": null,
+        "seed": false
+      }
+    ]
+  },
+  "results": [
+    {
+      "engine": "grapharrow",
+      "query": "got_schema_labels",
+      "status": "ok",
+      "median_seconds": 0.011050458997488022,
+      "best_seconds": 0.010804582852870226,
+      "worst_seconds": 0.012646791990846395,
+      "runs": [
+        0.011050458997488022,
+        0.010804582852870226,
+        0.012646791990846395
+      ],
+      "row_count": 6,
+      "checksum": "3ae3acba4603fbdb40f376c504dc7b90b744c5c422fbb82deba5884591bd1a23",
+      "semantic_checksum": "9b29565fc3815580df74578d0dc63afdb26cf7e9bc84c3d52bd290656b03556e",
+      "error": null
+    },
+    {
+      "engine": "grapharrow",
+      "query": "got_schema_relationship_types",
+      "status": "ok",
+      "median_seconds": 0.04221179196611047,
+      "best_seconds": 0.04200437502004206,
+      "worst_seconds": 0.05403479188680649,
+      "runs": [
+        0.04200437502004206,
+        0.04221179196611047,
+        0.05403479188680649
+      ],
+      "row_count": 6,
+      "checksum": "3d01257bd978de8a87729a22c8a9441dcefff43607f6a8e8d37ecbde7d3e10b9",
+      "semantic_checksum": "ce0aee594d7e1397643f05b1803407b68e8aa20124d1c97eb1ce91d826a8009a",
+      "error": null
+    },
+    {
+      "engine": "grapharrow",
+      "query": "got_episode_deaths",
+      "status": "ok",
+      "median_seconds": 0.04949150001630187,
+      "best_seconds": 0.0399656668305397,
+      "worst_seconds": 0.061971375020220876,
+      "runs": [
+        0.04949150001630187,
+        0.061971375020220876,
+        0.0399656668305397
+      ],
+      "row_count": 69,
+      "checksum": "779a72897c67779e19e14bbed5148999f7a8fd9931df1db27459eb0a16688e65",
+      "semantic_checksum": "f1293e0340a3f0ce7fc5513f68ca2f34394d5871f3ce8bf0c422db74d69f1c02",
+      "error": null
+    },
+    {
+      "engine": "grapharrow",
+      "query": "got_season_deaths",
+      "status": "ok",
+      "median_seconds": 0.044042791007086635,
+      "best_seconds": 0.034017832949757576,
+      "worst_seconds": 0.046399791026487947,
+      "runs": [
+        0.046399791026487947,
+        0.044042791007086635,
+        0.034017832949757576
+      ],
+      "row_count": 8,
+      "checksum": "02c525d5b01703b5929e36381dac36e657f5e86752abaca8472eb83c992efd04",
+      "semantic_checksum": "fa14ad2744bf881d288a296fbb0eb082a3f11380eefa9ddc140cde40133e3eb2",
+      "error": null
+    },
+    {
+      "engine": "grapharrow",
+      "query": "got_location_deaths",
+      "status": "ok",
+      "median_seconds": 0.05967804207466543,
+      "best_seconds": 0.04919895809143782,
+      "worst_seconds": 0.06528533296659589,
+      "runs": [
+        0.05967804207466543,
+        0.04919895809143782,
+        0.06528533296659589
+      ],
+      "row_count": 41,
+      "checksum": "d5f1b8198acb0cfac0503b891a52f22ee59c9d3c4afe70888238bb4adc94f757",
+      "semantic_checksum": "b69fac2b312412cd7b7387c7d5e667794453177e5eb0a42d5d9d5cefbc8395ed",
+      "error": null
+    },
+    {
+      "engine": "grapharrow",
+      "query": "got_castle_location_text_filter",
+      "status": "ok",
+      "median_seconds": 0.0445463340729475,
+      "best_seconds": 0.04102075006812811,
+      "worst_seconds": 0.05860408302396536,
+      "runs": [
+        0.0445463340729475,
+        0.05860408302396536,
+        0.04102075006812811
+      ],
+      "row_count": 1,
+      "checksum": "61c30d5b35e9c49b5a43b64426927cba7b044ad1150868861fbaa0077413d584",
+      "semantic_checksum": "61c30d5b35e9c49b5a43b64426927cba7b044ad1150868861fbaa0077413d584",
+      "error": null
+    },
+    {
+      "engine": "grapharrow",
+      "query": "got_episode_avg_rating",
+      "status": "ok",
+      "median_seconds": 0.028223334113135934,
+      "best_seconds": 0.022655625129118562,
+      "worst_seconds": 0.04323633317835629,
+      "runs": [
+        0.022655625129118562,
+        0.028223334113135934,
+        0.04323633317835629
+      ],
+      "row_count": 8,
+      "checksum": "060aaad72845e7404ad9706409f7d1050ca52fcdcb63e39e66a826d6439f4cba",
+      "semantic_checksum": "a045957e5180818de318c1c2dbfb01897e683873ff434c6f73505b4784822e4d",
+      "error": null
+    },
+    {
+      "engine": "grapharrow",
+      "query": "got_visual_death_location",
+      "status": "ok",
+      "median_seconds": 0.03437470807693899,
+      "best_seconds": 0.0341557499486953,
+      "worst_seconds": 0.037764082895591855,
+      "runs": [
+        0.037764082895591855,
+        0.03437470807693899,
+        0.0341557499486953
+      ],
+      "row_count": 50,
+      "checksum": "44e4bdb72a0e46cf38da7faf5b85d6a304bb30db20b3ff486b7414c8921886c1",
+      "semantic_checksum": "422ec6d5708ff925881e646cad29006f359095d4feb63aaa0ff9298a4b221a6c",
+      "error": null
+    },
+    {
+      "engine": "grapharrow",
+      "query": "got_jon_snow_death_locations",
+      "status": "ok",
+      "median_seconds": 0.09197079204022884,
+      "best_seconds": 0.09046241687610745,
+      "worst_seconds": 0.10141087509691715,
+      "runs": [
+        0.09197079204022884,
+        0.09046241687610745,
+        0.10141087509691715
+      ],
+      "row_count": 51,
+      "checksum": "fe7225d81b3e9e2c1dd0721ff6d9054248dc3999b80b01e71d65ee586092ff11",
+      "semantic_checksum": "3fe6918a5631c0f465716bd989070fad85c08f40a122c675a56e16a4d0b84f4b",
+      "error": null
+    },
+    {
+      "engine": "neo4j",
+      "query": "got_schema_labels",
+      "status": "ok",
+      "median_seconds": 0.021854666993021965,
+      "best_seconds": 0.020459125051274896,
+      "worst_seconds": 0.2794389580376446,
+      "runs": [
+        0.020459125051274896,
+        0.021854666993021965,
+        0.2794389580376446
+      ],
+      "row_count": 1,
+      "checksum": "19309b08464d9c979f74aade625d3ca495a203409ccc53e9e64b45f32d30f341",
+      "semantic_checksum": "19309b08464d9c979f74aade625d3ca495a203409ccc53e9e64b45f32d30f341",
+      "error": null
+    },
+    {
+      "engine": "neo4j",
+      "query": "got_schema_relationship_types",
+      "status": "ok",
+      "median_seconds": 0.2317129580769688,
+      "best_seconds": 0.09390695812180638,
+      "worst_seconds": 0.32882816693745553,
+      "runs": [
+        0.2317129580769688,
+        0.09390695812180638,
+        0.32882816693745553
+      ],
+      "row_count": 2,
+      "checksum": "4ef318870d413394deaf4de686519b6b3e0a11128518be5cb5a00755dda04145",
+      "semantic_checksum": "f1b3448e4949677377711e8cb534eb1710797cf64047eb9181d25f94cb310006",
+      "error": null
+    },
+    {
+      "engine": "neo4j",
+      "query": "got_episode_deaths",
+      "status": "ok",
+      "median_seconds": 0.002544041955843568,
+      "best_seconds": 0.0016986671835184097,
+      "worst_seconds": 0.06484837480820715,
+      "runs": [
+        0.0016986671835184097,
+        0.002544041955843568,
+        0.06484837480820715
+      ],
+      "row_count": 0,
+      "checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "semantic_checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "error": null
+    },
+    {
+      "engine": "neo4j",
+      "query": "got_season_deaths",
+      "status": "ok",
+      "median_seconds": 0.002948625013232231,
+      "best_seconds": 0.0021958330180495977,
+      "worst_seconds": 0.018692207988351583,
+      "runs": [
+        0.002948625013232231,
+        0.0021958330180495977,
+        0.018692207988351583
+      ],
+      "row_count": 0,
+      "checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "semantic_checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "error": null
+    },
+    {
+      "engine": "neo4j",
+      "query": "got_location_deaths",
+      "status": "ok",
+      "median_seconds": 0.001625375123694539,
+      "best_seconds": 0.0016014159191399813,
+      "worst_seconds": 0.004726957995444536,
+      "runs": [
+        0.001625375123694539,
+        0.0016014159191399813,
+        0.004726957995444536
+      ],
+      "row_count": 0,
+      "checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "semantic_checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "error": null
+    },
+    {
+      "engine": "neo4j",
+      "query": "got_castle_location_text_filter",
+      "status": "ok",
+      "median_seconds": 0.0030819580424576998,
+      "best_seconds": 0.002836500061675906,
+      "worst_seconds": 0.012050624936819077,
+      "runs": [
+        0.002836500061675906,
+        0.0030819580424576998,
+        0.012050624936819077
+      ],
+      "row_count": 0,
+      "checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "semantic_checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "error": null
+    },
+    {
+      "engine": "neo4j",
+      "query": "got_episode_avg_rating",
+      "status": "ok",
+      "median_seconds": 0.0021605000365525484,
+      "best_seconds": 0.001986374845728278,
+      "worst_seconds": 0.00934441713616252,
+      "runs": [
+        0.0021605000365525484,
+        0.001986374845728278,
+        0.00934441713616252
+      ],
+      "row_count": 0,
+      "checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "semantic_checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "error": null
+    },
+    {
+      "engine": "neo4j",
+      "query": "got_visual_death_location",
+      "status": "ok",
+      "median_seconds": 0.0017463751137256622,
+      "best_seconds": 0.0016180421225726604,
+      "worst_seconds": 0.004630708135664463,
+      "runs": [
+        0.0016180421225726604,
+        0.0017463751137256622,
+        0.004630708135664463
+      ],
+      "row_count": 0,
+      "checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "semantic_checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "error": null
+    },
+    {
+      "engine": "neo4j",
+      "query": "got_jon_snow_death_locations",
+      "status": "ok",
+      "median_seconds": 0.001681624911725521,
+      "best_seconds": 0.0013894999865442514,
+      "worst_seconds": 0.008773916168138385,
+      "runs": [
+        0.001681624911725521,
+        0.0013894999865442514,
+        0.008773916168138385
+      ],
+      "row_count": 0,
+      "checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "semantic_checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "error": null
+    },
+    {
+      "engine": "memgraph",
+      "query": "got_schema_labels",
+      "status": "ok",
+      "median_seconds": 0.0040751248598098755,
+      "best_seconds": 0.003693042090162635,
+      "worst_seconds": 0.004151875153183937,
+      "runs": [
+        0.0040751248598098755,
+        0.003693042090162635,
+        0.004151875153183937
+      ],
+      "row_count": 1,
+      "checksum": "19309b08464d9c979f74aade625d3ca495a203409ccc53e9e64b45f32d30f341",
+      "semantic_checksum": "19309b08464d9c979f74aade625d3ca495a203409ccc53e9e64b45f32d30f341",
+      "error": null
+    },
+    {
+      "engine": "memgraph",
+      "query": "got_schema_relationship_types",
+      "status": "ok",
+      "median_seconds": 0.017717457842081785,
+      "best_seconds": 0.017328625079244375,
+      "worst_seconds": 0.017723041819408536,
+      "runs": [
+        0.017723041819408536,
+        0.017328625079244375,
+        0.017717457842081785
+      ],
+      "row_count": 2,
+      "checksum": "4ef318870d413394deaf4de686519b6b3e0a11128518be5cb5a00755dda04145",
+      "semantic_checksum": "f1b3448e4949677377711e8cb534eb1710797cf64047eb9181d25f94cb310006",
+      "error": null
+    },
+    {
+      "engine": "memgraph",
+      "query": "got_episode_deaths",
+      "status": "ok",
+      "median_seconds": 0.001622708048671484,
+      "best_seconds": 0.0015281250234693289,
+      "worst_seconds": 0.0024615000002086163,
+      "runs": [
+        0.0024615000002086163,
+        0.0015281250234693289,
+        0.001622708048671484
+      ],
+      "row_count": 0,
+      "checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "semantic_checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "error": null
+    },
+    {
+      "engine": "memgraph",
+      "query": "got_season_deaths",
+      "status": "ok",
+      "median_seconds": 0.0019418750889599323,
+      "best_seconds": 0.0014684591442346573,
+      "worst_seconds": 0.0020810000132769346,
+      "runs": [
+        0.0014684591442346573,
+        0.0019418750889599323,
+        0.0020810000132769346
+      ],
+      "row_count": 0,
+      "checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "semantic_checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "error": null
+    },
+    {
+      "engine": "memgraph",
+      "query": "got_location_deaths",
+      "status": "ok",
+      "median_seconds": 0.0019353749230504036,
+      "best_seconds": 0.0012168330140411854,
+      "worst_seconds": 0.0022885410580784082,
+      "runs": [
+        0.0022885410580784082,
+        0.0019353749230504036,
+        0.0012168330140411854
+      ],
+      "row_count": 0,
+      "checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "semantic_checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "error": null
+    },
+    {
+      "engine": "memgraph",
+      "query": "got_castle_location_text_filter",
+      "status": "ok",
+      "median_seconds": 0.0013049580156803131,
+      "best_seconds": 0.0012135000433772802,
+      "worst_seconds": 0.0015943748876452446,
+      "runs": [
+        0.0013049580156803131,
+        0.0012135000433772802,
+        0.0015943748876452446
+      ],
+      "row_count": 0,
+      "checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "semantic_checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "error": null
+    },
+    {
+      "engine": "memgraph",
+      "query": "got_episode_avg_rating",
+      "status": "ok",
+      "median_seconds": 0.0012872919905930758,
+      "best_seconds": 0.0012014159001410007,
+      "worst_seconds": 0.002234916901215911,
+      "runs": [
+        0.0012014159001410007,
+        0.0012872919905930758,
+        0.002234916901215911
+      ],
+      "row_count": 0,
+      "checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "semantic_checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "error": null
+    },
+    {
+      "engine": "memgraph",
+      "query": "got_visual_death_location",
+      "status": "ok",
+      "median_seconds": 0.0016520828939974308,
+      "best_seconds": 0.001644957810640335,
+      "worst_seconds": 0.002360832877457142,
+      "runs": [
+        0.002360832877457142,
+        0.001644957810640335,
+        0.0016520828939974308
+      ],
+      "row_count": 0,
+      "checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "semantic_checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "error": null
+    },
+    {
+      "engine": "memgraph",
+      "query": "got_jon_snow_death_locations",
+      "status": "ok",
+      "median_seconds": 0.0014637911226600409,
+      "best_seconds": 0.0013423750642687082,
+      "worst_seconds": 0.001560125034302473,
+      "runs": [
+        0.0014637911226600409,
+        0.001560125034302473,
+        0.0013423750642687082
+      ],
+      "row_count": 0,
+      "checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "semantic_checksum": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "error": null
+    }
+  ]
+}

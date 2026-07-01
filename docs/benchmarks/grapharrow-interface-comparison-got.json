@@ -1,0 +1,439 @@
+{
+  "database_path": "/tmp/grapharrow-db-D",
+  "repeats": 5,
+  "warmups": 2,
+  "results": [
+    {
+      "interface": "embedded",
+      "query": "got_character_name_projection",
+      "median_seconds": 0.005319209070876241,
+      "best_seconds": 0.005109625170007348,
+      "worst_seconds": 0.005790791008621454,
+      "runs": [
+        0.005790791008621454,
+        0.005257582990452647,
+        0.005319209070876241,
+        0.005109625170007348,
+        0.005423125112429261
+      ],
+      "row_count": 100,
+      "bolt_median_seconds": 0.0068388329818844795
+    },
+    {
+      "interface": "rest_testclient",
+      "query": "got_character_name_projection",
+      "median_seconds": 0.0062715839594602585,
+      "best_seconds": 0.005962915951386094,
+      "worst_seconds": 0.007375124841928482,
+      "runs": [
+        0.007375124841928482,
+        0.006884915987029672,
+        0.0062715839594602585,
+        0.006071500014513731,
+        0.005962915951386094
+      ],
+      "row_count": 100,
+      "bolt_median_seconds": 0.0068388329818844795
+    },
+    {
+      "interface": "mcp_cypher_direct",
+      "query": "got_character_name_projection",
+      "median_seconds": 0.004863458918407559,
+      "best_seconds": 0.0047385001089423895,
+      "worst_seconds": 0.005260874982923269,
+      "runs": [
+        0.004863458918407559,
+        0.0047385001089423895,
+        0.005260874982923269,
+        0.004742583958432078,
+        0.005026290891692042
+      ],
+      "row_count": 100,
+      "bolt_median_seconds": 0.0068388329818844795
+    },
+    {
+      "interface": "embedded",
+      "query": "got_character_name_tolower_contains",
+      "median_seconds": 0.004865833092480898,
+      "best_seconds": 0.004815249936655164,
+      "worst_seconds": 0.005633040796965361,
+      "runs": [
+        0.005207540933042765,
+        0.004815249936655164,
+        0.004865833092480898,
+        0.005633040796965361,
+        0.004822958959266543
+      ],
+      "row_count": 1,
+      "bolt_median_seconds": 0.005296916933730245
+    },
+    {
+      "interface": "rest_testclient",
+      "query": "got_character_name_tolower_contains",
+      "median_seconds": 0.006076582940295339,
+      "best_seconds": 0.005812208168208599,
+      "worst_seconds": 0.006170833017677069,
+      "runs": [
+        0.006076582940295339,
+        0.006111999973654747,
+        0.006170833017677069,
+        0.005812208168208599,
+        0.006051999982446432
+      ],
+      "row_count": 1,
+      "bolt_median_seconds": 0.005296916933730245
+    },
+    {
+      "interface": "mcp_cypher_direct",
+      "query": "got_character_name_tolower_contains",
+      "median_seconds": 0.00562912505120039,
+      "best_seconds": 0.0048111670184880495,
+      "worst_seconds": 0.019978333031758666,
+      "runs": [
+        0.0048111670184880495,
+        0.00543866609223187,
+        0.019978333031758666,
+        0.005743375048041344,
+        0.00562912505120039
+      ],
+      "row_count": 1,
+      "bolt_median_seconds": 0.005296916933730245
+    },
+    {
+      "interface": "embedded",
+      "query": "got_location_deaths",
+      "median_seconds": 0.013071750057861209,
+      "best_seconds": 0.012924624839797616,
+      "worst_seconds": 0.013549499912187457,
+      "runs": [
+        0.012924624839797616,
+        0.01330133294686675,
+        0.013549499912187457,
+        0.013071750057861209,
+        0.013043916784226894
+      ],
+      "row_count": 41,
+      "bolt_median_seconds": 0.013913374859839678
+    },
+    {
+      "interface": "rest_testclient",
+      "query": "got_location_deaths",
+      "median_seconds": 0.014291415922343731,
+      "best_seconds": 0.013981041964143515,
+      "worst_seconds": 0.028045541141182184,
+      "runs": [
+        0.014305166900157928,
+        0.014162125065922737,
+        0.028045541141182184,
+        0.014291415922343731,
+        0.013981041964143515
+      ],
+      "row_count": 41,
+      "bolt_median_seconds": 0.013913374859839678
+    },
+    {
+      "interface": "mcp_cypher_direct",
+      "query": "got_location_deaths",
+      "median_seconds": 0.01297900010831654,
+      "best_seconds": 0.012811374850571156,
+      "worst_seconds": 0.013167333090677857,
+      "runs": [
+        0.01297900010831654,
+        0.013082666089758277,
+        0.012921249959617853,
+        0.013167333090677857,
+        0.012811374850571156
+      ],
+      "row_count": 41,
+      "bolt_median_seconds": 0.013913374859839678
+    },
+    {
+      "interface": "embedded",
+      "query": "got_castle_location_text_filter",
+      "median_seconds": 0.018188833026215434,
+      "best_seconds": 0.013424207922071218,
+      "worst_seconds": 0.026885708095505834,
+      "runs": [
+        0.026885708095505834,
+        0.01885420805774629,
+        0.018188833026215434,
+        0.013639834010973573,
+        0.013424207922071218
+      ],
+      "row_count": 1,
+      "bolt_median_seconds": 0.013843541964888573
+    },
+    {
+      "interface": "rest_testclient",
+      "query": "got_castle_location_text_filter",
+      "median_seconds": 0.01481824996881187,
+      "best_seconds": 0.014658916974440217,
+      "worst_seconds": 0.029190459055826068,
+      "runs": [
+        0.01472683297470212,
+        0.015028875088319182,
+        0.014658916974440217,
+        0.01481824996881187,
+        0.029190459055826068
+      ],
+      "row_count": 1,
+      "bolt_median_seconds": 0.013843541964888573
+    },
+    {
+      "interface": "mcp_cypher_direct",
+      "query": "got_castle_location_text_filter",
+      "median_seconds": 0.01335766608826816,
+      "best_seconds": 0.013216207968071103,
+      "worst_seconds": 0.013649375177919865,
+      "runs": [
+        0.0133669578935951,
+        0.013292457908391953,
+        0.013649375177919865,
+        0.01335766608826816,
+        0.013216207968071103
+      ],
+      "row_count": 1,
+      "bolt_median_seconds": 0.013843541964888573
+    },
+    {
+      "interface": "embedded",
+      "query": "got_killed_method_text_filter_count",
+      "median_seconds": 0.023206958081573248,
+      "best_seconds": 0.022993083111941814,
+      "worst_seconds": 0.03663195786066353,
+      "runs": [
+        0.03663195786066353,
+        0.023263749899342656,
+        0.022993083111941814,
+        0.023206958081573248,
+        0.023067250149324536
+      ],
+      "row_count": 1,
+      "bolt_median_seconds": 0.023815375054255128
+    },
+    {
+      "interface": "rest_testclient",
+      "query": "got_killed_method_text_filter_count",
+      "median_seconds": 0.023842334048822522,
+      "best_seconds": 0.023614125093445182,
+      "worst_seconds": 0.024271916830912232,
+      "runs": [
+        0.024173124926164746,
+        0.023614125093445182,
+        0.024271916830912232,
+        0.023842334048822522,
+        0.02367083285935223
+      ],
+      "row_count": 1,
+      "bolt_median_seconds": 0.023815375054255128
+    },
+    {
+      "interface": "mcp_cypher_direct",
+      "query": "got_killed_method_text_filter_count",
+      "median_seconds": 0.023002957925200462,
+      "best_seconds": 0.02287958306260407,
+      "worst_seconds": 0.023285584058612585,
+      "runs": [
+        0.02311454201117158,
+        0.02287958306260407,
+        0.023002957925200462,
+        0.022985458839684725,
+        0.023285584058612585
+      ],
+      "row_count": 1,
+      "bolt_median_seconds": 0.023815375054255128
+    },
+    {
+      "interface": "embedded",
+      "query": "got_victim_location_two_hop_projection",
+      "median_seconds": 0.01531787496060133,
+      "best_seconds": 0.014850042061880231,
+      "worst_seconds": 0.029237332986667752,
+      "runs": [
+        0.014850042061880231,
+        0.029237332986667752,
+        0.0155133749358356,
+        0.01531787496060133,
+        0.014975666999816895
+      ],
+      "row_count": 100,
+      "bolt_median_seconds": 0.017483833013102412
+    },
+    {
+      "interface": "rest_testclient",
+      "query": "got_victim_location_two_hop_projection",
+      "median_seconds": 0.016261541983112693,
+      "best_seconds": 0.016109124990180135,
+      "worst_seconds": 0.017066209111362696,
+      "runs": [
+        0.016261541983112693,
+        0.016254208981990814,
+        0.016427333001047373,
+        0.017066209111362696,
+        0.016109124990180135
+      ],
+      "row_count": 100,
+      "bolt_median_seconds": 0.017483833013102412
+    },
+    {
+      "interface": "mcp_cypher_direct",
+      "query": "got_victim_location_two_hop_projection",
+      "median_seconds": 0.015241541899740696,
+      "best_seconds": 0.015166624914854765,
+      "worst_seconds": 0.015463167103007436,
+      "runs": [
+        0.015463167103007436,
+        0.015190749894827604,
+        0.01534645794890821,
+        0.015241541899740696,
+        0.015166624914854765
+      ],
+      "row_count": 100,
+      "bolt_median_seconds": 0.017483833013102412
+    },
+    {
+      "interface": "embedded",
+      "query": "got_unwind_parameter_names",
+      "median_seconds": 0.0004802918992936611,
+      "best_seconds": 0.00047320802696049213,
+      "worst_seconds": 0.0005952499341219664,
+      "runs": [
+        0.00047995802015066147,
+        0.00047320802696049213,
+        0.0005952499341219664,
+        0.0004802918992936611,
+        0.0005287909880280495
+      ],
+      "row_count": 5,
+      "bolt_median_seconds": 0.0009328329470008612
+    },
+    {
+      "interface": "rest_testclient",
+      "query": "got_unwind_parameter_names",
+      "median_seconds": 0.001602750038728118,
+      "best_seconds": 0.0015172080602496862,
+      "worst_seconds": 0.0017003749962896109,
+      "runs": [
+        0.001625375123694539,
+        0.001602750038728118,
+        0.0017003749962896109,
+        0.001570583088323474,
+        0.0015172080602496862
+      ],
+      "row_count": 5,
+      "bolt_median_seconds": 0.0009328329470008612
+    },
+    {
+      "interface": "mcp_cypher_direct",
+      "query": "got_unwind_parameter_names",
+      "median_seconds": 0.000483666080981493,
+      "best_seconds": 0.00044175004586577415,
+      "worst_seconds": 0.0008012079633772373,
+      "runs": [
+        0.00044175004586577415,
+        0.0008012079633772373,
+        0.000483666080981493,
+        0.0004706250037997961,
+        0.000527750002220273
+      ],
+      "row_count": 5,
+      "bolt_median_seconds": 0.0009328329470008612
+    },
+    {
+      "interface": "embedded",
+      "query": "got_visual_death_location",
+      "median_seconds": 0.029519665986299515,
+      "best_seconds": 0.029328708071261644,
+      "worst_seconds": 0.029758417047560215,
+      "runs": [
+        0.029328708071261644,
+        0.029643999878317118,
+        0.029758417047560215,
+        0.029398541897535324,
+        0.029519665986299515
+      ],
+      "row_count": 50,
+      "bolt_median_seconds": 0.03157520806416869
+    },
+    {
+      "interface": "rest_testclient",
+      "query": "got_visual_death_location",
+      "median_seconds": 0.0308334999717772,
+      "best_seconds": 0.030192166101187468,
+      "worst_seconds": 0.031357666943222284,
+      "runs": [
+        0.0308334999717772,
+        0.03118170890957117,
+        0.031357666943222284,
+        0.030439625028520823,
+        0.030192166101187468
+      ],
+      "row_count": 50,
+      "bolt_median_seconds": 0.03157520806416869
+    },
+    {
+      "interface": "mcp_cypher_direct",
+      "query": "got_visual_death_location",
+      "median_seconds": 0.02955116587691009,
+      "best_seconds": 0.029100875137373805,
+      "worst_seconds": 0.04326275014318526,
+      "runs": [
+        0.04326275014318526,
+        0.029640834080055356,
+        0.02955116587691009,
+        0.029100875137373805,
+        0.029457916971296072
+      ],
+      "row_count": 50,
+      "bolt_median_seconds": 0.03157520806416869
+    },
+    {
+      "interface": "embedded",
+      "query": "got_jon_snow_death_locations",
+      "median_seconds": 0.0830067079514265,
+      "best_seconds": 0.08032962493598461,
+      "worst_seconds": 0.09670958411879838,
+      "runs": [
+        0.08761820802465081,
+        0.0830067079514265,
+        0.09670958411879838,
+        0.08032962493598461,
+        0.08153508300893009
+      ],
+      "row_count": 51,
+      "bolt_median_seconds": 0.08457762515172362
+    },
+    {
+      "interface": "rest_testclient",
+      "query": "got_jon_snow_death_locations",
+      "median_seconds": 0.08263662504032254,
+      "best_seconds": 0.08205920900218189,
+      "worst_seconds": 0.09651758288964629,
+      "runs": [
+        0.08205920900218189,
+        0.09524370892904699,
+        0.08263662504032254,
+        0.09651758288964629,
+        0.08263225015252829
+      ],
+      "row_count": 51,
+      "bolt_median_seconds": 0.08457762515172362
+    },
+    {
+      "interface": "mcp_cypher_direct",
+      "query": "got_jon_snow_death_locations",
+      "median_seconds": 0.08152904198504984,
+      "best_seconds": 0.08107645902782679,
+      "worst_seconds": 0.09562579193152487,
+      "runs": [
+        0.08107645902782679,
+        0.09562579193152487,
+        0.08119341684505343,
+        0.08152904198504984,
+        0.09551474987529218
+      ],
+      "row_count": 51,
+      "bolt_median_seconds": 0.08457762515172362
+    }
+  ]
+}

@@ -20,7 +20,10 @@ class ExpandPlan:
     input: LogicalPlan
     start_variable: str
     edge_variable: str
+    previous_edge_variables: tuple[str, ...]
+    direction: str
     rel_type: str | None
+    rel_type_alternatives: tuple[str, ...]
     edge_properties: dict[str, object]
     edge_requested_fields: set[str] | None
     end_variable: str
