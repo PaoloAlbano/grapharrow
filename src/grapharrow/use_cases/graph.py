@@ -751,7 +751,7 @@ class GraphStateUseCase:
         nodes: list[NodeRecord],
         edges: list[EdgeRecord],
     ) -> GraphState:
-        """Persist a staged snapshot, publish it atomically, and return the new state."""
+        """Persist a staged snapshot, update the current pointer, and return the new state."""
         if catalog.version != previous_state.catalog.version:
             self._catalog_store.write(catalog)
 

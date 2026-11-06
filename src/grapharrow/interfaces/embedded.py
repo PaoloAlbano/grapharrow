@@ -46,6 +46,7 @@ class Session:
 
     def __enter__(self) -> Session:
         """Allow the embedded session to be used as a context manager by Python callers."""
+        self._ensure_open()
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
@@ -59,9 +60,13 @@ class Session:
         return self._closed
 
     def close(self) -> None:
-        """Mark the session as closed so callers can stop reusing this lightweight handle."""
+        """Close this session. Later operations raise TransactionError."""
 
         self._closed = True
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise TransactionError("Session is closed.")
 
     def query(
         self,
@@ -70,6 +75,7 @@ class Session:
     ) -> QueryResult:
         """Execute one Cypher statement, enforcing read sessions against accidental writes."""
 
+        self._ensure_open()
         if self.mode == "read" and query_requires_write(query):
             raise TransactionError("Write queries require a write transaction.")
         return self.database._app.use_cases.cypher.execute(query, dict(params or {}))
@@ -82,6 +88,7 @@ class Session:
     ) -> dict[str, object]:
         """Create one node through the embedded imperative API and return its Python payload."""
 
+        self._ensure_open()
         if self.mode == "read":
             raise TransactionError("Node creation requires a write transaction.")
         _, node = self.database._app.use_cases.graph.create_node(
@@ -102,6 +109,7 @@ class Session:
     ) -> tuple[dict[str, object], ...]:
         """Create many nodes from supported bulk inputs through the shared bulk-ingest adapter."""
 
+        self._ensure_open()
         if self.mode == "read":
             raise TransactionError("Node creation requires a write transaction.")
 
@@ -129,6 +137,7 @@ class Session:
     ) -> dict[str, object]:
         """Create one relationship between existing node ids through the embedded imperative API."""
 
+        self._ensure_open()
         if self.mode == "read":
             raise TransactionError("Edge creation requires a write transaction.")
         if not isinstance(src, int) or not isinstance(dst, int):
@@ -159,6 +168,7 @@ class Session:
     ) -> tuple[dict[str, object], ...]:
         """Create many relationships from supported bulk inputs, optionally using business keys."""
 
+        self._ensure_open()
         if self.mode == "read":
             raise TransactionError("Edge creation requires a write transaction.")
 

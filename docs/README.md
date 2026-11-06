@@ -8,6 +8,8 @@ All versioned documents, source code and comments are written in English.
 - [ANA HTTP Interface](ana-interface.md): default agent tools, RPC, sessions and compatibility limits.
 - [Interface Comparison](interface-comparison.md): expected and actual graph
   results across Python, REST, Bolt, MCP, ANA and CLI ingestion.
+- [Transactions and Sessions](transactions.md): write visibility, explicit Bolt
+  transactions, embedded session behavior and writer-coordination limits.
 - [Cypher V1](cypher-v1.md): supported query features, execution and limitations.
 - [Query Execution Architecture](query-execution-architecture.md): parsing,
   compilation, planning, storage access and public interfaces.

@@ -1,8 +1,10 @@
 from pathlib import Path
 
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
+import pytest
 
 from grapharrow import Database
+from grapharrow.core.errors import TransactionError
 from grapharrow.domain import CatalogVersion, SnapshotId
 
 
@@ -29,6 +31,31 @@ def test_session_context_manager_closes_session(tmp_path: Path) -> None:
         assert session.closed is False
 
     assert session.closed is True
+
+
+@pytest.mark.parametrize("mode", ["read", "write"])
+@pytest.mark.parametrize(
+    "operation", ["query", "node", "nodes", "edge", "edges", "triple", "enter"]
+)
+def test_closed_session_rejects_operations_before_touching_storage(
+    tmp_path: Path, mode: str, operation: str
+) -> None:
+    database = Database(tmp_path / "closed")
+    session = database.read_transaction() if mode == "read" else database.write_transaction()
+    session.close()
+    session.close()
+    operations = {
+        "query": lambda: session.query("RETURN 1 AS value"),
+        "node": lambda: session.add_node(labels=["Person"]),
+        "nodes": lambda: session.add_nodes_bulk([{"name": "unexpected"}]),
+        "edge": lambda: session.add_edge(src=1, rel_type="KNOWS", dst=2),
+        "edges": lambda: session.add_edges_bulk([]),
+        "triple": lambda: session.add_triple(1, "KNOWS", 2),
+        "enter": lambda: session.__enter__(),
+    }
+    with pytest.raises(TransactionError, match="Session is closed"):
+        operations[operation]()
+    assert not (tmp_path / "closed" / "current_snapshot.json").exists()
 
 
 def test_database_initialize_bootstraps_layout_and_catalog(tmp_path: Path) -> None:
