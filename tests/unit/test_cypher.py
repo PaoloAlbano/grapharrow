@@ -2001,6 +2001,28 @@ def test_optional_match_returns_null_row_when_pattern_has_no_match(tmp_path: Pat
     assert result.rows == ({"n": None},)
 
 
+@pytest.mark.parametrize("disable_planner", [False, True])
+def test_optional_incoming_match_preserves_matches_nulls_and_return_alias_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, disable_planner: bool
+) -> None:
+    monkeypatch.setenv("GRAPHARROW_DISABLE_CYPHER_PLANNER", "1" if disable_planner else "0")
+    database = Database(tmp_path / "optional-incoming")
+    with database.write_transaction() as session:
+        session.query(
+            "CREATE (p:Person {name: 'Alice'})-[:WORKS]->(c:Company {name: 'Acme'}) RETURN p.name"
+        )
+        session.query("CREATE (c:Company {name: 'Empty'}) RETURN c.name")
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (c:Company) OPTIONAL MATCH (c)<-[:WORKS]-(p:Person) "
+            "RETURN c.name AS company, p.name AS person ORDER BY company"
+        )
+    assert result.rows == (
+        {"company": "Acme", "person": "Alice"},
+        {"company": "Empty", "person": None},
+    )
+
+
 def test_optional_match_returns_rows_when_pattern_matches(tmp_path: Path) -> None:
     database = Database(tmp_path / "example-db")
 

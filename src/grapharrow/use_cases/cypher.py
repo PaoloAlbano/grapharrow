@@ -3390,7 +3390,9 @@ def _compile_optional_match_query(
         where_predicate=where_predicate,
         return_items=return_items,
         distinct=distinct,
-        order_by=_compile_order_by(projection_body.oC_Order(), scope=scope),
+        order_by=_compile_order_by(
+            projection_body.oC_Order(), scope=scope, return_items=return_items
+        ),
         skip=_compile_optional_int(projection_body.oC_Skip(), params),
         limit=_compile_optional_int(projection_body.oC_Limit(), params),
     )
@@ -3451,7 +3453,9 @@ def _compile_match_optional_query(
         optional_where_predicate=optional_where_predicate,
         return_items=return_items,
         distinct=distinct,
-        order_by=_compile_order_by(projection_body.oC_Order(), scope=final_scope),
+        order_by=_compile_order_by(
+            projection_body.oC_Order(), scope=final_scope, return_items=return_items
+        ),
         skip=_compile_optional_int(projection_body.oC_Skip(), params),
         limit=_compile_optional_int(projection_body.oC_Limit(), params),
     )
@@ -5812,6 +5816,12 @@ def _optional_match_single_path_from_input_table(
     current_variable = pattern.start.variable
     for index, step in enumerate(pattern.steps):
         edge_prefix = step.variable or f"_edge_{index}"
+        current_edge_key = (
+            f"{edge_prefix}.source" if step.direction == "outgoing" else f"{edge_prefix}.target"
+        )
+        next_edge_key = (
+            f"{edge_prefix}.target" if step.direction == "outgoing" else f"{edge_prefix}.source"
+        )
         edge_requested_fields = _requested_fields_for_edge_step(required_fields, edge_prefix, step)
         edge_table = _edge_match_table(
             edges,
@@ -5829,7 +5839,7 @@ def _optional_match_single_path_from_input_table(
             matched,
             edge_table,
             left_keys=_binding_column_name(current_variable, _NODE_ID_FIELD),
-            right_keys=f"{edge_prefix}.source",
+            right_keys=current_edge_key,
         )
         matched = _ensure_edge_source_column(
             matched,
@@ -5847,7 +5857,7 @@ def _optional_match_single_path_from_input_table(
         matched = tabular.left_join(
             matched,
             next_nodes,
-            left_keys=f"{edge_prefix}.target",
+            left_keys=next_edge_key,
             right_keys=_binding_column_name(step.node.variable, "__join_id"),
         )
         current_variable = step.node.variable

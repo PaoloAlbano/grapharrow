@@ -304,6 +304,10 @@ def create_rest_app(
     app.include_router(public_router)
     app.include_router(protected_router)
     _register_error_handlers(app)
+    if container.settings.ana_enabled:
+        from grapharrow.interfaces.ana import install_ana_routes
+
+        install_ana_routes(app, container)
     return app
 
 

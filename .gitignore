@@ -6,6 +6,11 @@ __pycache__/
 # Virtual environments
 .venv/
 .env/
+.env
+.env.*
+!.env.example
+/.local-secrets/
+/.benchmarks/
 
 # Tooling caches
 .pytest_cache/
@@ -22,13 +27,16 @@ dist/
 .DS_Store
 .vscode/
 
-docs/*
-!docs/agent-first-graph-database.md
-!docs/benchmarks/
-!docs/benchmarks/cypher-engine-benchmark-current-with-multimatch.json
-!docs/benchmarks/cypher-engine-benchmark-current-with-multimatch.md
+# Local research experiments and results
+/investigation/
+
+# Private plans, roadmaps, internal ADRs and working drafts
+/.local-notes/
+
 scripts/*
 !scripts/benchmark_bolt_engines.py
 !scripts/benchmark_cypher_engine.py
 !scripts/benchmark_tabular_json.py
+!scripts/benchmark_backends.py
+!scripts/benchmark_ana_sessions.py
 tests/integration/.runtime/

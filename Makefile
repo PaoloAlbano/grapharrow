@@ -2,7 +2,7 @@ UV ?= uv
 PACKAGE ?= grapharrow
 SRC_DIRS := src tests
 
-.PHONY: help sync sync-dev lint format format-check typecheck test test-unit test-integration test-integration-live coverage check cli-help server-help bolt-help db-init db-show-catalog db-show-snapshot db-verify db-recover-dry-run db-bulk-add-nodes db-bulk-add-edges db-import-nodes db-import-edges serve bolt benchmark-backends benchmark-cypher-engine benchmark-tabular-json clean
+.PHONY: help sync sync-dev lint format format-check typecheck test test-unit test-interface-comparison test-integration test-integration-live coverage check cli-help server-help bolt-help db-init db-show-catalog db-show-snapshot db-verify db-recover-dry-run db-bulk-add-nodes db-bulk-add-edges db-import-nodes db-import-edges serve bolt benchmark-backends benchmark-cypher-engine benchmark-tabular-json benchmark-ana-sessions clean
 
 help:
 	@printf "Available targets:\n"
@@ -35,6 +35,8 @@ help:
 	@printf "  make benchmark-backends          Run the backend comparison benchmark\n"
 	@printf "  make benchmark-cypher-engine     Run the Cypher engine benchmark\n"
 	@printf "  make benchmark-tabular-json      Compare json vs orjson tabular serialization\n"
+	@printf "  make benchmark-ana-sessions      Measure ANA session latency and memory\n"
+	@printf "  make test-interface-comparison   Compare public graph interfaces and save results\n"
 	@printf "  make clean        Remove local tool caches\n"
 
 sync:
@@ -57,6 +59,9 @@ typecheck:
 
 test:
 	$(UV) run pytest
+
+test-interface-comparison:
+	GRAPHARROW_INTERFACE_COMPARISON_REPORT=/tmp/grapharrow-interface-comparison.json $(UV) run pytest -v tests/integration/test_interface_comparison.py --junitxml=/tmp/grapharrow-interface-comparison.xml
 
 test-unit:
 	$(UV) run pytest tests/unit
@@ -119,6 +124,9 @@ benchmark-backends:
 
 benchmark-cypher-engine:
 	$(UV) run python scripts/benchmark_cypher_engine.py
+
+benchmark-ana-sessions:
+	$(UV) run python scripts/benchmark_ana_sessions.py
 
 benchmark-tabular-json:
 	$(UV) run python scripts/benchmark_tabular_json.py

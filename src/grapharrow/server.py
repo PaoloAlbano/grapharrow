@@ -32,6 +32,12 @@ def main() -> int:
     )
     parser.add_argument("--host", default=None, help="Server host override.")
     parser.add_argument("--port", type=int, default=None, help="Server port override.")
+    parser.add_argument(
+        "--ana",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable the ANA HTTP interface (enabled by default).",
+    )
     args = parser.parse_args()
 
     settings = GraphArrowSettings()
@@ -39,7 +45,12 @@ def main() -> int:
     if database_path is None:
         parser.error("A database path is required via --path or GRAPHARROW_DATABASE_PATH.")
 
-    resolved_settings = settings.model_copy(update={"database_path": database_path})
+    resolved_settings = settings.model_copy(
+        update={
+            "database_path": database_path,
+            "ana_enabled": settings.ana_enabled if args.ana is None else args.ana,
+        }
+    )
     app = create_rest_app(database_path, settings=resolved_settings)
     uvicorn.run(
         app,
