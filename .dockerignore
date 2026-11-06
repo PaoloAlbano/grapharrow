@@ -11,3 +11,9 @@ build
 dist
 docs/adr
 TODO.md
+.local-notes
+investigation
+.local-secrets
+.benchmarks
+.env
+.env.*

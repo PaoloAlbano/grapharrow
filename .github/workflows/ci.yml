@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Install locked dependencies
+        run: uv sync --locked --python ${{ matrix.python-version }}
+      - name: Lint
+        run: uv run --frozen ruff check .
+      - name: Check formatting
+        run: uv run --frozen ruff format --check .
+      - name: Check types
+        run: uv run --frozen mypy src
+      - name: Test local backends and interfaces
+        run: uv run --frozen pytest -m "not live_storage"
+      - name: Build distributions
+        run: uv build --no-sources
+      - name: Verify archives and install the wheel in a clean environment
+        run: uv run --frozen python .github/check_distribution.py dist
+
+  ana-reference:
+    runs-on: ubuntu-24.04
+    services:
+      neo4j:
+        image: neo4j:2026.05.0
+        env:
+          NEO4J_AUTH: neo4j/grapharrow-reference-ci
+          NEO4J_server_memory_heap_initial__size: 256m
+          NEO4J_server_memory_heap_max__size: 512m
+          NEO4J_server_memory_pagecache_size: 128m
+        ports:
+          - 7687:7687
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p grapharrow-reference-ci 'RETURN 1'"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 12
+          --health-start-period 30s
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Install locked dependencies
+        run: uv sync --locked
+      - name: Start the ANA reference HTTP service
+        run: |
+          key="$(openssl rand -hex 32)"
+          echo "::add-mask::$key"
+          auth="$(mktemp "${RUNNER_TEMP}/ana-clients.XXXXXX")"
+          printf '{"clients":[{"id":"grapharrow-ci","api_key":"%s"}]}' "$key" > "$auth"
+          chmod 644 "$auth"
+          docker run -d --name grapharrow-ana-reference --network host \
+            -e NEO4J_URI=bolt://127.0.0.1:7687 \
+            -e NEO4J_USER=neo4j \
+            -e NEO4J_PASSWORD=grapharrow-reference-ci \
+            -e NEO4J_DATABASE=neo4j \
+            -e ANA_NEO4J_IDENTITY_MODE=transaction \
+            -e ANA_AUTH_FILE=/run/ana/clients.json \
+            -v "$auth:/run/ana/clients.json:ro" \
+            ghcr.io/paoloalbano/agent-native-graph@sha256:d2b04b3a1c9d0e923c764f12f37ce6467d4b6b0566e5375a26c0553efe44ca73
+          printf 'GRAPHARROW_TEST_ANA_KEY=%s\n' "$key" >> "$GITHUB_ENV"
+          curl --fail --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:8080/health
+      - name: Compare ANA workflows over HTTP
+        env:
+          GRAPHARROW_TEST_NEO4J_URI: bolt://localhost:7687
+          GRAPHARROW_TEST_NEO4J_PASSWORD: grapharrow-reference-ci
+          GRAPHARROW_TEST_ANA_URL: http://127.0.0.1:8080
+        run: uv run --frozen pytest tests/integration/test_ana_reference.py
+      - name: Stop the reference service
+        if: always()
+        run: docker rm -f grapharrow-ana-reference

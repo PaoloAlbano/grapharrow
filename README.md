@@ -1,13 +1,16 @@
 <div align="center">
 
-  <img src="images/grapharrow_1.jpg" alt="Pipol" width="128" />
+  <img src="images/grapharrow_1.jpg" alt="GraphArrow" width="128" />
 
 # GraphArrow
 </div>
 
 GraphArrow is an embedded property graph database built in Python on top of PyArrow and Parquet.
 
-The project is currently in the bootstrap phase. The repository already contains the main architecture decisions, and this skeleton provides the initial package layout, tooling configuration, and test scaffolding to start implementation.
+The project is experimental: query APIs and storage formats are evolving.
+It provides embedded Python, REST, Bolt and ANA agent interfaces. See the
+[supported Cypher subset](docs/cypher-v1.md) and
+[ANA compatibility limits](docs/ana-interface.md) before integrating it.
 
 ## Goals
 
@@ -20,7 +23,8 @@ The project is currently in the bootstrap phase. The repository already contains
 
 ## Getting Started
 
-This project uses `uv` as the package manager.
+This project requires Python 3.11+, Git and `uv`. ANA is installed with the
+standard dependencies; no optional extra or adjacent checkout is needed.
 
 ### Install dependencies
 
@@ -111,9 +115,11 @@ The server can also read the database path from `GRAPHARROW_DATABASE_PATH`.
 
 If `GRAPHARROW_SERVER_AUTH_TOKEN` is configured, every REST endpoint except `/v1/health`
 requires `Authorization: Bearer <token>`.
+REST permits unauthenticated writes and administration when that setting is absent.
+ANA credentials are configured separately and do not protect REST routes; see the
+[ANA authentication guide](docs/ana-interface.md#start-the-server).
 
-`grapharrow-bolt` is currently a wiring/bootstrap entrypoint only. It already resolves settings
-and database paths, and now exposes a minimal Bolt 4.4 server with basic auth,
+`grapharrow-bolt` exposes a Bolt 4.4 compatibility server with basic auth,
 `RUN`, `PULL`, `DISCARD`, `RESET`, and `GOODBYE`.
 
 Run it locally with:
@@ -280,8 +286,6 @@ export GRAPHARROW_TEST_REAL_AZURE_URI="az://grapharrow-tests/bootstrap"
 make test-integration-live
 ```
 
-See [Real Object Storage Testing](docs/real-object-storage-testing.md) for details.
-
 GraphArrow can now also build cloud filesystem clients from explicit settings when needed.
 The most relevant environment variables are:
 
@@ -331,7 +335,7 @@ docker build -t grapharrow:runtime .
 Run the runtime image:
 
 ```bash
-docker run --rm -p 8000:8000 -e GRAPHARROW_DATABASE_PATH=/data/grapharrow grapharrow:runtime
+docker run --rm -p 127.0.0.1:8000:8000 -e GRAPHARROW_DATABASE_PATH=/data/grapharrow grapharrow:runtime
 ```
 
 Build the development image:
@@ -342,13 +346,14 @@ docker build -f Dockerfile.dev -t grapharrow:dev .
 
 ## Current Status
 
-The codebase already includes a working bootstrap slice:
+The codebase includes:
 
 - project metadata and tooling are configured with `uv`;
 - the package is wired through `app.py` with settings, adapters, repositories, and use cases;
 - the embedded API is exposed through the interfaces layer while keeping stable top-level imports;
 - a minimal CLI exists for database bootstrap, inspection, verification, and recovery;
 - a sync REST server exists for health checks, query execution, graph writes, and admin operations;
+- the ANA interface is included and enabled by default, with authenticated workflows and native graph tools;
 - a minimal Bolt 4.4 server is available for direct Neo4j-driver access on the bootstrap path;
 - immutable catalog and snapshot metadata are persisted through staged manifests and a current snapshot pointer;
 - Parquet-backed node, edge, node-label, and adjacency storage is implemented for the bootstrap engine;
@@ -360,9 +365,12 @@ The most important remaining work is deeper Cypher coverage, richer Bolt semanti
 more production-ready object-storage behavior, and continued cleanup/documentation of
 the compiler/executor internals.
 
-## Architecture Notes
+## Documentation
 
-- [Query Execution Architecture](docs/query-execution-architecture.md) explains how the vendored `openCypher` grammar compiles into GraphArrow's internal query model, how that model maps to PyArrow-backed execution, and how the same engine is surfaced through the embedded API, REST, and Bolt.
-- [Cypher Engine Roadmap](docs/cypher-engine-roadmap.md) captures the plan to make the engine more Arrow-native, identifies the query classes where GraphArrow may outperform Neo4j, and outlines the path toward a true compiler, executor, and optimizer stack.
-- [MCP Interface Design](docs/mcp-interface-design.md) defines the first MCP surface for LLM-oriented usage, starting from `query`, `write_cypher`, `get_schema`, `get_constraints`, and `get_indexes`.
-- [Real Object Storage Testing](docs/real-object-storage-testing.md) describes the optional live integration suite for real S3, GCS, and Azure backends.
+See the [documentation index](docs/README.md) for technical guides and benchmark
+reports. Versioned documentation, source code and comments are written in English.
+
+The [ANA HTTP interface](docs/ana-interface.md) provides agent tool calls and
+workflow sessions on `grapharrow-server` by default. Configure `ANA_AUTH_FILE`
+to access its catalog/data endpoints, or use `--no-ana` to disable the interface.
+Its tool catalog and runtime limits are documented.

@@ -1,0 +1,3443 @@
+[
+  {
+    "name": "schema_overview",
+    "group": "schema",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Discover available labels, node counts and relationships before choosing a traversal.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "schema_search",
+    "group": "schema",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Find labels, relationships and properties relevant to a search term.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "schema_describe_label",
+    "group": "schema",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Inspect one label, its properties and its incoming and outgoing relationships.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "label"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "schema_describe_relationship",
+    "group": "schema",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Inspect endpoint labels, direction and properties for a relationship type.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "relationship_type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "relationship_type"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "inspect_paths",
+    "group": "schema",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Find candidate schema paths from a source label to an optional target label.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "source_label": {
+          "type": "string"
+        },
+        "target_label": {
+          "type": "string"
+        },
+        "relationship_type": {
+          "type": "string"
+        },
+        "max_hops": {
+          "type": "integer"
+        },
+        "limit": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "source_label"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "summarize_handle",
+    "group": "inspection",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Inspect the type, bindings, columns and a small sample of a workflow handle.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "sample_limit": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "from"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "handle_recap",
+    "group": "inspection",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Review how a workflow handle was produced.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "from"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "repair_empty_result",
+    "group": "inspection",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Suggest ways to diagnose an empty result or a failed tool call.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "tool": {
+          "type": "string"
+        },
+        "args": {
+          "type": "object"
+        },
+        "error": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool",
+        "args"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "entity_resolve",
+    "group": "lookup",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Resolve text to graph nodes using names, aliases and optional context.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "as": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "context_terms": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allow_large": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "label",
+        "text"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "node_search",
+    "group": "lookup",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Find nodes of a label with an exact property value.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "value": {},
+        "property": {
+          "type": "string"
+        },
+        "as": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "label",
+        "value"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "node_scan",
+    "group": "lookup",
+    "status": "experimental",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Scan a bounded number of nodes of one label.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "as": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "allow_large": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "label"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "count_nodes",
+    "group": "lookup",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Count all nodes of one label.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "alias": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "label"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "count_handle",
+    "group": "answers",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Count rows or distinct entities in a workflow result.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "var": {
+          "type": "string"
+        },
+        "distinct": {
+          "type": "boolean"
+        },
+        "alias": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "from"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "expand",
+    "group": "traversal",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Follow one relationship from entities in an existing handle.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "relationship_type": {
+          "type": "string"
+        },
+        "direction": {
+          "type": "string",
+          "enum": [
+            "out",
+            "in",
+            "both"
+          ]
+        },
+        "target_label": {
+          "type": "string"
+        },
+        "as": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "page_size": {
+          "type": "integer"
+        },
+        "max_input_rows": {
+          "type": "integer"
+        },
+        "allow_large": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "from",
+        "source",
+        "relationship_type",
+        "direction",
+        "target_label"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "expand_aggregate",
+    "group": "traversal",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Traverse one relationship and aggregate the resulting bindings.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "relationship_type": {
+          "type": "string"
+        },
+        "direction": {
+          "type": "string",
+          "enum": [
+            "out",
+            "in"
+          ]
+        },
+        "target_label": {
+          "type": "string"
+        },
+        "as": {
+          "type": "string"
+        },
+        "group_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "required": [
+              "var",
+              "property",
+              "alias"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "metrics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "op": {
+                "type": "string",
+                "enum": [
+                  "count",
+                  "count_distinct",
+                  "max",
+                  "min",
+                  "sum",
+                  "avg"
+                ]
+              },
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "var",
+              "alias"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "limit": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "from",
+        "source",
+        "relationship_type",
+        "direction",
+        "target_label"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "optional_expand_count",
+    "group": "optional",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Count related nodes while retaining source entities that have no matches.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "relationship_type": {
+          "type": "string"
+        },
+        "direction": {
+          "type": "string",
+          "enum": [
+            "out",
+            "in"
+          ]
+        },
+        "target_label": {
+          "type": "string"
+        },
+        "as": {
+          "type": "string"
+        },
+        "group_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "required": [
+              "var",
+              "property",
+              "alias"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "alias": {
+          "type": "string"
+        },
+        "distinct": {
+          "type": "boolean"
+        },
+        "limit": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "from",
+        "source",
+        "relationship_type",
+        "direction",
+        "target_label"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "optional_count_by_pattern",
+    "group": "optional",
+    "status": "experimental",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Evaluate a source pattern and count optional relationships from its bindings.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "start_label": {
+          "type": "string"
+        },
+        "hops": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "relationship_type": {
+                "type": "string"
+              },
+              "direction": {
+                "type": "string",
+                "enum": [
+                  "out",
+                  "in"
+                ]
+              },
+              "target_label": {
+                "type": "string"
+              },
+              "as": {
+                "type": "string"
+              },
+              "rel_as": {
+                "type": "string"
+              },
+              "relationship_filters": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "property": {
+                      "type": "string"
+                    },
+                    "op": {
+                      "type": "string",
+                      "enum": [
+                        "eq",
+                        "neq",
+                        "gt",
+                        "gte",
+                        "lt",
+                        "lte",
+                        "gte_or_null",
+                        "lte_or_null",
+                        "is_null",
+                        "is_not_null"
+                      ]
+                    },
+                    "value": {},
+                    "value_type": {
+                      "type": "string",
+                      "enum": [
+                        "date",
+                        "string",
+                        "integer"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "property",
+                    "op"
+                  ],
+                  "additionalProperties": true
+                }
+              }
+            },
+            "required": [
+              "relationship_type",
+              "direction",
+              "target_label",
+              "as"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "optional_relationship": {
+          "type": "object",
+          "properties": {
+            "relationship_type": {
+              "type": "string"
+            },
+            "direction": {
+              "type": "string",
+              "enum": [
+                "out",
+                "in"
+              ]
+            },
+            "target_label": {
+              "type": "string"
+            },
+            "as": {
+              "type": "string"
+            },
+            "rel_as": {
+              "type": "string"
+            },
+            "relationship_filters": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "property": {
+                    "type": "string"
+                  },
+                  "op": {
+                    "type": "string",
+                    "enum": [
+                      "eq",
+                      "neq",
+                      "gt",
+                      "gte",
+                      "lt",
+                      "lte",
+                      "gte_or_null",
+                      "lte_or_null",
+                      "is_null",
+                      "is_not_null"
+                    ]
+                  },
+                  "value": {},
+                  "value_type": {
+                    "type": "string",
+                    "enum": [
+                      "date",
+                      "string",
+                      "integer"
+                    ]
+                  }
+                },
+                "required": [
+                  "property",
+                  "op"
+                ],
+                "additionalProperties": true
+              }
+            }
+          },
+          "required": [
+            "relationship_type",
+            "direction",
+            "target_label"
+          ],
+          "additionalProperties": true
+        },
+        "group_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "required": [
+              "var",
+              "property",
+              "alias"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "start_as": {
+          "type": "string"
+        },
+        "from": {
+          "type": "string"
+        },
+        "filters": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "op": {
+                "type": "string",
+                "enum": [
+                  "eq",
+                  "neq",
+                  "gt",
+                  "gte",
+                  "gte_or_null",
+                  "lt",
+                  "lte",
+                  "lte_or_null",
+                  "contains",
+                  "not_contains",
+                  "in",
+                  "not_in",
+                  "is_null",
+                  "is_not_null"
+                ]
+              },
+              "value": {},
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "required": [
+              "var",
+              "property",
+              "op"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "select": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              },
+              "explode": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "var",
+              "property"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "metrics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "op": {
+                "type": "string",
+                "enum": [
+                  "count",
+                  "count_distinct",
+                  "max",
+                  "min",
+                  "sum",
+                  "avg"
+                ]
+              },
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "var",
+              "alias"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "order_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "field": {
+                "type": "string"
+              },
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "direction": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ]
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "distinct": {
+          "type": "boolean"
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "max_input_rows": {
+          "type": "integer"
+        },
+        "allow_large": {
+          "type": "boolean"
+        },
+        "source": {
+          "type": "string"
+        },
+        "alias": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_label",
+        "hops",
+        "optional_relationship",
+        "group_by"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "relationship_query",
+    "group": "traversal",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Query a single relationship between two labels with filters and projections.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "source_label": {
+          "type": "string"
+        },
+        "relationship_type": {
+          "type": "string"
+        },
+        "target_label": {
+          "type": "string"
+        },
+        "source_as": {
+          "type": "string"
+        },
+        "direction": {
+          "type": "string",
+          "enum": [
+            "out",
+            "in"
+          ]
+        },
+        "rel_as": {
+          "type": "string"
+        },
+        "target_as": {
+          "type": "string"
+        },
+        "filters": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "op": {
+                "type": "string",
+                "enum": [
+                  "eq",
+                  "neq",
+                  "gt",
+                  "gte",
+                  "gte_or_null",
+                  "lt",
+                  "lte",
+                  "lte_or_null",
+                  "contains",
+                  "not_contains",
+                  "in",
+                  "not_in",
+                  "is_null",
+                  "is_not_null"
+                ]
+              },
+              "value": {},
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "required": [
+              "var",
+              "property",
+              "op"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "select": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              },
+              "explode": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "var",
+              "property"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "group_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "required": [
+              "var",
+              "property",
+              "alias"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "metrics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "op": {
+                "type": "string",
+                "enum": [
+                  "count",
+                  "count_distinct",
+                  "max",
+                  "min",
+                  "sum",
+                  "avg"
+                ]
+              },
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "var",
+              "alias"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "order_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "field": {
+                "type": "string"
+              },
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "direction": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ]
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "distinct": {
+          "type": "boolean"
+        },
+        "limit": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "source_label",
+        "relationship_type",
+        "target_label"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "multi_hop_query",
+    "group": "traversal",
+    "status": "experimental",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Follow a sequence of typed relationships and return or aggregate bindings.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "start_label": {
+          "type": "string"
+        },
+        "hops": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "relationship_type": {
+                "type": "string"
+              },
+              "direction": {
+                "type": "string",
+                "enum": [
+                  "out",
+                  "in"
+                ]
+              },
+              "target_label": {
+                "type": "string"
+              },
+              "as": {
+                "type": "string"
+              },
+              "rel_as": {
+                "type": "string"
+              },
+              "relationship_filters": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "property": {
+                      "type": "string"
+                    },
+                    "op": {
+                      "type": "string",
+                      "enum": [
+                        "eq",
+                        "neq",
+                        "gt",
+                        "gte",
+                        "lt",
+                        "lte",
+                        "gte_or_null",
+                        "lte_or_null",
+                        "is_null",
+                        "is_not_null"
+                      ]
+                    },
+                    "value": {},
+                    "value_type": {
+                      "type": "string",
+                      "enum": [
+                        "date",
+                        "string",
+                        "integer"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "property",
+                    "op"
+                  ],
+                  "additionalProperties": true
+                }
+              }
+            },
+            "required": [
+              "relationship_type",
+              "direction",
+              "target_label",
+              "as"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "start_as": {
+          "type": "string"
+        },
+        "from": {
+          "type": "string"
+        },
+        "filters": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "op": {
+                "type": "string",
+                "enum": [
+                  "eq",
+                  "neq",
+                  "gt",
+                  "gte",
+                  "gte_or_null",
+                  "lt",
+                  "lte",
+                  "lte_or_null",
+                  "contains",
+                  "not_contains",
+                  "in",
+                  "not_in",
+                  "is_null",
+                  "is_not_null"
+                ]
+              },
+              "value": {},
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "required": [
+              "var",
+              "property",
+              "op"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "select": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              },
+              "explode": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "var",
+              "property"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "group_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "required": [
+              "var",
+              "property",
+              "alias"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "metrics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "op": {
+                "type": "string",
+                "enum": [
+                  "count",
+                  "count_distinct",
+                  "max",
+                  "min",
+                  "sum",
+                  "avg"
+                ]
+              },
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "var",
+              "alias"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "order_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "field": {
+                "type": "string"
+              },
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "direction": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ]
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "distinct": {
+          "type": "boolean"
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "max_input_rows": {
+          "type": "integer"
+        },
+        "allow_large": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "start_label",
+        "hops"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "pattern_query",
+    "group": "traversal",
+    "status": "experimental",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Match a bounded graph pattern with filters, selection, grouping and ordering.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "start_label": {
+          "type": "string"
+        },
+        "hops": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "relationship_type": {
+                "type": "string"
+              },
+              "direction": {
+                "type": "string",
+                "enum": [
+                  "out",
+                  "in"
+                ]
+              },
+              "target_label": {
+                "type": "string"
+              },
+              "as": {
+                "type": "string"
+              },
+              "rel_as": {
+                "type": "string"
+              },
+              "relationship_filters": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "property": {
+                      "type": "string"
+                    },
+                    "op": {
+                      "type": "string",
+                      "enum": [
+                        "eq",
+                        "neq",
+                        "gt",
+                        "gte",
+                        "lt",
+                        "lte",
+                        "gte_or_null",
+                        "lte_or_null",
+                        "is_null",
+                        "is_not_null"
+                      ]
+                    },
+                    "value": {},
+                    "value_type": {
+                      "type": "string",
+                      "enum": [
+                        "date",
+                        "string",
+                        "integer"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "property",
+                    "op"
+                  ],
+                  "additionalProperties": true
+                }
+              }
+            },
+            "required": [
+              "relationship_type",
+              "direction",
+              "target_label",
+              "as"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "start_as": {
+          "type": "string"
+        },
+        "from": {
+          "type": "string"
+        },
+        "filters": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "op": {
+                "type": "string",
+                "enum": [
+                  "eq",
+                  "neq",
+                  "gt",
+                  "gte",
+                  "gte_or_null",
+                  "lt",
+                  "lte",
+                  "lte_or_null",
+                  "contains",
+                  "not_contains",
+                  "in",
+                  "not_in",
+                  "is_null",
+                  "is_not_null"
+                ]
+              },
+              "value": {},
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "required": [
+              "var",
+              "property",
+              "op"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "select": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              },
+              "explode": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "var",
+              "property"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "group_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "required": [
+              "var",
+              "property",
+              "alias"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "metrics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "op": {
+                "type": "string",
+                "enum": [
+                  "count",
+                  "count_distinct",
+                  "max",
+                  "min",
+                  "sum",
+                  "avg"
+                ]
+              },
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "var",
+              "alias"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "order_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "field": {
+                "type": "string"
+              },
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "direction": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ]
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "distinct": {
+          "type": "boolean"
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "max_input_rows": {
+          "type": "integer"
+        },
+        "allow_large": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "start_label",
+        "hops"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "top_entities_by_property",
+    "group": "answers",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Rank entities by one property and return a limited result.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "start_label": {
+          "type": "string"
+        },
+        "property": {
+          "type": "string"
+        },
+        "start_as": {
+          "type": "string"
+        },
+        "from": {
+          "type": "string"
+        },
+        "filters": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "op": {
+                "type": "string",
+                "enum": [
+                  "eq",
+                  "neq",
+                  "gt",
+                  "gte",
+                  "gte_or_null",
+                  "lt",
+                  "lte",
+                  "lte_or_null",
+                  "contains",
+                  "not_contains",
+                  "in",
+                  "not_in",
+                  "is_null",
+                  "is_not_null"
+                ]
+              },
+              "value": {},
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "required": [
+              "var",
+              "property",
+              "op"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "hops": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "relationship_type": {
+                "type": "string"
+              },
+              "direction": {
+                "type": "string",
+                "enum": [
+                  "out",
+                  "in"
+                ]
+              },
+              "target_label": {
+                "type": "string"
+              },
+              "as": {
+                "type": "string"
+              },
+              "rel_as": {
+                "type": "string"
+              },
+              "relationship_filters": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "property": {
+                      "type": "string"
+                    },
+                    "op": {
+                      "type": "string",
+                      "enum": [
+                        "eq",
+                        "neq",
+                        "gt",
+                        "gte",
+                        "lt",
+                        "lte",
+                        "gte_or_null",
+                        "lte_or_null",
+                        "is_null",
+                        "is_not_null"
+                      ]
+                    },
+                    "value": {},
+                    "value_type": {
+                      "type": "string",
+                      "enum": [
+                        "date",
+                        "string",
+                        "integer"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "property",
+                    "op"
+                  ],
+                  "additionalProperties": true
+                }
+              }
+            },
+            "required": [
+              "relationship_type",
+              "direction",
+              "target_label",
+              "as"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "select": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              },
+              "explode": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "var",
+              "property"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "group_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "required": [
+              "var",
+              "property",
+              "alias"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "metrics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "op": {
+                "type": "string",
+                "enum": [
+                  "count",
+                  "count_distinct",
+                  "max",
+                  "min",
+                  "sum",
+                  "avg"
+                ]
+              },
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "var",
+              "alias"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "order_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "field": {
+                "type": "string"
+              },
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "direction": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ]
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "distinct": {
+          "type": "boolean"
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "max_input_rows": {
+          "type": "integer"
+        },
+        "allow_large": {
+          "type": "boolean"
+        },
+        "target": {
+          "type": "string"
+        },
+        "order": {
+          "type": "string",
+          "enum": [
+            "asc",
+            "desc"
+          ]
+        },
+        "include_property": {
+          "type": "boolean"
+        },
+        "name_alias": {
+          "type": "string"
+        },
+        "property_alias": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "start_label",
+        "property"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "constraint_query",
+    "group": "traversal",
+    "status": "experimental",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Find entities that satisfy independent one-hop constraints.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "find": {
+          "type": "object",
+          "properties": {
+            "label": {
+              "type": "string"
+            },
+            "as": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "label"
+          ],
+          "additionalProperties": true
+        },
+        "where": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "relationship_type": {
+                "type": "string"
+              },
+              "direction": {
+                "type": "string",
+                "enum": [
+                  "out",
+                  "in"
+                ]
+              },
+              "target_label": {
+                "type": "string"
+              },
+              "target_as": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "op": {
+                "type": "string",
+                "enum": [
+                  "eq",
+                  "neq",
+                  "gt",
+                  "gte",
+                  "gte_or_null",
+                  "lt",
+                  "lte",
+                  "lte_or_null",
+                  "contains",
+                  "not_contains",
+                  "in",
+                  "not_in",
+                  "is_null",
+                  "is_not_null"
+                ]
+              },
+              "value": {},
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "required": [
+              "relationship_type",
+              "direction",
+              "target_label"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "return_mode": {
+          "type": "string",
+          "enum": [
+            "entities",
+            "names",
+            "count"
+          ]
+        },
+        "return_property": {
+          "type": "string"
+        },
+        "return_properties": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "property"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "alias": {
+          "type": "string"
+        },
+        "distinct": {
+          "type": "boolean"
+        },
+        "order_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "field": {
+                "type": "string"
+              },
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "direction": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ]
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "offset": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "find",
+        "where"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "entity_set_operation",
+    "group": "composition",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Union, intersect or subtract sets of entities from multiple handles.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "op": {
+          "type": "string",
+          "enum": [
+            "union",
+            "intersect",
+            "difference"
+          ]
+        },
+        "operands": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "handle": {
+                "type": "string"
+              },
+              "var": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "handle",
+              "var"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "as": {
+          "type": "string"
+        },
+        "max_operand_rows": {
+          "type": "integer"
+        },
+        "allow_large": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "op",
+        "operands"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "filter",
+    "group": "composition",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Keep rows whose bound entity satisfies a property predicate.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "var": {
+          "type": "string"
+        },
+        "property": {
+          "type": "string"
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "eq",
+            "neq",
+            "gt",
+            "gte",
+            "gte_or_null",
+            "lt",
+            "lte",
+            "lte_or_null",
+            "contains",
+            "not_contains",
+            "in",
+            "not_in",
+            "is_null",
+            "is_not_null"
+          ]
+        },
+        "value": {},
+        "value_type": {
+          "type": "string",
+          "enum": [
+            "date",
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "required": [
+        "from",
+        "var",
+        "property",
+        "op"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "filter_same_node",
+    "group": "composition",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Keep rows where two bindings refer to the same node.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "left_var": {
+          "type": "string"
+        },
+        "right_var": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "left_var",
+        "right_var"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "join_handles",
+    "group": "composition",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Join handles on entity identity or select matching or nonmatching left rows.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "left": {
+          "type": "string"
+        },
+        "right": {
+          "type": "string"
+        },
+        "left_var": {
+          "type": "string"
+        },
+        "right_var": {
+          "type": "string"
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "inner",
+            "left_semi",
+            "left_anti"
+          ]
+        },
+        "as": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "left",
+        "right"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "same_target_role_intersection",
+    "group": "composition",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Find entity pairs connected by all required relationship roles.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "source_label": {
+          "type": "string"
+        },
+        "target_label": {
+          "type": "string"
+        },
+        "relationships": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "relationship_type": {
+                "type": "string"
+              },
+              "direction": {
+                "type": "string",
+                "enum": [
+                  "in",
+                  "out"
+                ]
+              }
+            },
+            "required": [
+              "relationship_type",
+              "direction"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "source_as": {
+          "type": "string"
+        },
+        "target_as": {
+          "type": "string"
+        },
+        "filters": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "op": {
+                "type": "string",
+                "enum": [
+                  "eq",
+                  "neq",
+                  "gt",
+                  "gte",
+                  "gte_or_null",
+                  "lt",
+                  "lte",
+                  "lte_or_null",
+                  "contains",
+                  "not_contains",
+                  "in",
+                  "not_in",
+                  "is_null",
+                  "is_not_null"
+                ]
+              },
+              "value": {},
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "required": [
+              "var",
+              "property",
+              "op"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "select": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              },
+              "explode": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "var",
+              "property"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "order_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "field": {
+                "type": "string"
+              },
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "direction": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ]
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "distinct": {
+          "type": "boolean"
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "keep_entities": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "source_label",
+        "target_label",
+        "relationships"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "shared_role_aggregate",
+    "group": "composition",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Find peers through shared entities and optionally aggregate their bindings.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "seed_label": {
+          "type": "string"
+        },
+        "shared_label": {
+          "type": "string"
+        },
+        "seed_relationship": {
+          "type": "object",
+          "properties": {
+            "relationship_type": {
+              "type": "string"
+            },
+            "direction": {
+              "type": "string",
+              "enum": [
+                "out",
+                "in"
+              ]
+            }
+          },
+          "required": [
+            "relationship_type",
+            "direction"
+          ],
+          "additionalProperties": true
+        },
+        "peer_label": {
+          "type": "string"
+        },
+        "peer_relationship": {
+          "type": "object",
+          "properties": {
+            "relationship_type": {
+              "type": "string"
+            },
+            "direction": {
+              "type": "string",
+              "enum": [
+                "out",
+                "in"
+              ]
+            }
+          },
+          "required": [
+            "relationship_type",
+            "direction"
+          ],
+          "additionalProperties": true
+        },
+        "seed_as": {
+          "type": "string"
+        },
+        "seed_from": {
+          "type": "string"
+        },
+        "seed_filters": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "op": {
+                "type": "string",
+                "enum": [
+                  "eq",
+                  "neq",
+                  "gt",
+                  "gte",
+                  "gte_or_null",
+                  "lt",
+                  "lte",
+                  "lte_or_null",
+                  "contains",
+                  "not_contains",
+                  "in",
+                  "not_in",
+                  "is_null",
+                  "is_not_null"
+                ]
+              },
+              "value": {},
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "required": [
+              "var",
+              "property",
+              "op"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "shared_as": {
+          "type": "string"
+        },
+        "peer_as": {
+          "type": "string"
+        },
+        "peer_filters": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "op": {
+                "type": "string",
+                "enum": [
+                  "eq",
+                  "neq",
+                  "gt",
+                  "gte",
+                  "gte_or_null",
+                  "lt",
+                  "lte",
+                  "lte_or_null",
+                  "contains",
+                  "not_contains",
+                  "in",
+                  "not_in",
+                  "is_null",
+                  "is_not_null"
+                ]
+              },
+              "value": {},
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "required": [
+              "var",
+              "property",
+              "op"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "shared_filters": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "op": {
+                "type": "string",
+                "enum": [
+                  "eq",
+                  "neq",
+                  "gt",
+                  "gte",
+                  "gte_or_null",
+                  "lt",
+                  "lte",
+                  "lte_or_null",
+                  "contains",
+                  "not_contains",
+                  "in",
+                  "not_in",
+                  "is_null",
+                  "is_not_null"
+                ]
+              },
+              "value": {},
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "required": [
+              "var",
+              "property",
+              "op"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "exclude_seed": {
+          "type": "boolean"
+        },
+        "select": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              },
+              "explode": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "var",
+              "property"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "group_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "required": [
+              "var",
+              "property",
+              "alias"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "metrics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "op": {
+                "type": "string",
+                "enum": [
+                  "count",
+                  "count_distinct",
+                  "max",
+                  "min",
+                  "sum",
+                  "avg"
+                ]
+              },
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "var",
+              "alias"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "order_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "field": {
+                "type": "string"
+              },
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "direction": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ]
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "distinct": {
+          "type": "boolean"
+        },
+        "limit": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "seed_label",
+        "shared_label",
+        "seed_relationship",
+        "peer_label",
+        "peer_relationship"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "combine",
+    "group": "composition",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Apply a set operation to two workflow handles.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "left": {
+          "type": "string"
+        },
+        "right": {
+          "type": "string"
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "union",
+            "intersect",
+            "difference"
+          ]
+        },
+        "left_var": {
+          "type": "string"
+        },
+        "right_var": {
+          "type": "string"
+        },
+        "as": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "left",
+        "right",
+        "op"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "group_handle",
+    "group": "answers",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Group rows and compute counts or numeric aggregates.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "group_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "required": [
+              "var",
+              "property",
+              "alias"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "metrics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "op": {
+                "type": "string",
+                "enum": [
+                  "count",
+                  "count_distinct",
+                  "max",
+                  "min",
+                  "sum",
+                  "avg"
+                ]
+              },
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "var",
+              "alias"
+            ],
+            "additionalProperties": true
+          }
+        }
+      },
+      "required": [
+        "from"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "project",
+    "group": "answers",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Select and order result columns, optionally retaining entity bindings or expanding lists.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "select": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              },
+              "explode": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "var",
+              "property"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "distinct": {
+          "type": "boolean"
+        },
+        "distinct_scope": {
+          "type": "string",
+          "enum": [
+            "entity",
+            "scalar"
+          ]
+        },
+        "order_by": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "field": {
+                "type": "string"
+              },
+              "var": {
+                "type": "string"
+              },
+              "property": {
+                "type": "string"
+              },
+              "direction": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ]
+              },
+              "value_type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "string",
+                  "integer"
+                ]
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "keep_entities": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "from",
+        "select"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "compare",
+    "group": "answers",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Compare a property of one entity with the same property of another entity.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "left": {
+          "type": "string"
+        },
+        "left_var": {
+          "type": "string"
+        },
+        "right": {
+          "type": "string"
+        },
+        "right_var": {
+          "type": "string"
+        },
+        "property": {
+          "type": "string"
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "argmax",
+            "argmin",
+            "eq",
+            "neq",
+            "gt",
+            "gte",
+            "lt",
+            "lte",
+            "difference"
+          ]
+        },
+        "alias": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "left",
+        "left_var",
+        "right",
+        "right_var",
+        "property",
+        "op"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "fetch",
+    "group": "answers",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Return a page of result rows. Follow next_offset until it is null.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "offset": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "from"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "draft_tool_plan",
+    "group": "inspection",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "opt-in",
+    "description": "Suggest a short sequence of tools for investigating a graph question.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "question": {
+          "type": "string"
+        },
+        "max_steps": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "question"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "validate_tool_plan",
+    "group": "inspection",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "opt-in",
+    "description": "Check whether a proposed sequence uses known tools and valid arguments.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "plan": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "question": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "plan"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "value_search",
+    "group": "lookup",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Search a property for matching values or the entities that own them.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "property": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "match_mode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "exact",
+            "iexact",
+            "contains",
+            "prefix",
+            "suffix"
+          ]
+        },
+        "as": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "keep_entities": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "label",
+        "property",
+        "text"
+      ],
+      "additionalProperties": true
+    }
+  },
+  {
+    "name": "scalar_compute",
+    "group": "answers",
+    "status": "core",
+    "profile": "readonly",
+    "availability": "default",
+    "description": "Compute an arithmetic result from cells in existing table handles.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "inputs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "handle": {
+                "type": "string"
+              },
+              "column": {
+                "type": "string"
+              },
+              "alias": {
+                "type": "string"
+              },
+              "row_index": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "handle",
+              "column"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "difference",
+            "absolute_difference",
+            "sum",
+            "min",
+            "max",
+            "avg",
+            "argmin",
+            "argmax"
+          ]
+        },
+        "alias": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "inputs",
+        "op"
+      ],
+      "additionalProperties": true
+    }
+  }
+]
