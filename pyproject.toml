@@ -30,6 +30,10 @@ grapharrow-server = "grapharrow.server:main"
 grapharrow-bolt = "grapharrow.interfaces.bolt:main"
 
 [dependency-groups]
+benchmark = [
+  "duckdb",
+  "polars",
+]
 dev = [
   "antlr4-tools>=0.2.2",
   "httpx>=0.28.1",
@@ -49,7 +53,7 @@ include = [
   "/src", "/tests", "/vendor", "/docs", "/pyproject.toml", "/uv.lock",
   "/README.md", "/LICENSE", "/THIRD_PARTY_NOTICES.md", "/CONTRIBUTING.md",
   "/Makefile", "/Dockerfile", "/Dockerfile.dev", "/.dockerignore",
-  "/scripts/benchmark_bolt_engines.py",
+  "/scripts/benchmark_backends.py", "/scripts/benchmark_bolt_engines.py",
   "/scripts/benchmark_cypher_engine.py", "/scripts/benchmark_tabular_json.py",
   "/scripts/benchmark_ana_sessions.py",
 ]

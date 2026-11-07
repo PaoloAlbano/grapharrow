@@ -120,7 +120,7 @@ bolt:
 	$(UV) run grapharrow-bolt --path $(DB) --host $(or $(HOST),127.0.0.1) --port $(or $(PORT),18080) $(BOLT_ARGS)
 
 benchmark-backends:
-	$(UV) run python scripts/benchmark_backends.py
+	$(UV) run --locked --group benchmark python scripts/benchmark_backends.py
 
 benchmark-cypher-engine:
 	$(UV) run python scripts/benchmark_cypher_engine.py

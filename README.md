@@ -71,15 +71,13 @@ make check
 ```bash
 make benchmark-backends
 # or
-uv run python scripts/benchmark_backends.py
+uv run --locked --group benchmark python scripts/benchmark_backends.py
 ```
 
-The benchmark writes:
-
-- `docs/benchmarks/data-access-backend-benchmark.md`
-- `docs/benchmarks/data-access-backend-benchmark.json`
-
-It compares `pyarrow`, `pandas`, `polars`, and `duckdb` on a shared synthetic Parquet dataset.
+The runner compares PyArrow, pandas, Polars and DuckDB on shared synthetic
+Parquet data. New reports go to `.benchmarks/backend_evaluation/`.
+See the [backend evaluation](docs/data-access-backend-evaluation.md) for the
+historical measurements and a smaller smoke run.
 
 ### Explore the CLI
 
