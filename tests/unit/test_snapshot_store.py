@@ -1,4 +1,9 @@
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
+
+import pytest
 
 from grapharrow.core import DatabaseLayout
 from grapharrow.domain import CatalogVersion, DatasetFile, SnapshotId, SnapshotManifest
@@ -62,3 +67,64 @@ def test_snapshot_store_can_stage_a_candidate_manifest(tmp_path: Path) -> None:
     assert isinstance(staged_manifest_path, Path)
     assert staged_manifest_path.exists()
     assert staged_manifest_path.name == "manifest.json"
+
+
+@pytest.mark.parametrize("operation", ["fsync", "replace"])
+def test_failed_local_pointer_publication_preserves_the_current_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    layout = DatabaseLayout(root=tmp_path / "example-db")
+    store = SnapshotRepository(layout)
+    original = store.bootstrap(catalog_version=CatalogVersion(1))
+    original_pointer = store.load_current_pointer()
+    candidate = SnapshotManifest.empty(snapshot_id=SnapshotId(2), catalog_version=CatalogVersion(1))
+
+    def fail(*args: object) -> None:
+        raise OSError(f"Simulated {operation} failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, operation, fail)
+        with pytest.raises(OSError, match=f"Simulated {operation} failure"):
+            store.publish(candidate, staged_relative_path="staged/tx-000002")
+
+    assert store.load_current_pointer() == original_pointer
+    assert store.load_manifest() == original
+    assert not list((tmp_path / "example-db").glob(".current_snapshot.json.*.tmp"))
+
+    published = store.publish(candidate)
+    assert store.load_current_pointer() == published
+    assert store.load_manifest() == candidate
+
+
+@pytest.mark.parametrize("use_file_uri", [False, True])
+def test_reader_sees_complete_pointer_before_and_after_local_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, use_file_uri: bool
+) -> None:
+    root = tmp_path / "example-db"
+    layout = DatabaseLayout(root=root.as_uri() if use_file_uri else root)
+    writer, reader = SnapshotRepository(layout), SnapshotRepository(layout)
+    original = writer.bootstrap(catalog_version=CatalogVersion(1))
+    candidate = SnapshotManifest.empty(snapshot_id=SnapshotId(2), catalog_version=CatalogVersion(1))
+    ready = Event()
+    allow_replace = Event()
+    replace = os.replace
+
+    def pause_before_replace(source: Path, destination: Path) -> None:
+        ready.set()
+        if not allow_replace.wait(timeout=10):
+            raise TimeoutError("Test reader did not release snapshot replacement")
+        replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", pause_before_replace)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(writer.publish, candidate)
+        try:
+            assert ready.wait(timeout=10), "Writer did not reach pointer replacement"
+            assert reader.load_current_pointer().snapshot_id == original.snapshot_id
+            assert reader.load_manifest() == original
+        finally:
+            allow_replace.set()
+        published = pending.result(timeout=10)
+
+    assert reader.load_current_pointer() == published
+    assert reader.load_manifest() == candidate

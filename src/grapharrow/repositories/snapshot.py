@@ -94,7 +94,7 @@ class SnapshotRepository:
             commit_txid=manifest.commit_txid,
             created_at=manifest.created_at,
         )
-        self._filesystem.write_json(
+        self._filesystem.replace_json(
             self._layout.current_snapshot_path,
             self._serialize_pointer(pointer),
         )

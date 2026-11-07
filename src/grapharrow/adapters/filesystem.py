@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
+from contextlib import suppress
 from pathlib import Path
+from stat import S_IMODE
 from typing import cast
 from urllib.parse import ParseResult, urlparse
+from uuid import uuid4
 
 import pyarrow.fs as pafs  # type: ignore[import-untyped]
 
@@ -180,6 +184,32 @@ class FileSystemAdapter:
         """Encode and write JSON to ``location``."""
 
         self.write_text(location, json.dumps(payload, indent=2, sort_keys=True))
+
+    def replace_json(self, location: str | Path, payload: object) -> None:
+        """Replace a native local JSON file atomically, or use the normal remote write."""
+
+        filesystem, normalized_path = self.resolve(location)
+        if not isinstance(filesystem, pafs.LocalFileSystem):
+            self.write_json(location, payload)
+            return
+
+        content = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        destination = Path(normalized_path).resolve()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
+        handle = temporary.open("xb")
+        try:
+            with handle:
+                with suppress(FileNotFoundError):
+                    temporary.chmod(S_IMODE(destination.stat().st_mode))
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+        except BaseException:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
+            raise
 
     def copy_file(self, source: str | Path, destination: str | Path) -> None:
         """Copy a file between locations handled by ``pyarrow.fs``."""

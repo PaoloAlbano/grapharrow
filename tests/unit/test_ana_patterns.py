@@ -9,6 +9,28 @@ from neo4j import GraphDatabase
 
 from grapharrow.app import build_application
 from grapharrow.use_cases.ana import GraphArrowAgentBackend
+from grapharrow.use_cases.ana_patterns import edges_for_sources
+
+
+@pytest.mark.parametrize(
+    ("columns", "from_one", "from_two"),
+    [
+        (("src_id",), [5, 7, 9], [2]),
+        (("dst_id",), [5, 2], [7, 9]),
+        (("src_id", "dst_id"), [5, 7, 2, 9], [7, 2, 9]),
+    ],
+)
+def test_edges_for_sources_preserves_parallel_edges_and_input_order(
+    columns: tuple[str, ...], from_one: list[int], from_two: list[int]
+) -> None:
+    edges = pa.table({"edge_id": [5, 7, 2, 9], "src_id": [1, 1, 2, 1], "dst_id": [1, 2, 1, 2]})
+    sources = [1, 3, 2, 1, 3, 2, 3, 1]
+    expected = [from_one, [], from_two, from_one, [], from_two, [], from_one]
+    for batch, max_batch_rows in ((False, None), (True, None), (True, 1)):
+        groups = edges_for_sources(
+            edges, sources, columns, batch=batch, max_batch_rows=max_batch_rows
+        )
+        assert [[edge["edge_id"] for edge in group] for group in groups] == expected
 
 
 @pytest.fixture
@@ -83,6 +105,191 @@ def result_rows(graph: Any, tool: str, args: dict[str, Any]) -> list[list[Any]]:
     assert page["returned_count"] == len(page["rows"])
     assert not any(key.startswith("internal-") for key in graph._handle_store.handles)
     return list(page["rows"])
+
+
+@pytest.fixture
+def large_pattern_graph(tmp_path: Path) -> Any:
+    app = build_application(tmp_path / "streaming-pattern")
+    _, start = app.use_cases.graph.create_node(labels=("Start",), properties={"name": "start"})
+    _, devices = app.use_cases.graph.create_nodes_bulk(
+        table=pa.table(
+            {"name": [f"device-{i:03d}" for i in range(300)], "score": list(range(300))}
+        ),
+        default_labels=("Device",),
+    )
+    _, groups = app.use_cases.graph.create_nodes_bulk(
+        table=pa.table({"name": [f"group-{i}" for i in range(3)]}), default_labels=("Group",)
+    )
+    edges = [
+        {"src_id": start.node_id, "dst_id": device.node_id, "rel_type": "LINK"}
+        for device in devices
+        for _ in range(2)
+    ]
+    edges += [
+        {"src_id": device.node_id, "dst_id": groups[i % 3].node_id, "rel_type": "IN_GROUP"}
+        for i, device in enumerate(devices)
+    ]
+    app.use_cases.graph.create_edges_bulk(table=pa.Table.from_pylist(edges))
+    with GraphArrowAgentBackend(app) as backend:
+        yield backend
+
+
+@pytest.mark.parametrize("distinct", [False, True])
+def test_streamed_entity_pattern_materializes_limit_and_keeps_full_union(
+    large_pattern_graph: Any, monkeypatch: pytest.MonkeyPatch, distinct: bool
+) -> None:
+    graph = large_pattern_graph
+    materialized = []
+    original_node = graph._node
+
+    def node(node_id: int) -> Any:
+        materialized.append(node_id)
+        return original_node(node_id)
+
+    monkeypatch.setattr(graph, "_node", node)
+    result = graph.call(
+        "multi_hop_query",
+        {
+            "start_label": "Start",
+            "start_as": "s",
+            "hops": [{"relationship_type": "LINK", "target_label": "Device", "as": "d"}],
+            "limit": 10,
+            "distinct": distinct,
+        },
+    )
+    assert len(materialized) == 10
+    expected = [f"device-{i if distinct else i // 2:03d}" for i in range(10)]
+    assert graph.call("fetch", {"from": result["handle"]})["rows"] == [[name] for name in expected]
+    combined = graph.call(
+        "entity_set_operation",
+        {
+            "op": "union",
+            "operands": [{"handle": result["handle"], "var": "d"}] * 2,
+            "as": "d",
+        },
+    )
+    assert result_rows(
+        graph, "count_handle", {"from": combined["handle"], "var": "d", "distinct": True}
+    ) == [[300]]
+
+
+@pytest.mark.parametrize("distinct", [False, True])
+def test_streamed_pattern_filters_and_sorts_before_limit(
+    large_pattern_graph: Any, distinct: bool
+) -> None:
+    rows = result_rows(
+        large_pattern_graph,
+        "multi_hop_query",
+        {
+            "start_label": "Start",
+            "hops": [{"relationship_type": "LINK", "target_label": "Device", "as": "d"}],
+            "filters": [{"var": "d", "property": "score", "op": "gte", "value": 298}],
+            "select": [{"var": "d", "property": "name", "alias": "name"}],
+            "order_by": [{"var": "d", "property": "score", "direction": "desc"}],
+            "distinct": distinct,
+            "limit": 3,
+        },
+    )
+    assert rows == (
+        [["device-299"], ["device-298"]]
+        if distinct
+        else [["device-299"], ["device-299"], ["device-298"]]
+    )
+
+
+def test_streamed_multi_hop_pattern_aggregates_complete_groups(large_pattern_graph: Any) -> None:
+    rows = result_rows(
+        large_pattern_graph,
+        "multi_hop_query",
+        {
+            "start_label": "Start",
+            "hops": [
+                {"relationship_type": "LINK", "target_label": "Device", "as": "d"},
+                {"relationship_type": "IN_GROUP", "target_label": "Group", "as": "g"},
+            ],
+            "group_by": [{"var": "g", "property": "name", "alias": "group"}],
+            "metrics": [
+                {"var": "d", "op": "count", "alias": "count"},
+                {"var": "d", "property": "score", "op": "avg", "alias": "average"},
+            ],
+            "order_by": [{"field": "group"}],
+            "limit": 2,
+        },
+    )
+    assert rows == [["group-0", 200, 148.5], ["group-1", 200, 149.5]]
+
+
+@pytest.mark.parametrize(
+    ("filters", "first_group", "distinct_groups"),
+    [
+        ([{"var": "d", "property": "score", "op": "gte", "value": 298}], "group-1", 2),
+        ([{"var": "g", "property": "name", "value": "group-2"}], "group-2", 1),
+    ],
+)
+def test_streamed_multi_hop_union_counts_filtered_branch(
+    large_pattern_graph: Any,
+    filters: list[dict[str, Any]],
+    first_group: str,
+    distinct_groups: int,
+) -> None:
+    graph = large_pattern_graph
+    result = graph.call(
+        "multi_hop_query",
+        {
+            "start_label": "Start",
+            "hops": [
+                {"relationship_type": "LINK", "target_label": "Device", "as": "d"},
+                {"relationship_type": "IN_GROUP", "target_label": "Group", "as": "g"},
+            ],
+            "filters": filters,
+            "limit": 1,
+        },
+    )
+    assert graph.call("fetch", {"from": result["handle"]})["rows"] == [[first_group]]
+    combined = graph.call(
+        "entity_set_operation",
+        {
+            "op": "union",
+            "operands": [{"handle": result["handle"], "var": "g"}] * 2,
+            "as": "g",
+        },
+    )
+    assert result_rows(
+        graph, "count_handle", {"from": combined["handle"], "var": "g", "distinct": True}
+    ) == [[distinct_groups]]
+
+
+def test_streamed_pattern_preserves_bound_nodes_and_relationship_uniqueness(
+    large_pattern_graph: Any,
+) -> None:
+    args = {
+        "start_label": "Start",
+        "start_as": "s",
+        "hops": [
+            {"relationship_type": "LINK", "target_label": "Device", "as": "d", "rel_as": "link"},
+            {"relationship_type": "LINK", "target_label": "Start", "as": "s", "direction": "in"},
+        ],
+        "limit": 10,
+    }
+    assert result_rows(large_pattern_graph, "multi_hop_query", args) == [["start"]] * 10
+    args["hops"][1]["rel_as"] = "link"
+    assert result_rows(large_pattern_graph, "multi_hop_query", args) == []
+
+
+def test_streamed_pattern_validates_later_hops_with_empty_input(large_pattern_graph: Any) -> None:
+    with pytest.raises(ValueError, match="Unknown relationship_type"):
+        large_pattern_graph.call(
+            "multi_hop_query",
+            {
+                "start_label": "Start",
+                "filters": [{"var": "start", "property": "name", "value": "missing"}],
+                "hops": [
+                    {"relationship_type": "LINK", "target_label": "Device"},
+                    {"relationship_type": "UNKNOWN", "target_label": "Group"},
+                ],
+                "limit": 1,
+            },
+        )
 
 
 def test_entity_resolution_context_aliases_and_best_match_class(graph: Any) -> None:

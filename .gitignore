@@ -39,4 +39,5 @@ scripts/*
 !scripts/benchmark_tabular_json.py
 !scripts/benchmark_backends.py
 !scripts/benchmark_ana_sessions.py
+!scripts/benchmark_ana_traversals.py
 tests/integration/.runtime/

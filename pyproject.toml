@@ -56,6 +56,7 @@ include = [
   "/scripts/benchmark_backends.py", "/scripts/benchmark_bolt_engines.py",
   "/scripts/benchmark_cypher_engine.py", "/scripts/benchmark_tabular_json.py",
   "/scripts/benchmark_ana_sessions.py",
+  "/scripts/benchmark_ana_traversals.py",
 ]
 
 [tool.pytest.ini_options]

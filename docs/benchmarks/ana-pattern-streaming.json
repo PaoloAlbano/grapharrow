@@ -1,0 +1,1901 @@
+{
+  "date": "2026-11-07",
+  "experiments": {
+    "initial_hub_and_control": {
+      "baseline": {
+        "python": "3.12.11",
+        "platform": "macOS-27.2-arm64-arm-64bit",
+        "pyarrow": "23.0.1",
+        "degree": 20000,
+        "repeats": 21,
+        "warmups": 2,
+        "runs": [
+          {
+            "sessions": [
+              {
+                "latency_ms": [
+                  400.289334,
+                  352.847625,
+                  230.433042,
+                  265.954,
+                  258.396542,
+                  228.897375,
+                  290.518791,
+                  366.262208,
+                  248.7935,
+                  262.501167,
+                  238.162917,
+                  260.635708,
+                  277.9615,
+                  319.217875,
+                  264.49475,
+                  302.631208,
+                  303.571542,
+                  255.7175,
+                  321.363834,
+                  466.238292,
+                  263.071375
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27043656,
+                  "snapshot_bytes": 8167838
+                }
+              }
+            ],
+            "wall_ms": 6679.99224999221,
+            "setup_high_water_rss_bytes": 171917312,
+            "high_water_rss_bytes": 211075072,
+            "budget_after_close_bytes": 0,
+            "case": "hub_pattern_limit_10",
+            "concurrency": 1,
+            "setup_usage": [
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171922,
+                "snapshot_bytes": 8167838
+              }
+            ],
+            "rss_baseline_bytes": 155140096,
+            "sampled_peak_rss_bytes": 210550784,
+            "sampled_rss_growth_bytes": 55410688,
+            "rss_sample_count": 331,
+            "rss_sample_interval_median_ms": 17.762500006938353,
+            "latency_median_ms": 265.954,
+            "latency_p95_ms": 400.289334
+          },
+          {
+            "sessions": [
+              {
+                "latency_ms": [
+                  1272.602417,
+                  1470.908959,
+                  1487.250792,
+                  1256.142375,
+                  940.053542,
+                  980.712208,
+                  904.412792,
+                  1320.657791,
+                  962.252416,
+                  1378.738875,
+                  1358.497459,
+                  1364.345125,
+                  1282.888667,
+                  1337.603458,
+                  921.588083,
+                  1604.651417,
+                  1462.025209,
+                  1674.887875,
+                  1235.627708,
+                  1287.482333,
+                  1439.461833
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27042120,
+                  "snapshot_bytes": 8167838
+                }
+              },
+              {
+                "latency_ms": [
+                  1137.756208,
+                  1404.652792,
+                  1353.058459,
+                  1413.910375,
+                  1271.261417,
+                  1543.236959,
+                  1170.6825,
+                  1376.369292,
+                  1320.163417,
+                  824.945792,
+                  1419.203625,
+                  754.717875,
+                  1394.074958,
+                  1175.719167,
+                  1113.601542,
+                  1639.099625,
+                  1467.67975,
+                  1580.7455,
+                  1408.256,
+                  1197.162833,
+                  1442.76075
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27042136,
+                  "snapshot_bytes": 8167838
+                }
+              },
+              {
+                "latency_ms": [
+                  893.208583,
+                  1338.545375,
+                  1505.131375,
+                  1205.138875,
+                  1047.69775,
+                  1491.882334,
+                  1106.305208,
+                  599.440834,
+                  1269.904875,
+                  1341.595708,
+                  1515.987708,
+                  1213.368333,
+                  1281.741666,
+                  1332.585459,
+                  1307.53075,
+                  1263.381875,
+                  1282.058208,
+                  1526.919792,
+                  1372.406375,
+                  1216.481792,
+                  1436.236375
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27042160,
+                  "snapshot_bytes": 8167838
+                }
+              },
+              {
+                "latency_ms": [
+                  1260.023042,
+                  1501.379459,
+                  1465.567209,
+                  1410.478083,
+                  1292.975792,
+                  1384.330542,
+                  1109.302792,
+                  1264.411708,
+                  1323.788875,
+                  1382.29375,
+                  1528.773334,
+                  1376.818667,
+                  1306.928208,
+                  1334.0335,
+                  937.941167,
+                  1432.994542,
+                  1292.131042,
+                  1192.884,
+                  1394.990125,
+                  790.70375,
+                  1453.425542
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27042072,
+                  "snapshot_bytes": 8167838
+                }
+              }
+            ],
+            "wall_ms": 32893.266083003255,
+            "setup_high_water_rss_bytes": 210518016,
+            "high_water_rss_bytes": 443121664,
+            "budget_after_close_bytes": 0,
+            "case": "hub_pattern_limit_10",
+            "concurrency": 4,
+            "setup_usage": [
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171922,
+                "snapshot_bytes": 8167838
+              },
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171906,
+                "snapshot_bytes": 8167838
+              },
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171890,
+                "snapshot_bytes": 8167838
+              },
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171874,
+                "snapshot_bytes": 8167838
+              }
+            ],
+            "rss_baseline_bytes": 194134016,
+            "sampled_peak_rss_bytes": 443056128,
+            "sampled_rss_growth_bytes": 248922112,
+            "rss_sample_count": 1469,
+            "rss_sample_interval_median_ms": 18.11012500547804,
+            "latency_median_ms": 1328.187167,
+            "latency_p95_ms": 1543.236959
+          },
+          {
+            "sessions": [
+              {
+                "latency_ms": [
+                  14.774458,
+                  14.09775,
+                  14.295333,
+                  26.563084,
+                  14.670042,
+                  14.39375,
+                  14.627041,
+                  14.048167,
+                  21.913875,
+                  14.260833,
+                  82.533792,
+                  32.199833,
+                  34.276292,
+                  24.517,
+                  14.392708,
+                  15.720208,
+                  39.233084,
+                  43.092875,
+                  31.672084,
+                  14.231041,
+                  14.60225
+                ],
+                "result_sha256": "c9f2f472ab7f453da8d83d78aa912caf0b813eb2ca539bb7a2928d66c549a74f",
+                "usage": {
+                  "handles": 24,
+                  "rows": 17500,
+                  "bytes": 32593326,
+                  "snapshot_bytes": 8167838
+                }
+              }
+            ],
+            "wall_ms": 579.8446670232806,
+            "setup_high_water_rss_bytes": 168624128,
+            "high_water_rss_bytes": 180502528,
+            "budget_after_close_bytes": 0,
+            "case": "low_degree_250",
+            "concurrency": 1,
+            "setup_usage": [
+              {
+                "handles": 1,
+                "rows": 250,
+                "bytes": 8427610,
+                "snapshot_bytes": 8167838
+              }
+            ],
+            "rss_baseline_bytes": 151027712,
+            "sampled_peak_rss_bytes": 180469760,
+            "sampled_rss_growth_bytes": 29442048,
+            "rss_sample_count": 28,
+            "rss_sample_interval_median_ms": 19.047666501137428,
+            "latency_median_ms": 14.774458,
+            "latency_p95_ms": 43.092875
+          },
+          {
+            "sessions": [
+              {
+                "latency_ms": [
+                  45.540042,
+                  89.0,
+                  37.878084,
+                  53.29475,
+                  118.530542,
+                  125.143292,
+                  15.386708,
+                  62.902291,
+                  86.39375,
+                  111.225583,
+                  93.446916,
+                  57.199416,
+                  115.416708,
+                  84.037,
+                  69.675333,
+                  92.055833,
+                  131.055333,
+                  58.54325,
+                  68.006042,
+                  142.606167,
+                  117.364958
+                ],
+                "result_sha256": "c9f2f472ab7f453da8d83d78aa912caf0b813eb2ca539bb7a2928d66c549a74f",
+                "usage": {
+                  "handles": 24,
+                  "rows": 17500,
+                  "bytes": 32591806,
+                  "snapshot_bytes": 8167838
+                }
+              },
+              {
+                "latency_ms": [
+                  56.061875,
+                  56.03975,
+                  63.856209,
+                  44.300542,
+                  26.988084,
+                  78.903541,
+                  49.565625,
+                  79.464833,
+                  110.310458,
+                  87.113667,
+                  91.377667,
+                  60.461291,
+                  98.687625,
+                  114.6025,
+                  31.855583,
+                  44.683708,
+                  149.851209,
+                  41.90475,
+                  57.892959,
+                  117.952458,
+                  141.530875
+                ],
+                "result_sha256": "c9f2f472ab7f453da8d83d78aa912caf0b813eb2ca539bb7a2928d66c549a74f",
+                "usage": {
+                  "handles": 24,
+                  "rows": 17500,
+                  "bytes": 32591814,
+                  "snapshot_bytes": 8167838
+                }
+              },
+              {
+                "latency_ms": [
+                  31.735125,
+                  79.6285,
+                  39.327917,
+                  48.93475,
+                  117.514584,
+                  81.550875,
+                  53.645416,
+                  76.942,
+                  108.35425,
+                  66.849,
+                  70.480541,
+                  37.374292,
+                  107.567916,
+                  97.302542,
+                  74.5665,
+                  74.715292,
+                  163.694875,
+                  17.342417,
+                  75.514625,
+                  124.912625,
+                  114.007125
+                ],
+                "result_sha256": "c9f2f472ab7f453da8d83d78aa912caf0b813eb2ca539bb7a2928d66c549a74f",
+                "usage": {
+                  "handles": 24,
+                  "rows": 17500,
+                  "bytes": 32591822,
+                  "snapshot_bytes": 8167838
+                }
+              },
+              {
+                "latency_ms": [
+                  54.451209,
+                  81.009916,
+                  60.636083,
+                  62.674416,
+                  122.118542,
+                  83.278291,
+                  33.434209,
+                  86.898458,
+                  106.616792,
+                  108.128916,
+                  63.714291,
+                  61.868375,
+                  106.538791,
+                  105.567,
+                  61.104125,
+                  64.721166,
+                  158.232542,
+                  56.132667,
+                  60.084334,
+                  134.780125,
+                  132.828291
+                ],
+                "result_sha256": "c9f2f472ab7f453da8d83d78aa912caf0b813eb2ca539bb7a2928d66c549a74f",
+                "usage": {
+                  "handles": 24,
+                  "rows": 17500,
+                  "bytes": 32591774,
+                  "snapshot_bytes": 8167838
+                }
+              }
+            ],
+            "wall_ms": 2189.2098750104196,
+            "setup_high_water_rss_bytes": 210911232,
+            "high_water_rss_bytes": 322748416,
+            "budget_after_close_bytes": 0,
+            "case": "low_degree_250",
+            "concurrency": 4,
+            "setup_usage": [
+              {
+                "handles": 1,
+                "rows": 250,
+                "bytes": 8427610,
+                "snapshot_bytes": 8167838
+              },
+              {
+                "handles": 1,
+                "rows": 250,
+                "bytes": 8427602,
+                "snapshot_bytes": 8167838
+              },
+              {
+                "handles": 1,
+                "rows": 250,
+                "bytes": 8427594,
+                "snapshot_bytes": 8167838
+              },
+              {
+                "handles": 1,
+                "rows": 250,
+                "bytes": 8427586,
+                "snapshot_bytes": 8167838
+              }
+            ],
+            "rss_baseline_bytes": 193527808,
+            "sampled_peak_rss_bytes": 322748416,
+            "sampled_rss_growth_bytes": 129220608,
+            "rss_sample_count": 99,
+            "rss_sample_interval_median_ms": 18.54283400462009,
+            "latency_median_ms": 77.9227705,
+            "latency_p95_ms": 141.530875
+          }
+        ],
+        "ana_source_sha256": "dc5ef1e201ecbe3febd8e766bac4bdd452d306637a48c615f76d4c0f22780daf"
+      },
+      "optimized": {
+        "python": "3.12.11",
+        "platform": "macOS-27.2-arm64-arm-64bit",
+        "pyarrow": "23.0.1",
+        "degree": 20000,
+        "repeats": 21,
+        "warmups": 2,
+        "runs": [
+          {
+            "sessions": [
+              {
+                "latency_ms": [
+                  31.577292,
+                  31.011583,
+                  31.662875,
+                  31.014292,
+                  31.386709,
+                  31.608959,
+                  30.818417,
+                  29.5935,
+                  30.122167,
+                  30.60725,
+                  30.204,
+                  30.687375,
+                  30.073916,
+                  30.199041,
+                  29.639042,
+                  31.941875,
+                  30.327708,
+                  30.09375,
+                  29.875375,
+                  30.21775,
+                  30.740542
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27045176,
+                  "snapshot_bytes": 8167838
+                }
+              }
+            ],
+            "wall_ms": 706.31462498568,
+            "setup_high_water_rss_bytes": 170115072,
+            "high_water_rss_bytes": 173326336,
+            "budget_after_close_bytes": 0,
+            "case": "hub_pattern_limit_10",
+            "concurrency": 1,
+            "setup_usage": [
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171922,
+                "snapshot_bytes": 8167838
+              }
+            ],
+            "rss_baseline_bytes": 152518656,
+            "sampled_peak_rss_bytes": 173342720,
+            "sampled_rss_growth_bytes": 20824064,
+            "rss_sample_count": 47,
+            "rss_sample_interval_median_ms": 16.528708016267046,
+            "latency_median_ms": 30.60725,
+            "latency_p95_ms": 31.662875
+          },
+          {
+            "sessions": [
+              {
+                "latency_ms": [
+                  59.344042,
+                  116.212916,
+                  32.066333,
+                  112.017083,
+                  115.258083,
+                  116.523834,
+                  31.455333,
+                  136.132708,
+                  62.715291,
+                  31.34625,
+                  87.243292,
+                  109.138375,
+                  30.500541,
+                  31.501167,
+                  122.431958,
+                  62.100625,
+                  60.417125,
+                  31.008916,
+                  30.750583,
+                  88.3115,
+                  30.892792
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27042152,
+                  "snapshot_bytes": 8167838
+                }
+              },
+              {
+                "latency_ms": [
+                  114.658166,
+                  107.437875,
+                  61.210792,
+                  30.560125,
+                  100.331667,
+                  67.092709,
+                  115.159667,
+                  73.770417,
+                  99.336458,
+                  61.651625,
+                  58.931583,
+                  58.743375,
+                  87.857333,
+                  60.371959,
+                  60.566,
+                  31.74875,
+                  116.395,
+                  88.087458,
+                  65.316917,
+                  30.687917,
+                  118.87125
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27042848,
+                  "snapshot_bytes": 8167838
+                }
+              },
+              {
+                "latency_ms": [
+                  112.021667,
+                  59.217625,
+                  113.646125,
+                  115.441125,
+                  66.023292,
+                  95.121291,
+                  87.200125,
+                  106.59175,
+                  121.395167,
+                  111.63,
+                  31.085458,
+                  114.771459,
+                  115.948959,
+                  116.724917,
+                  93.190875,
+                  121.220083,
+                  89.410458,
+                  115.365666,
+                  115.423167,
+                  116.855541,
+                  97.384333
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27042096,
+                  "snapshot_bytes": 8167838
+                }
+              },
+              {
+                "latency_ms": [
+                  31.027625,
+                  31.142875,
+                  118.823583,
+                  60.056333,
+                  30.788375,
+                  31.642542,
+                  70.977792,
+                  50.808416,
+                  33.406708,
+                  121.645417,
+                  114.871917,
+                  54.620417,
+                  58.87775,
+                  108.137583,
+                  50.223916,
+                  92.622917,
+                  31.720709,
+                  72.154333,
+                  111.126167,
+                  66.043541,
+                  60.364958
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27042120,
+                  "snapshot_bytes": 8167838
+                }
+              }
+            ],
+            "wall_ms": 2717.8306250134483,
+            "setup_high_water_rss_bytes": 209321984,
+            "high_water_rss_bytes": 291782656,
+            "budget_after_close_bytes": 0,
+            "case": "hub_pattern_limit_10",
+            "concurrency": 4,
+            "setup_usage": [
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171922,
+                "snapshot_bytes": 8167838
+              },
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171906,
+                "snapshot_bytes": 8167838
+              },
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171890,
+                "snapshot_bytes": 8167838
+              },
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171874,
+                "snapshot_bytes": 8167838
+              }
+            ],
+            "rss_baseline_bytes": 191873024,
+            "sampled_peak_rss_bytes": 291651584,
+            "sampled_rss_growth_bytes": 99778560,
+            "rss_sample_count": 168,
+            "rss_sample_interval_median_ms": 16.66964599280618,
+            "latency_median_ms": 80.485271,
+            "latency_p95_ms": 121.220083
+          },
+          {
+            "sessions": [
+              {
+                "latency_ms": [
+                  14.5875,
+                  13.698625,
+                  14.655792,
+                  14.398584,
+                  15.262375,
+                  15.241458,
+                  14.060625,
+                  14.576958,
+                  15.086375,
+                  14.827917,
+                  14.010875,
+                  14.814167,
+                  32.592166,
+                  14.718584,
+                  14.491333,
+                  14.595333,
+                  14.794833,
+                  14.139292,
+                  14.70125,
+                  14.538833,
+                  14.347958
+                ],
+                "result_sha256": "c9f2f472ab7f453da8d83d78aa912caf0b813eb2ca539bb7a2928d66c549a74f",
+                "usage": {
+                  "handles": 24,
+                  "rows": 17500,
+                  "bytes": 32593326,
+                  "snapshot_bytes": 8167838
+                }
+              }
+            ],
+            "wall_ms": 375.9946670033969,
+            "setup_high_water_rss_bytes": 169213952,
+            "high_water_rss_bytes": 183894016,
+            "budget_after_close_bytes": 0,
+            "case": "low_degree_250",
+            "concurrency": 1,
+            "setup_usage": [
+              {
+                "handles": 1,
+                "rows": 250,
+                "bytes": 8427610,
+                "snapshot_bytes": 8167838
+              }
+            ],
+            "rss_baseline_bytes": 152666112,
+            "sampled_peak_rss_bytes": 183910400,
+            "sampled_rss_growth_bytes": 31244288,
+            "rss_sample_count": 27,
+            "rss_sample_interval_median_ms": 16.700125008355826,
+            "latency_median_ms": 14.595333,
+            "latency_p95_ms": 15.262375
+          },
+          {
+            "sessions": [
+              {
+                "latency_ms": [
+                  41.319666,
+                  72.286083,
+                  57.649958,
+                  58.585791,
+                  43.298917,
+                  47.091292,
+                  53.65625,
+                  32.391042,
+                  97.876875,
+                  54.666708,
+                  44.912,
+                  101.468458,
+                  46.770584,
+                  38.63525,
+                  47.300333,
+                  55.358,
+                  120.7545,
+                  47.234041,
+                  45.575584,
+                  37.154791,
+                  38.921166
+                ],
+                "result_sha256": "c9f2f472ab7f453da8d83d78aa912caf0b813eb2ca539bb7a2928d66c549a74f",
+                "usage": {
+                  "handles": 24,
+                  "rows": 17500,
+                  "bytes": 32591830,
+                  "snapshot_bytes": 8167838
+                }
+              },
+              {
+                "latency_ms": [
+                  38.2105,
+                  60.277916,
+                  49.17675,
+                  31.130583,
+                  54.365625,
+                  55.282083,
+                  38.212292,
+                  40.243958,
+                  96.261958,
+                  37.626792,
+                  46.934208,
+                  119.12025,
+                  32.6905,
+                  55.755917,
+                  46.003917,
+                  46.286375,
+                  130.177834,
+                  45.917333,
+                  37.76775,
+                  52.7735,
+                  53.368166
+                ],
+                "result_sha256": "c9f2f472ab7f453da8d83d78aa912caf0b813eb2ca539bb7a2928d66c549a74f",
+                "usage": {
+                  "handles": 24,
+                  "rows": 17500,
+                  "bytes": 32591822,
+                  "snapshot_bytes": 8167838
+                }
+              },
+              {
+                "latency_ms": [
+                  57.702708,
+                  80.133584,
+                  59.14475,
+                  39.023333,
+                  93.722458,
+                  31.622292,
+                  30.742125,
+                  48.489166,
+                  94.670583,
+                  46.873334,
+                  48.439125,
+                  115.731667,
+                  49.1225,
+                  47.921291,
+                  54.797791,
+                  43.291542,
+                  122.226417,
+                  54.993625,
+                  55.170375,
+                  38.788125,
+                  54.93975
+                ],
+                "result_sha256": "c9f2f472ab7f453da8d83d78aa912caf0b813eb2ca539bb7a2928d66c549a74f",
+                "usage": {
+                  "handles": 24,
+                  "rows": 17500,
+                  "bytes": 32591774,
+                  "snapshot_bytes": 8167838
+                }
+              },
+              {
+                "latency_ms": [
+                  55.287083,
+                  64.125959,
+                  45.795958,
+                  54.158125,
+                  45.72975,
+                  39.559,
+                  52.484208,
+                  56.170667,
+                  87.097875,
+                  45.354792,
+                  57.467083,
+                  93.195083,
+                  56.918708,
+                  46.37175,
+                  37.54,
+                  47.578583,
+                  118.840167,
+                  37.728583,
+                  46.954458,
+                  54.498833,
+                  37.036666
+                ],
+                "result_sha256": "c9f2f472ab7f453da8d83d78aa912caf0b813eb2ca539bb7a2928d66c549a74f",
+                "usage": {
+                  "handles": 24,
+                  "rows": 17500,
+                  "bytes": 32591790,
+                  "snapshot_bytes": 8167838
+                }
+              }
+            ],
+            "wall_ms": 1549.7254999936558,
+            "setup_high_water_rss_bytes": 208060416,
+            "high_water_rss_bytes": 318603264,
+            "budget_after_close_bytes": 0,
+            "case": "low_degree_250",
+            "concurrency": 4,
+            "setup_usage": [
+              {
+                "handles": 1,
+                "rows": 250,
+                "bytes": 8427610,
+                "snapshot_bytes": 8167838
+              },
+              {
+                "handles": 1,
+                "rows": 250,
+                "bytes": 8427602,
+                "snapshot_bytes": 8167838
+              },
+              {
+                "handles": 1,
+                "rows": 250,
+                "bytes": 8427594,
+                "snapshot_bytes": 8167838
+              },
+              {
+                "handles": 1,
+                "rows": 250,
+                "bytes": 8427586,
+                "snapshot_bytes": 8167838
+              }
+            ],
+            "rss_baseline_bytes": 190627840,
+            "sampled_peak_rss_bytes": 318603264,
+            "sampled_rss_growth_bytes": 127975424,
+            "rss_sample_count": 98,
+            "rss_sample_interval_median_ms": 16.64875001006294,
+            "latency_median_ms": 48.805833,
+            "latency_p95_ms": 118.840167
+          }
+        ],
+        "ana_source_sha256": "25dfa39911c118a1f9e4f1f2eeb9f57983fb5eb2c2a41b6be5b74cadaf19999f"
+      }
+    },
+    "hub_repeat": {
+      "baseline": {
+        "python": "3.12.11",
+        "platform": "macOS-27.2-arm64-arm-64bit",
+        "pyarrow": "23.0.1",
+        "degree": 20000,
+        "repeats": 21,
+        "warmups": 2,
+        "runs": [
+          {
+            "sessions": [
+              {
+                "latency_ms": [
+                  217.325833,
+                  238.09025,
+                  221.939166,
+                  234.648583,
+                  260.650958,
+                  224.754458,
+                  238.240166,
+                  213.033416,
+                  248.687625,
+                  237.8045,
+                  222.784625,
+                  253.923291,
+                  216.381375,
+                  258.827,
+                  225.917333,
+                  239.538375,
+                  247.207291,
+                  236.291042,
+                  243.674417,
+                  226.093042,
+                  253.255
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27043656,
+                  "snapshot_bytes": 8167838
+                }
+              }
+            ],
+            "wall_ms": 5433.562124992022,
+            "setup_high_water_rss_bytes": 170328064,
+            "high_water_rss_bytes": 209158144,
+            "budget_after_close_bytes": 0,
+            "case": "hub_pattern_limit_10",
+            "concurrency": 1,
+            "setup_usage": [
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171922,
+                "snapshot_bytes": 8167838
+              }
+            ],
+            "rss_baseline_bytes": 152764416,
+            "sampled_peak_rss_bytes": 209158144,
+            "sampled_rss_growth_bytes": 56393728,
+            "rss_sample_count": 337,
+            "rss_sample_interval_median_ms": 16.461084014736116,
+            "latency_median_ms": 237.8045,
+            "latency_p95_ms": 258.827
+          },
+          {
+            "sessions": [
+              {
+                "latency_ms": [
+                  630.986625,
+                  959.16825,
+                  801.913709,
+                  893.09175,
+                  1087.004042,
+                  430.610542,
+                  1047.494708,
+                  666.257833,
+                  625.222667,
+                  873.269792,
+                  899.738125,
+                  557.005167,
+                  894.4715,
+                  1040.852583,
+                  1060.019791,
+                  756.252208,
+                  1101.12475,
+                  1085.2925,
+                  461.910459,
+                  1135.674291,
+                  287.954291
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27042168,
+                  "snapshot_bytes": 8167838
+                }
+              },
+              {
+                "latency_ms": [
+                  1065.72925,
+                  1080.23775,
+                  1003.651417,
+                  896.031959,
+                  736.51575,
+                  941.753125,
+                  1056.979333,
+                  966.020375,
+                  1105.373792,
+                  722.99875,
+                  1103.255625,
+                  463.109292,
+                  1111.664417,
+                  938.8945,
+                  1007.096917,
+                  711.028125,
+                  973.416833,
+                  970.913,
+                  878.516625,
+                  1123.189083,
+                  851.426167
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27042104,
+                  "snapshot_bytes": 8167838
+                }
+              },
+              {
+                "latency_ms": [
+                  349.763625,
+                  1083.321291,
+                  267.998667,
+                  1029.006834,
+                  934.796084,
+                  990.9335,
+                  262.085834,
+                  662.948417,
+                  992.305916,
+                  1101.970166,
+                  1048.011583,
+                  1025.2215,
+                  1121.524042,
+                  264.885583,
+                  276.180291,
+                  1101.327375,
+                  606.358,
+                  1020.450542,
+                  1038.39325,
+                  663.26025,
+                  1124.808625
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27042144,
+                  "snapshot_bytes": 8167838
+                }
+              },
+              {
+                "latency_ms": [
+                  1083.554583,
+                  582.058959,
+                  1015.495,
+                  444.388917,
+                  1076.67675,
+                  523.8475,
+                  819.2245,
+                  1041.227709,
+                  387.079125,
+                  1112.991583,
+                  368.098917,
+                  1108.09275,
+                  906.284125,
+                  983.440042,
+                  1003.535292,
+                  1105.073917,
+                  465.386125,
+                  839.937334,
+                  1115.338708,
+                  410.779083,
+                  1122.499541
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27042072,
+                  "snapshot_bytes": 8167838
+                }
+              }
+            ],
+            "wall_ms": 24723.051916982513,
+            "setup_high_water_rss_bytes": 210632704,
+            "high_water_rss_bytes": 407928832,
+            "budget_after_close_bytes": 0,
+            "case": "hub_pattern_limit_10",
+            "concurrency": 4,
+            "setup_usage": [
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171922,
+                "snapshot_bytes": 8167838
+              },
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171906,
+                "snapshot_bytes": 8167838
+              },
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171890,
+                "snapshot_bytes": 8167838
+              },
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171874,
+                "snapshot_bytes": 8167838
+              }
+            ],
+            "rss_baseline_bytes": 193200128,
+            "sampled_peak_rss_bytes": 407928832,
+            "sampled_rss_growth_bytes": 214728704,
+            "rss_sample_count": 1519,
+            "rss_sample_interval_median_ms": 16.327000019373372,
+            "latency_median_ms": 962.5943124999999,
+            "latency_p95_ms": 1121.524042
+          }
+        ],
+        "ana_source_sha256": "dc5ef1e201ecbe3febd8e766bac4bdd452d306637a48c615f76d4c0f22780daf"
+      },
+      "optimized": {
+        "python": "3.12.11",
+        "platform": "macOS-27.2-arm64-arm-64bit",
+        "pyarrow": "23.0.1",
+        "degree": 20000,
+        "repeats": 21,
+        "warmups": 2,
+        "runs": [
+          {
+            "sessions": [
+              {
+                "latency_ms": [
+                  30.771584,
+                  44.407667,
+                  30.945709,
+                  29.375625,
+                  28.996792,
+                  29.784417,
+                  29.447125,
+                  29.117333,
+                  29.191042,
+                  29.5105,
+                  29.233291,
+                  29.403834,
+                  29.212166,
+                  28.930958,
+                  29.286,
+                  29.180167,
+                  29.7405,
+                  29.1435,
+                  29.234709,
+                  29.212791,
+                  29.636459
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27045176,
+                  "snapshot_bytes": 8167838
+                }
+              }
+            ],
+            "wall_ms": 695.86225002422,
+            "setup_high_water_rss_bytes": 169312256,
+            "high_water_rss_bytes": 169312256,
+            "budget_after_close_bytes": 0,
+            "case": "hub_pattern_limit_10",
+            "concurrency": 1,
+            "setup_usage": [
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171922,
+                "snapshot_bytes": 8167838
+              }
+            ],
+            "rss_baseline_bytes": 151683072,
+            "sampled_peak_rss_bytes": 166428672,
+            "sampled_rss_growth_bytes": 14745600,
+            "rss_sample_count": 45,
+            "rss_sample_interval_median_ms": 16.7713749979157,
+            "latency_median_ms": 29.286,
+            "latency_p95_ms": 30.945709
+          },
+          {
+            "sessions": [
+              {
+                "latency_ms": [
+                  118.035417,
+                  113.893042,
+                  63.485125,
+                  93.966292,
+                  29.872667,
+                  30.25975,
+                  30.436875,
+                  84.199084,
+                  31.959834,
+                  114.791833,
+                  30.855708,
+                  59.324208,
+                  116.226583,
+                  30.564417,
+                  122.88,
+                  33.381917,
+                  42.485375,
+                  57.750084,
+                  126.647417,
+                  59.322375,
+                  61.0465
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27042136,
+                  "snapshot_bytes": 8167838
+                }
+              },
+              {
+                "latency_ms": [
+                  30.352417,
+                  34.974791,
+                  93.33175,
+                  115.318584,
+                  113.949917,
+                  105.534666,
+                  99.162084,
+                  116.281208,
+                  108.324542,
+                  110.766333,
+                  114.617917,
+                  30.665667,
+                  59.311208,
+                  117.218875,
+                  113.255375,
+                  118.805,
+                  114.314625,
+                  113.194417,
+                  110.904709,
+                  30.796709,
+                  31.601458
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27042888,
+                  "snapshot_bytes": 8167838
+                }
+              },
+              {
+                "latency_ms": [
+                  86.901541,
+                  64.657667,
+                  121.928917,
+                  59.755083,
+                  65.009958,
+                  64.8215,
+                  115.246042,
+                  30.3915,
+                  60.921416,
+                  102.466916,
+                  59.057209,
+                  116.069166,
+                  30.954166,
+                  111.895042,
+                  63.912375,
+                  62.313625,
+                  58.775708,
+                  92.30125,
+                  68.182333,
+                  113.841667,
+                  91.414667
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27042112,
+                  "snapshot_bytes": 8167838
+                }
+              },
+              {
+                "latency_ms": [
+                  58.898583,
+                  124.564125,
+                  33.725333,
+                  31.476208,
+                  109.42725,
+                  113.000083,
+                  59.586041,
+                  111.524666,
+                  120.896208,
+                  31.52175,
+                  111.945083,
+                  94.200375,
+                  87.830291,
+                  58.551708,
+                  33.414208,
+                  90.954458,
+                  86.848416,
+                  49.334333,
+                  62.307458,
+                  105.080875,
+                  120.565875
+                ],
+                "result_sha256": "705a92ff5a3b2a3fa595810e8ebfdd4832a5d919e04afb7229ed2be41ea8cf1a",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 27042088,
+                  "snapshot_bytes": 8167838
+                }
+              }
+            ],
+            "wall_ms": 2704.5229169889353,
+            "setup_high_water_rss_bytes": 210599936,
+            "high_water_rss_bytes": 291880960,
+            "budget_after_close_bytes": 0,
+            "case": "hub_pattern_limit_10",
+            "concurrency": 4,
+            "setup_usage": [
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171922,
+                "snapshot_bytes": 8167838
+              },
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171906,
+                "snapshot_bytes": 8167838
+              },
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171890,
+                "snapshot_bytes": 8167838
+              },
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 8171874,
+                "snapshot_bytes": 8167838
+              }
+            ],
+            "rss_baseline_bytes": 193953792,
+            "sampled_peak_rss_bytes": 291864576,
+            "sampled_rss_growth_bytes": 97910784,
+            "rss_sample_count": 169,
+            "rss_sample_interval_median_ms": 16.631958016660064,
+            "latency_median_ms": 86.8749785,
+            "latency_p95_ms": 120.896208
+          }
+        ],
+        "ana_source_sha256": "25dfa39911c118a1f9e4f1f2eeb9f57983fb5eb2c2a41b6be5b74cadaf19999f"
+      }
+    },
+    "two_hop": {
+      "baseline": {
+        "python": "3.12.11",
+        "platform": "macOS-27.2-arm64-arm-64bit",
+        "pyarrow": "23.0.1",
+        "degree": 1000,
+        "repeats": 21,
+        "warmups": 2,
+        "runs": [
+          {
+            "sessions": [
+              {
+                "latency_ms": [
+                  176.879584,
+                  174.161125,
+                  177.357041,
+                  170.927875,
+                  179.615709,
+                  174.816083,
+                  184.22625,
+                  171.313333,
+                  168.955791,
+                  172.542958,
+                  169.754208,
+                  165.557333,
+                  160.33275,
+                  156.045583,
+                  156.30925,
+                  157.087833,
+                  158.374209,
+                  159.621125,
+                  164.010541,
+                  165.509,
+                  164.226416
+                ],
+                "result_sha256": "c5973ad371f730b5e425f4d3441bbc337cc41b90bf9ae760df04e18be688cefe",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 891138,
+                  "snapshot_bytes": 492463
+                }
+              }
+            ],
+            "wall_ms": 3874.1234999906737,
+            "setup_high_water_rss_bytes": 127746048,
+            "high_water_rss_bytes": 164364288,
+            "budget_after_close_bytes": 0,
+            "case": "hub_two_hop_limit_10",
+            "concurrency": 1,
+            "setup_usage": [
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 496547,
+                "snapshot_bytes": 492463
+              }
+            ],
+            "rss_baseline_bytes": 127746048,
+            "sampled_peak_rss_bytes": 164364288,
+            "sampled_rss_growth_bytes": 36618240,
+            "rss_sample_count": 244,
+            "rss_sample_interval_median_ms": 16.08160400064662,
+            "latency_median_ms": 168.955791,
+            "latency_p95_ms": 179.615709
+          },
+          {
+            "sessions": [
+              {
+                "latency_ms": [
+                  681.280792,
+                  762.614166,
+                  765.748042,
+                  745.127125,
+                  809.602583,
+                  754.451625,
+                  597.406125,
+                  663.000958,
+                  677.124791,
+                  731.562541,
+                  678.808084,
+                  707.970583,
+                  782.722917,
+                  513.56475,
+                  658.924334,
+                  724.343166,
+                  661.073459,
+                  774.307666,
+                  827.39825,
+                  761.468584,
+                  803.913
+                ],
+                "result_sha256": "c5973ad371f730b5e425f4d3441bbc337cc41b90bf9ae760df04e18be688cefe",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 889642,
+                  "snapshot_bytes": 492463
+                }
+              },
+              {
+                "latency_ms": [
+                  708.487708,
+                  775.364584,
+                  754.562708,
+                  745.157834,
+                  576.189208,
+                  571.040375,
+                  694.493792,
+                  765.704208,
+                  779.47175,
+                  731.769625,
+                  671.621,
+                  701.11,
+                  711.384083,
+                  758.32525,
+                  781.848375,
+                  703.157708,
+                  793.159959,
+                  847.911375,
+                  827.144917,
+                  768.44025,
+                  745.54475
+                ],
+                "result_sha256": "c5973ad371f730b5e425f4d3441bbc337cc41b90bf9ae760df04e18be688cefe",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 889586,
+                  "snapshot_bytes": 492463
+                }
+              },
+              {
+                "latency_ms": [
+                  719.174167,
+                  652.63925,
+                  690.755208,
+                  733.105375,
+                  685.91275,
+                  746.715917,
+                  694.267833,
+                  765.584625,
+                  684.126958,
+                  704.563334,
+                  771.854958,
+                  701.085208,
+                  727.595667,
+                  724.777,
+                  765.659,
+                  802.463666,
+                  746.709625,
+                  764.344917,
+                  753.476,
+                  675.673,
+                  579.86725
+                ],
+                "result_sha256": "c5973ad371f730b5e425f4d3441bbc337cc41b90bf9ae760df04e18be688cefe",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 889610,
+                  "snapshot_bytes": 492463
+                }
+              },
+              {
+                "latency_ms": [
+                  758.247875,
+                  762.721792,
+                  747.10375,
+                  784.160375,
+                  809.938209,
+                  747.087834,
+                  740.372292,
+                  703.773,
+                  779.345208,
+                  731.957208,
+                  768.346084,
+                  775.493625,
+                  720.288209,
+                  764.919208,
+                  753.330959,
+                  802.3885,
+                  753.102834,
+                  857.564,
+                  819.989333,
+                  679.668792,
+                  797.124417
+                ],
+                "result_sha256": "c5973ad371f730b5e425f4d3441bbc337cc41b90bf9ae760df04e18be688cefe",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 889562,
+                  "snapshot_bytes": 492463
+                }
+              }
+            ],
+            "wall_ms": 17891.215958981775,
+            "setup_high_water_rss_bytes": 131235840,
+            "high_water_rss_bytes": 268484608,
+            "budget_after_close_bytes": 0,
+            "case": "hub_two_hop_limit_10",
+            "concurrency": 4,
+            "setup_usage": [
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 496547,
+                "snapshot_bytes": 492463
+              },
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 496531,
+                "snapshot_bytes": 492463
+              },
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 496515,
+                "snapshot_bytes": 492463
+              },
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 496499,
+                "snapshot_bytes": 492463
+              }
+            ],
+            "rss_baseline_bytes": 131235840,
+            "sampled_peak_rss_bytes": 268484608,
+            "sampled_rss_growth_bytes": 137248768,
+            "rss_sample_count": 1110,
+            "rss_sample_interval_median_ms": 16.228083011810668,
+            "latency_median_ms": 746.712771,
+            "latency_p95_ms": 819.989333
+          }
+        ],
+        "ana_source_sha256": "dc5ef1e201ecbe3febd8e766bac4bdd452d306637a48c615f76d4c0f22780daf"
+      },
+      "optimized": {
+        "python": "3.12.11",
+        "platform": "macOS-27.2-arm64-arm-64bit",
+        "pyarrow": "23.0.1",
+        "degree": 1000,
+        "repeats": 21,
+        "warmups": 2,
+        "runs": [
+          {
+            "sessions": [
+              {
+                "latency_ms": [
+                  40.882166,
+                  40.553667,
+                  40.210458,
+                  40.119167,
+                  40.191625,
+                  39.938167,
+                  40.105667,
+                  40.183625,
+                  50.871584,
+                  39.940042,
+                  39.831708,
+                  39.962708,
+                  40.250334,
+                  40.462167,
+                  40.477625,
+                  40.709542,
+                  39.992833,
+                  39.957125,
+                  49.548125,
+                  40.538125,
+                  49.707625
+                ],
+                "result_sha256": "c5973ad371f730b5e425f4d3441bbc337cc41b90bf9ae760df04e18be688cefe",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 891138,
+                  "snapshot_bytes": 492463
+                }
+              }
+            ],
+            "wall_ms": 958.5319159959909,
+            "setup_high_water_rss_bytes": 127418368,
+            "high_water_rss_bytes": 131153920,
+            "budget_after_close_bytes": 0,
+            "case": "hub_two_hop_limit_10",
+            "concurrency": 1,
+            "setup_usage": [
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 496547,
+                "snapshot_bytes": 492463
+              }
+            ],
+            "rss_baseline_bytes": 127418368,
+            "sampled_peak_rss_bytes": 131203072,
+            "sampled_rss_growth_bytes": 3784704,
+            "rss_sample_count": 65,
+            "rss_sample_interval_median_ms": 15.668165986426175,
+            "latency_median_ms": 40.210458,
+            "latency_p95_ms": 49.707625
+          },
+          {
+            "sessions": [
+              {
+                "latency_ms": [
+                  257.948667,
+                  237.309084,
+                  226.668291,
+                  212.480959,
+                  212.57325,
+                  213.775416,
+                  203.355542,
+                  224.339625,
+                  222.032625,
+                  206.68775,
+                  231.377417,
+                  221.408958,
+                  222.356916,
+                  207.808834,
+                  205.180625,
+                  206.117875,
+                  216.201708,
+                  231.63125,
+                  210.137542,
+                  230.657167,
+                  192.934083
+                ],
+                "result_sha256": "c5973ad371f730b5e425f4d3441bbc337cc41b90bf9ae760df04e18be688cefe",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 889618,
+                  "snapshot_bytes": 492463
+                }
+              },
+              {
+                "latency_ms": [
+                  249.903125,
+                  243.712792,
+                  220.443584,
+                  218.894084,
+                  220.253916,
+                  206.7205,
+                  210.944625,
+                  210.38825,
+                  229.341417,
+                  213.885542,
+                  238.979083,
+                  214.955667,
+                  229.081,
+                  225.011084,
+                  238.6325,
+                  229.032833,
+                  223.828,
+                  209.783209,
+                  217.071625,
+                  217.301792,
+                  212.317
+                ],
+                "result_sha256": "c5973ad371f730b5e425f4d3441bbc337cc41b90bf9ae760df04e18be688cefe",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 889610,
+                  "snapshot_bytes": 492463
+                }
+              },
+              {
+                "latency_ms": [
+                  267.4655,
+                  231.307084,
+                  213.407125,
+                  204.774708,
+                  200.888375,
+                  227.8365,
+                  218.58925,
+                  231.029042,
+                  215.078167,
+                  196.754334,
+                  224.004792,
+                  200.189,
+                  236.247875,
+                  232.234875,
+                  213.945084,
+                  221.8595,
+                  200.197708,
+                  224.384541,
+                  202.49175,
+                  209.8895,
+                  205.9645
+                ],
+                "result_sha256": "c5973ad371f730b5e425f4d3441bbc337cc41b90bf9ae760df04e18be688cefe",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 889586,
+                  "snapshot_bytes": 492463
+                }
+              },
+              {
+                "latency_ms": [
+                  272.502292,
+                  222.159666,
+                  195.347459,
+                  196.590792,
+                  227.561292,
+                  221.036125,
+                  197.0105,
+                  217.126375,
+                  207.210084,
+                  220.335542,
+                  217.410167,
+                  208.113166,
+                  213.991334,
+                  216.111167,
+                  231.3915,
+                  214.271375,
+                  209.184125,
+                  217.787166,
+                  195.398917,
+                  226.117208,
+                  197.219917
+                ],
+                "result_sha256": "c5973ad371f730b5e425f4d3441bbc337cc41b90bf9ae760df04e18be688cefe",
+                "usage": {
+                  "handles": 24,
+                  "rows": 231,
+                  "bytes": 889618,
+                  "snapshot_bytes": 492463
+                }
+              }
+            ],
+            "wall_ms": 5307.054959004745,
+            "setup_high_water_rss_bytes": 130154496,
+            "high_water_rss_bytes": 142639104,
+            "budget_after_close_bytes": 0,
+            "case": "hub_two_hop_limit_10",
+            "concurrency": 4,
+            "setup_usage": [
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 496547,
+                "snapshot_bytes": 492463
+              },
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 496531,
+                "snapshot_bytes": 492463
+              },
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 496515,
+                "snapshot_bytes": 492463
+              },
+              {
+                "handles": 1,
+                "rows": 1,
+                "bytes": 496499,
+                "snapshot_bytes": 492463
+              }
+            ],
+            "rss_baseline_bytes": 130154496,
+            "sampled_peak_rss_bytes": 142639104,
+            "sampled_rss_growth_bytes": 12484608,
+            "rss_sample_count": 331,
+            "rss_sample_interval_median_ms": 16.238249983871356,
+            "latency_median_ms": 217.21408350000002,
+            "latency_p95_ms": 243.712792
+          }
+        ],
+        "ana_source_sha256": "25dfa39911c118a1f9e4f1f2eeb9f57983fb5eb2c2a41b6be5b74cadaf19999f"
+      }
+    }
+  }
+}

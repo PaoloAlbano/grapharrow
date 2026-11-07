@@ -845,7 +845,10 @@ class CypherQueryUseCase:
             else None
         )
         if logical_plan is not None:
-            planned = self._execute_match_logical_plan(logical_plan)
+            planned = self._execute_match_logical_plan(
+                logical_plan,
+                include_edges=_match_requires_edges(query.patterns, query.where_predicate),
+            )
             if planned.query_result is not None:
                 return cast(QueryResult, planned.query_result)
             assert planned.table is not None
@@ -890,7 +893,7 @@ class CypherQueryUseCase:
             return None
 
         pattern, return_item = shape
-        state = self._graph_service.load_tabular_state()
+        state = self._graph_service.load_tabular_state(include_edges=False)
         adjacency_loader = self._adjacency_loader_for_state(state)
         node_property_loader = self._node_property_loader_for_state(state)
         result_rows = _match_distinct_endpoint_range_table(
@@ -909,9 +912,11 @@ class CypherQueryUseCase:
         )
         return _build_query_result_from_table(query.return_items, result_rows)
 
-    def _execute_match_logical_plan(self, plan: MatchLogicalPlan) -> MatchLogicalPlanResult:
+    def _execute_match_logical_plan(
+        self, plan: MatchLogicalPlan, *, include_edges: bool = True
+    ) -> MatchLogicalPlanResult:
         """Execute this query shape and return the result needed by the caller."""
-        state = self._graph_service.load_tabular_state()
+        state = self._graph_service.load_tabular_state(include_edges=include_edges)
         adjacency_loader = self._adjacency_loader_for_state(state)
         edge_property_loader = self._edge_property_loader_for_state(state)
         node_property_loader = self._node_property_loader_for_state(state)
@@ -2017,7 +2022,9 @@ class CypherQueryUseCase:
         extra_required_fields: Mapping[str, set[str]] | None = None,
     ) -> pa.Table:
         """Produce binding rows for this pattern against the current graph state."""
-        state = self._graph_service.load_tabular_state()
+        state = self._graph_service.load_tabular_state(
+            include_edges=_match_requires_edges(patterns, where_predicate)
+        )
         adjacency_loader = self._adjacency_loader_for_state(state)
         node_property_loader = self._node_property_loader_for_state(state)
         edge_property_loader = self._edge_property_loader_for_state(state)
@@ -7262,6 +7269,15 @@ def _patterns_have_relationship_type_alternatives(
     return False
 
 
+def _match_requires_edges(
+    patterns: tuple[CompiledPattern, ...], predicate: WherePredicate | None
+) -> bool:
+    """Check for relationships in the match patterns or in a WHERE subquery."""
+    return any(isinstance(pattern, PathPattern) for pattern in patterns) or (
+        _predicate_has_exists_pattern(predicate)
+    )
+
+
 def _predicate_has_exists_pattern(predicate: WherePredicate | None) -> bool:
     """Check whether a predicate tree contains an existential pattern subquery."""
 
@@ -11344,9 +11360,6 @@ def _node_binding_table_from_canonical_table(
     requested_fields: set[str] | None,
 ) -> pa.Table:
     """Handle node-specific matching, projection, or lookup logic for Cypher."""
-    labels_values = [
-        [_cypher_name(label) for label in (labels or [])] for labels in table["labels"].to_pylist()
-    ]
     reserved_fields = {_NODE_ID_FIELD, _ENTITY_ID_FIELD, "__join_id", "labels"}
     if requested_fields is None:
         properties = [
@@ -11374,9 +11387,8 @@ def _node_binding_table_from_canonical_table(
         _binding_column_name(variable, _ENTITY_ID_FIELD): table["node_id"],
         _binding_column_name(variable, _NODE_ID_FIELD): table["node_id"],
         _binding_column_name(variable, "__join_id"): table["node_id"],
-        _binding_column_name(variable, "labels"): pa.array(
-            [json.dumps(list(labels or [])) for labels in labels_values],
-            type=pa.string(),
+        _binding_column_name(variable, "labels"): _encode_binding_labels(
+            table["labels"], normalize=True
         ),
     }
     for property_name in property_names:
@@ -11443,8 +11455,14 @@ def _node_binding_table_from_property_projection(
         variable=variable,
         predicate=pushdown_predicate,
     )
-    label_mask = _canonical_labels_contains_all_mask(canonical_table["labels"], pattern.labels)
-    filtered = canonical_table.filter(label_mask)
+    candidates = canonical_table.select(["node_id", "labels"])
+    if restrict_candidates:
+        candidates = candidates.filter(
+            pc.is_in(candidates["node_id"], value_set=property_table["node_id"])
+        )
+    filtered = candidates.filter(
+        _canonical_labels_contains_all_mask(candidates["labels"], pattern.labels)
+    )
     if filtered.num_rows == 0:
         return pa.table(
             {
@@ -11455,21 +11473,15 @@ def _node_binding_table_from_property_projection(
             }
         )
 
-    labels_values = filtered["labels"].to_pylist()
     base = pa.table(
         {
             _binding_column_name(variable, _ENTITY_ID_FIELD): filtered["node_id"],
             _binding_column_name(variable, _NODE_ID_FIELD): filtered["node_id"],
             _binding_column_name(variable, "__join_id"): filtered["node_id"],
-            _binding_column_name(variable, "labels"): pa.array(
-                [json.dumps(list(labels or [])) for labels in labels_values],
-                type=pa.string(),
-            ),
+            _binding_column_name(variable, "labels"): _encode_binding_labels(filtered["labels"]),
         }
     )
     if restrict_candidates:
-        if property_table.num_rows == 0:
-            return base.slice(0, 0)
         base = base.join(
             property_table.select(["node_id"]),
             keys=_binding_column_name(variable, _NODE_ID_FIELD),
@@ -11519,6 +11531,19 @@ def _node_binding_table_from_property_projection(
         column_name for column_name in projected.column_names if column_name not in drop_columns
     ]
     return projected.select(kept_columns)
+
+
+def _encode_binding_labels(column: pa.ChunkedArray, *, normalize: bool = False) -> pa.Array:
+    """Reuse the JSON encoding for nodes with the same ordered label list."""
+    encoded: dict[tuple[str, ...], str] = {}
+    rows = []
+    for labels in column.to_pylist():
+        key = tuple(labels or ())
+        if key not in encoded:
+            values = [_cypher_name(label) for label in key] if normalize else list(key)
+            encoded[key] = json.dumps(values)
+        rows.append(encoded[key])
+    return pa.array(rows, type=pa.string())
 
 
 def _node_property_projection_restricts_candidates(
@@ -11743,19 +11768,24 @@ def _canonical_labels_contains_all_mask(
         return pa.array([True] * len(column), type=pa.bool_())
 
     canonical = column.combine_chunks()
-    masks = [_canonical_label_membership_mask(canonical, label) for label in expected_labels]
+    if canonical.null_count:
+        # Flattening skips null lists, while parent indices can include their children.
+        canonical = pc.fill_null(canonical, pa.scalar([], type=canonical.type))
+    flat_labels = pc.list_flatten(canonical)
+    parent_indices = pc.list_parent_indices(canonical)
+    raw_labels = pc.unique(flat_labels).to_pylist()
+    row_indices = pa.array(range(len(canonical)), type=pa.int64())
+    masks = []
+    for label in expected_labels:
+        matching_labels = pa.array(
+            [raw for raw in raw_labels if raw is not None and _cypher_name(raw) == label],
+            type=flat_labels.type,
+        )
+        matched_parents = pc.filter(
+            parent_indices, pc.is_in(flat_labels, value_set=matching_labels)
+        )
+        masks.append(pc.is_in(row_indices, value_set=matched_parents))
     return _combine_masks(masks, operator="and")
-
-
-def _canonical_label_membership_mask(column: pa.Array, value: str) -> pa.Array:
-    """Check whether the optimized or semantically valid path applies here."""
-    return pa.array(
-        [
-            any(_cypher_name(label) == value for label in (labels or []))
-            for labels in column.to_pylist()
-        ],
-        type=pa.bool_(),
-    )
 
 
 def _edge_binding_table_from_canonical_table(

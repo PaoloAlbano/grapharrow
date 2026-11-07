@@ -12,7 +12,7 @@ import pyarrow.compute as pc  # type: ignore[import-untyped]
 
 from grapharrow.ana.catalog import SUPPORTED_ANA_TOOLS as SUPPORTED_ANA_TOOLS
 from grapharrow.ana.catalog import get_tool_specs, validate_args
-from grapharrow.ana.handles import EntityPayload, EntityReference, HandleStore, entity_identity
+from grapharrow.ana.handles import EntityPayload, EntityReference, HandleStore
 from grapharrow.ana.values import _int_arg, _primary_label
 from grapharrow.ana.values import equal as _property_equal
 from grapharrow.app import GraphArrowApplication
@@ -170,9 +170,6 @@ class GraphArrowAgentBackend(AnaRuntime):
             raise RuntimeError("Graph backend is closed")
         return self._snapshot_state
 
-    def _entity_key(self, value: Any) -> Any:
-        return entity_identity(value)
-
     def _entity_query_metadata(self, node_ids: set[int], var: str, label: str) -> dict[str, Any]:
         """Preserve full branch membership separately from limited entity rows."""
         return {"native_entity_query": {"node_ids": node_ids, "var": var, "label": label}}
@@ -208,11 +205,21 @@ class GraphArrowAgentBackend(AnaRuntime):
 
     def _node(self, node_id: int) -> EntityPayload:
         row = self._state.node_table.slice(self._positions[node_id], 1).to_pylist()[0]
+        return self._node_payload(row)
+
+    def _node_payload(self, row: dict[str, Any]) -> EntityPayload:
         payload = EntityPayload(
             labels=list(row["labels"]), properties=json.loads(row["properties_json"])
         )
-        payload.reference = EntityReference(self._owner, str(node_id))
+        payload.reference = EntityReference(self._owner, str(row["node_id"]))
         return payload
+
+    def _materialize_nodes(self, node_ids: list[int]) -> list[EntityPayload]:
+        if not node_ids:
+            return []
+        positions = pa.array([self._positions[node_id] for node_id in node_ids], type=pa.int64())
+        columns = self._state.node_table.select(["node_id", "labels", "properties_json"])
+        return [self._node_payload(row) for row in columns.take(positions).to_pylist()]
 
     def _nodes(self, label: str) -> Any:
         ids = pa.array(self._label_ids.get(label, []), type=pa.int64())
@@ -229,18 +236,30 @@ class GraphArrowAgentBackend(AnaRuntime):
         table = self._property_tables.get(label)
         if table is not None and prop in table.column_names:
             try:
-                ids = table.filter(pc.fill_null(pc.equal(table[prop], value), False))["node_id"]
-                candidates = self._nodes(label)
-                selected = candidates.filter(pc.is_in(candidates["node_id"], ids))
+                selected = self._search_projected(label, table, prop, value)
             except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
-                selected = self._search_canonical(label, prop, value)
+                selected = self._search_canonical(label, prop, value)["node_id"]
         else:
-            selected = self._search_canonical(label, prop, value)
-        rows = [
-            {var: self._node(int(node_id)), "__rel_ids": []}
-            for node_id in selected.slice(0, limit)["node_id"].to_pylist()
-        ]
+            selected = self._search_canonical(label, prop, value)["node_id"]
+        node_ids = selected.slice(0, limit).to_pylist()
+        rows = [{var: entity, "__rel_ids": []} for entity in self._materialize_nodes(node_ids)]
         return dict(self._store(rows, focus=var))
+
+    def _search_projected(
+        self, label: str, table: pa.Table, prop: str, value: Any
+    ) -> pa.Array | pa.ChunkedArray:
+        matches = pc.filter(table["node_id"], pc.equal(table[prop], value))
+        if len(matches) <= 1 and pa.types.is_int64(matches.type):
+            if len(matches) == 0:
+                return matches
+            position = self._positions.get(matches[0].as_py())
+            if position is not None and label in self._state.node_table["labels"][position].as_py():
+                return matches
+            return matches.slice(0, 0)
+
+        # Keep canonical node order when a projection has several matches.
+        candidates = pa.array(self._label_ids.get(label, []), type=pa.int64())
+        return pc.filter(candidates, pc.is_in(candidates, matches))
 
     def _search_canonical(self, label: str, prop: str, value: Any) -> Any:
         table = self._nodes(label)
@@ -259,10 +278,8 @@ class GraphArrowAgentBackend(AnaRuntime):
         limit = _int_arg(args, "limit", 50000, min_value=1)
         if limit > 5000 and not args.get("allow_large"):
             raise ValueError("node_scan is capped at 5000 unless allow_large=true")
-        rows = [
-            {var: self._node(int(node_id)), "__rel_ids": []}
-            for node_id in self._nodes(label).slice(0, limit)["node_id"].to_pylist()
-        ]
+        node_ids = self._label_ids.get(label, [])[:limit]
+        rows = [{var: entity, "__rel_ids": []} for entity in self._materialize_nodes(node_ids)]
         return dict(self._store(rows, focus=var))
 
     def _count_nodes(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -294,25 +311,31 @@ class GraphArrowAgentBackend(AnaRuntime):
             args=args,
             alternatives=["use a selective node_search"],
         )
-        edges = self._state.edge_table
+        edges = self._state.edge_table.select(["edge_id", "rel_type", "src_id", "dst_id"])
         edges = edges.filter(pc.equal(edges["rel_type"], rel_type))
+        edges = edges.select(["edge_id", "src_id", "dst_id"])
         targets = set(self._label_ids.get(label, []))
         output = []
         inputs = [row for row in handle.rows if source in row]
+        node_ids = [ana_patterns.source_node_id(row[source], self._owner) for row in inputs]
+        source_columns = (
+            ("src_id",)
+            if direction == "out"
+            else ("dst_id",)
+            if direction == "in"
+            else ("src_id", "dst_id")
+        )
+        matches_by_source = ana_patterns.edges_for_sources(
+            edges,
+            node_ids,
+            source_columns,
+            batch=limit >= len(node_ids),
+            max_batch_rows=max(1024, limit),
+        )
         processed = 0
-        for row in inputs:
+        for row, node_id, selected in zip(inputs, node_ids, matches_by_source, strict=True):
             processed += 1
-            reference = self._entity_key(row[source])
-            if not isinstance(reference, EntityReference) or reference.owner != self._owner:
-                raise ValueError("Source entity does not belong to this workflow")
-            node_id = int(reference.key)
-            masks = []
-            if direction in {"out", "both"}:
-                masks.append(pc.equal(edges["src_id"], node_id))
-            if direction in {"in", "both"}:
-                masks.append(pc.equal(edges["dst_id"], node_id))
-            mask = masks[0] if len(masks) == 1 else pc.or_(masks[0], masks[1])
-            for edge in edges.filter(mask).to_pylist():
+            for edge in selected:
                 edge_key = str(edge["edge_id"])
                 if edge_key in row.get("__rel_ids", []):
                     continue
@@ -332,9 +355,7 @@ class GraphArrowAgentBackend(AnaRuntime):
                 break
         # The reference keeps a full query branch for union counts. Its branch
         # uses input entities independently of the materialized traversal limit.
-        source_ids = pa.array(
-            [int(self._entity_key(row[source]).key) for row in inputs], type=pa.int64()
-        )
+        source_ids = pa.array(node_ids, type=pa.int64())
         full_targets: set[int] = set()
         for source_column, target_column in (
             [("src_id", "dst_id")]
@@ -343,8 +364,8 @@ class GraphArrowAgentBackend(AnaRuntime):
             if direction == "in"
             else [("src_id", "dst_id"), ("dst_id", "src_id")]
         ):
-            selected = edges.filter(pc.is_in(edges[source_column], source_ids))
-            full_targets.update(set(selected[target_column].to_pylist()) & targets)
+            selected = pc.filter(edges[target_column], pc.is_in(edges[source_column], source_ids))
+            full_targets.update(set(pc.unique(selected).to_pylist()) & targets)
         metadata = self._entity_query_metadata(full_targets, var, label) if inputs else None
         result = self._store(output, focus=var, metadata=metadata)
         result.update(
@@ -455,24 +476,34 @@ class GraphArrowAgentBackend(AnaRuntime):
             strict=True,
         ):
             labels_by_id[node_id] = labels
+            if raw == "{}":
+                continue
             for prop, value in json.loads(raw).items():
+                property_type = _property_type(value)
                 for label in labels:
-                    node_props[label, prop].add(_property_type(value))
+                    node_props[label, prop].add(property_type)
                     if value is not None:
                         node_values[label, prop] += 1
-        for edge in self._state.edge_table.to_pylist():
-            rel = edge["rel_type"]
+        edges = self._state.edge_table
+        for rel, source, target, raw in zip(
+            edges["rel_type"].to_pylist(),
+            edges["src_id"].to_pylist(),
+            edges["dst_id"].to_pylist(),
+            edges["properties_json"].to_pylist(),
+            strict=True,
+        ):
             relationship_counts[rel] += 1
-            for prop, value in json.loads(edge["properties_json"]).items():
-                edge_props[rel, prop].add(_property_type(value))
-                if value is not None:
-                    edge_values[rel, prop] += 1
-            for src in labels_by_id.get(edge["src_id"], []):
-                for dst in labels_by_id.get(edge["dst_id"], []):
-                    patterns.add((src, edge["rel_type"], dst))
+            if raw != "{}":
+                for prop, value in json.loads(raw).items():
+                    edge_props[rel, prop].add(_property_type(value))
+                    if value is not None:
+                        edge_values[rel, prop] += 1
+            for src in labels_by_id.get(source, []):
+                for dst in labels_by_id.get(target, []):
+                    patterns.add((src, rel, dst))
         return {
             "labels": sorted(self._label_ids),
-            "relationship_types": sorted(set(self._state.edge_table["rel_type"].to_pylist())),
+            "relationship_types": sorted(relationship_counts),
             "node_properties": [
                 {
                     "nodeLabels": [label],

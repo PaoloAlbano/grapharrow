@@ -248,6 +248,72 @@ def test_search_does_not_coerce_property_types(backend: Any, value: Any) -> None
     assert result["matched_count"] == 0
 
 
+def test_projected_search_uses_canonical_labels_and_order(backend: Any) -> None:
+    first, second = backend._label_ids["Device"][:2]
+    [zone] = backend._label_ids["Zone"]
+    backend._property_tables["Device"] = pa.table(
+        {"node_id": [second, zone, first, zone], "name": ["match", "match", "match", "stale"]}
+    )
+
+    result = backend.call("node_search", {"label": "Device", "value": "match", "limit": 2})
+    assert result["matched_count"] == 2
+    assert _fetch(backend, result)["preview"] == [["sensor-00"], ["sensor-01"]]
+    assert backend.call("node_search", {"label": "Device", "value": "stale"})["matched_count"] == 0
+
+
+@pytest.mark.parametrize("direction", ["out", "in", "both"])
+def test_limited_expand_of_hubs_preserves_rows_and_full_union_count(
+    tmp_path: Path, direction: str
+) -> None:
+    app = build_application(tmp_path / "hub-expand")
+    _, hubs = app.use_cases.graph.create_nodes_bulk(
+        table=pa.table({"name": [f"hub-{index}" for index in range(8)]}),
+        default_labels=("Hub",),
+    )
+    _, targets = app.use_cases.graph.create_nodes_bulk(
+        table=pa.table({"name": [f"target-{index}" for index in range(80)]}),
+        default_labels=("Target",),
+    )
+    edges = []
+    for hub in hubs:
+        # The first candidate has the wrong target label.
+        edges.append({"src_id": hub.node_id, "dst_id": hub.node_id, "rel_type": "LINK"})
+        for index in range(160):
+            source, target = hub.node_id, targets[index % len(targets)].node_id
+            if direction == "in" or direction == "both" and index % 2:
+                source, target = target, source
+            edges.append({"src_id": source, "dst_id": target, "rel_type": "LINK"})
+    app.use_cases.graph.create_edges_bulk(table=pa.Table.from_pylist(edges))
+    with GraphArrowAgentBackend(app) as backend:
+        seed = backend.call("node_scan", {"label": "Hub", "limit": 8, "as": "hub"})
+        result = backend.call(
+            "expand",
+            {
+                "from": seed["handle"],
+                "source": "hub",
+                "relationship_type": "LINK",
+                "target_label": "Target",
+                "direction": direction,
+                "as": "target",
+                "limit": 10,
+            },
+        )
+        assert _fetch(backend, result)["rows"] == [[f"target-{index}"] for index in range(10)]
+        assert result["limited"] is True and result["input_count"] == 8
+        combined = backend.call(
+            "entity_set_operation",
+            {
+                "op": "union",
+                "operands": [{"handle": result["handle"], "var": "target"}] * 2,
+                "as": "target",
+            },
+        )
+        count = backend.call(
+            "count_handle", {"from": combined["handle"], "var": "target", "distinct": True}
+        )
+        assert _fetch(backend, count)["rows"] == [[80]]
+
+
 def test_snapshot_stays_stable_across_commit_compaction_and_vacuum(
     application: GraphArrowApplication, backend: Any
 ) -> None:

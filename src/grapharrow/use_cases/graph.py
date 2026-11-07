@@ -30,6 +30,7 @@ from grapharrow.repositories import (
     NodeRecord,
     SnapshotRepository,
 )
+from grapharrow.repositories.graph import EDGE_SCHEMA
 from grapharrow.use_cases.admin import DatabaseAdminUseCase
 
 
@@ -99,14 +100,18 @@ class GraphStateUseCase:
             edges=edges,
         )
 
-    def load_tabular_state(self) -> GraphTabularState:
-        """Load the current catalog, snapshot, and canonical Arrow tables."""
+    def load_tabular_state(self, *, include_edges: bool = True) -> GraphTabularState:
+        """Load the current snapshot and the canonical tables needed by the caller."""
 
         self._admin_service.initialize()
         catalog = self._catalog_store.load()
         snapshot = self._snapshot_store.load_manifest()
         node_table = self._graph_store.load_node_table(snapshot.nodes)
-        edge_table = self._graph_store.load_edge_table(snapshot.edges)
+        edge_table = (
+            self._graph_store.load_edge_table(snapshot.edges)
+            if include_edges
+            else EDGE_SCHEMA.empty_table()
+        )
         return GraphTabularState(
             catalog=catalog,
             snapshot=snapshot,
@@ -1058,14 +1063,14 @@ class GraphTransactionUseCase:
 
         return self._state
 
-    def load_tabular_state(self) -> GraphTabularState:
+    def load_tabular_state(self, *, include_edges: bool = True) -> GraphTabularState:
         """Return the current transaction-local state in Arrow-first form."""
 
         return GraphTabularState(
             catalog=self._state.catalog,
             snapshot=self._state.snapshot,
             node_table=self._state.node_table,
-            edge_table=self._state.edge_table,
+            edge_table=self._state.edge_table if include_edges else EDGE_SCHEMA.empty_table(),
         )
 
     def publish_records(

@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
+from collections.abc import Iterable, Iterator
+from itertools import islice
 from typing import Any
 from uuid import uuid4
 
+import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.compute as pc  # type: ignore[import-untyped]
 
 from grapharrow.ana.handles import EntityPayload, EntityReference, _preview, entity_identity
@@ -24,6 +28,61 @@ from grapharrow.ana.values import (
     _validate_membership_operand,
     equal,
 )
+
+_BATCH_SOURCE_THRESHOLD = 8
+_EDGE_ROW_BATCH_SIZE = 256
+
+
+def source_node_id(value: Any, owner: str) -> int:
+    reference = entity_identity(value)
+    if not isinstance(reference, EntityReference) or reference.owner != owner:
+        raise ValueError("Source entity does not belong to this workflow")
+    return int(reference.key)
+
+
+def edges_for_sources(
+    edges: pa.Table,
+    node_ids: list[int],
+    source_columns: tuple[str, ...],
+    *,
+    batch: bool = True,
+    max_batch_rows: int | None = None,
+) -> Iterator[Iterable[dict[str, Any]]]:
+    """Resolve candidates for each source without changing edge or input order."""
+    if not batch or len(node_ids) < _BATCH_SOURCE_THRESHOLD:
+        for node_id in node_ids:
+            mask = pc.equal(edges[source_columns[0]], node_id)
+            if len(source_columns) == 2:
+                mask = pc.or_(mask, pc.equal(edges[source_columns[1]], node_id))
+            yield _edge_rows(edges.filter(mask))
+        return
+
+    source_ids = set(node_ids)
+    keys = pa.array(list(source_ids), type=pa.int64())
+    mask = pc.is_in(edges[source_columns[0]], keys)
+    if len(source_columns) == 2:
+        mask = pc.or_(mask, pc.is_in(edges[source_columns[1]], keys))
+    candidates = edges.filter(mask)
+    if max_batch_rows is not None and candidates.num_rows > max_batch_rows:
+        yield from edges_for_sources(candidates, node_ids, source_columns, batch=False)
+        return
+    buckets: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for edge in candidates.to_pylist():
+        primary = edge[source_columns[0]]
+        if primary in source_ids:
+            buckets[primary].append(edge)
+        if len(source_columns) == 2:
+            secondary = edge[source_columns[1]]
+            if secondary != primary and secondary in source_ids:
+                buckets[secondary].append(edge)
+    for node_id in node_ids:
+        yield buckets.get(node_id, [])
+
+
+def _edge_rows(edges: pa.Table) -> Iterator[dict[str, Any]]:
+    """Decode a bounded batch at a time so limited traversals can stop early."""
+    for batch in edges.to_batches(max_chunksize=_EDGE_ROW_BATCH_SIZE):
+        yield from batch.to_pylist()
 
 
 def validate_filter(flt: dict[str, Any]) -> None:
@@ -53,7 +112,7 @@ def validate_filter(flt: dict[str, Any]) -> None:
 def initial_rows(backend: Any, args: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
     label = str(args["start_label"])
     variable = str(args.get("start_as") or label.lower())
-    nodes = backend._nodes(label)["node_id"].to_pylist()
+    nodes = backend._label_ids.get(label, [])
     if args.get("from"):
         handle = backend._handle(str(args["from"]))
         backend._guard_large_handle_input(
@@ -67,12 +126,11 @@ def initial_rows(backend: Any, args: dict[str, Any]) -> tuple[list[dict[str, Any
         for row in handle.rows:
             if variable not in row:
                 continue
-            ref = entity_identity(row[variable])
-            if not isinstance(ref, EntityReference) or ref.owner != backend._owner:
-                raise ValueError("Source entity does not belong to this workflow")
-            allowed.add(int(ref.key))
+            allowed.add(source_node_id(row[variable], backend._owner))
         nodes = [node for node in nodes if node in allowed]
-    return [{variable: backend._node(node), "__rel_ids": []} for node in nodes], variable
+    return [
+        {variable: entity, "__rel_ids": []} for entity in backend._materialize_nodes(nodes)
+    ], variable
 
 
 def extend_rows(
@@ -84,6 +142,25 @@ def extend_rows(
     *,
     exclude_traversed: bool = True,
 ) -> tuple[list[dict[str, Any]], str]:
+    expanded, target = iter_extend_rows(
+        backend, rows, source, hop, index, exclude_traversed=exclude_traversed
+    )
+    return list(expanded), target
+
+
+def iter_extend_rows(
+    backend: Any,
+    rows: Iterable[dict[str, Any]],
+    source: str,
+    hop: dict[str, Any],
+    index: int,
+    *,
+    exclude_traversed: bool = True,
+    max_rows: int | None = None,
+    distinct: bool = False,
+    matched_node_ids: set[int] | None = None,
+) -> tuple[Iterator[dict[str, Any]], str]:
+    """Validate a hop eagerly and expand bounded input batches in binding order."""
     rel_type = str(hop["relationship_type"])
     target_label = str(hop["target_label"])
     target = str(hop.get("as") or target_label.lower())
@@ -101,39 +178,47 @@ def extend_rows(
         ("src_id", "dst_id") if direction == "out" else ("dst_id", "src_id")
     )
     target_ids = set(backend._label_ids.get(target_label, []))
-    output = []
-    for row in rows:
-        source_ref = entity_identity(row[source])
-        if not isinstance(source_ref, EntityReference) or source_ref.owner != backend._owner:
-            raise ValueError("Source entity does not belong to this workflow")
-        selected = edges.filter(pc.equal(edges[source_column], int(source_ref.key)))
-        for edge in selected.to_pylist():
-            edge_id = str(edge["edge_id"])
-            target_id = edge[target_column]
-            if target_id not in target_ids:
-                continue
-            if exclude_traversed and edge_id in row.get("__rel_ids", []):
-                continue
-            node = backend._node(target_id)
-            if target in row and entity_identity(row[target]) != entity_identity(node):
-                continue
-            if rel_var in row and str(row[rel_var]["id"]) != edge_id:
-                continue
-            output.append(
-                {
-                    **row,
-                    target: node,
-                    rel_var: {
-                        "id": edge_id,
-                        "type": rel_type,
-                        "start": str(edge["src_id"]),
-                        "end": str(edge["dst_id"]),
-                        "properties": json.loads(edge["properties_json"]),
-                    },
-                    "__rel_ids": [*row.get("__rel_ids", []), edge_id],
-                }
-            )
-    return output, target
+
+    def expand() -> Iterator[dict[str, Any]]:
+        inputs = iter(rows)
+        emitted = 0
+        while batch := list(islice(inputs, _EDGE_ROW_BATCH_SIZE)):
+            node_ids = [source_node_id(row[source], backend._owner) for row in batch]
+            candidates = edges_for_sources(edges, node_ids, (source_column,), max_batch_rows=4096)
+            for row, selected in zip(batch, candidates, strict=True):
+                for edge in selected:
+                    edge_id = str(edge["edge_id"])
+                    target_id = edge[target_column]
+                    if target_id not in target_ids:
+                        continue
+                    if exclude_traversed and edge_id in row.get("__rel_ids", []):
+                        continue
+                    if target in row and entity_identity(row[target]) != EntityReference(
+                        backend._owner, str(target_id)
+                    ):
+                        continue
+                    if rel_var in row and str(row[rel_var]["id"]) != edge_id:
+                        continue
+                    if matched_node_ids is not None:
+                        duplicate = target_id in matched_node_ids
+                        matched_node_ids.add(target_id)
+                        if (max_rows is not None and emitted >= max_rows) or distinct and duplicate:
+                            continue
+                    emitted += 1
+                    yield {
+                        **row,
+                        target: backend._node(target_id),
+                        rel_var: {
+                            "id": edge_id,
+                            "type": rel_type,
+                            "start": str(edge["src_id"]),
+                            "end": str(edge["dst_id"]),
+                            "properties": json.loads(edge["properties_json"]),
+                        },
+                        "__rel_ids": [*row.get("__rel_ids", []), edge_id],
+                    }
+
+    return expand(), target
 
 
 def matches(row: dict[str, Any], flt: dict[str, Any]) -> bool:
@@ -161,7 +246,8 @@ def prepare_pattern(
     args: dict[str, Any],
     *,
     require_hops: bool = False,
-) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+    limit_final_rows: bool = False,
+) -> tuple[Iterable[dict[str, Any]], str, dict[str, Any], set[int] | None]:
     hops = list(args.get("hops") or [])
     if require_hops and not hops:
         raise ValueError("multi_hop_query requires at least one hop")
@@ -194,22 +280,45 @@ def prepare_pattern(
             raise ValueError("Metric references an unknown pattern variable")
         if metric.get("op") not in {"count", "count_distinct", "sum", "avg", "min", "max"}:
             raise ValueError(f"Unsupported metric op: {metric.get('op')}")
-    rows, current = initial_rows(backend, normalized)
+    initial, current = initial_rows(backend, normalized)
+    rows: Iterable[dict[str, Any]] = initial
+    matched_node_ids: set[int] | None = None
     pending = list(normalized_filters)
 
     def filter_bound(bound: set[str]) -> None:
         nonlocal rows, pending
         ready = [flt for flt in pending if str(flt["var"]) in bound]
-        rows = [row for row in rows if all(matches(row, flt) for flt in ready)]
+        rows = (row for row in rows if all(matches(row, flt) for flt in ready))
         pending = [flt for flt in pending if str(flt["var"]) not in bound]
 
     bound = {current}
     filter_bound(bound)
     for index, hop in enumerate(hops):
-        rows, current = extend_rows(backend, rows, current, hop, index)
+        max_rows = None
+        if (
+            limit_final_rows
+            and index == len(hops) - 1
+            and normalized.get("limit") is not None
+            and not pending
+            and not any(
+                normalized.get(key) for key in ("select", "group_by", "metrics", "order_by")
+            )
+        ):
+            max_rows = _int_arg(normalized, "limit", 1, min_value=1)
+            matched_node_ids = set()
+        rows, current = iter_extend_rows(
+            backend,
+            rows,
+            current,
+            hop,
+            index,
+            max_rows=max_rows,
+            distinct=_bool_arg(normalized.get("distinct")),
+            matched_node_ids=matched_node_ids,
+        )
         bound.update({current, str(hop.get("rel_as") or f"r{index}")})
         filter_bound(bound)
-    return rows, current, normalized
+    return rows, current, normalized, matched_node_ids
 
 
 def freeze(value: Any) -> Any:
@@ -223,7 +332,7 @@ def freeze(value: Any) -> Any:
 
 
 def aggregate_rows(
-    rows: list[dict[str, Any]], args: dict[str, Any]
+    rows: Iterable[dict[str, Any]], args: dict[str, Any]
 ) -> tuple[list[dict[str, Any]], list[str]]:
     grouping = list(args.get("group_by") or [])
     metrics = list(args.get("metrics") or [])
@@ -274,52 +383,55 @@ def aggregate_rows(
 
 def finish_pattern(
     backend: Any,
-    rows: list[dict[str, Any]],
+    rows: Iterable[dict[str, Any]],
     focus: str,
     args: dict[str, Any],
     *,
     relationship_variables: tuple[str, str] | None = None,
+    node_ids: set[int] | None = None,
 ) -> dict[str, Any]:
     selected = list(args.get("select") or [])
     grouped = bool(args.get("metrics") or args.get("group_by"))
     distinct = _bool_arg(args.get("distinct"))
+    table = grouped or bool(selected) or relationship_variables is not None
+    limit = _int_arg(args, "limit", 1, min_value=1) if args.get("limit") is not None else None
+    ordered = bool(args.get("order_by"))
+    complete_node_ids = node_ids if node_ids is not None else set()
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
     if grouped:
         output, columns = aggregate_rows(rows, args)
         pairs = [(row, row) for row in output]
     else:
-        if selected:
-            columns = [str(item.get("alias") or item["property"]) for item in selected]
-            pairs = [
-                (
-                    row,
-                    {
-                        alias: _row_property(row, str(item["var"]), str(item["property"]))
-                        for alias, item in zip(columns, selected, strict=True)
-                    },
-                )
-                for row in rows
-            ]
-        elif relationship_variables:
+        columns = [str(item.get("alias") or item["property"]) for item in selected]
+        if relationship_variables and not selected:
             columns = ["source", "target"]
-            source_var, target_var = relationship_variables
-            pairs = [(row, {"source": row[source_var], "target": row[target_var]}) for row in rows]
-        else:
-            columns = []
-            pairs = [(row, {focus: row[focus], "__rel_ids": []}) for row in rows]
-        if distinct:
-            variables = _distinct_projection_vars(args)
-            seen = set()
-            kept = []
-            for original, projected in pairs:
+        variables = _distinct_projection_vars(args)
+        seen = set()
+        for row in rows:
+            if not table and node_ids is None:
+                reference = entity_identity(row[focus])
+                if reference is not None:
+                    complete_node_ids.add(int(reference.key))
+            if selected:
+                projected = {
+                    alias: _row_property(row, str(item["var"]), str(item["property"]))
+                    for alias, item in zip(columns, selected, strict=True)
+                }
+            elif relationship_variables:
+                source_var, target_var = relationship_variables
+                projected = {"source": row[source_var], "target": row[target_var]}
+            else:
+                projected = {focus: row[focus], "__rel_ids": []}
+            if distinct:
                 key = (
-                    freeze({var: original[var] for var in variables})
-                    if variables
-                    else freeze(projected)
+                    freeze({var: row[var] for var in variables}) if variables else freeze(projected)
                 )
-                if key not in seen:
-                    seen.add(key)
-                    kept.append((original, projected))
-            pairs = kept
+                if key in seen:
+                    continue
+                seen.add(key)
+            if ordered or limit is None or len(pairs) < limit:
+                # Ordering may reference original bindings outside the projection.
+                pairs.append((row if ordered else projected, projected))
     for order in reversed(args.get("order_by") or []):
         direction = str(order.get("direction", "asc")).lower()
         if direction not in {"asc", "desc"}:
@@ -349,16 +461,12 @@ def finish_pattern(
     if args.get("limit") is not None:
         pairs = pairs[: _int_arg(args, "limit", 1, min_value=1)]
     output = [pair[1] for pair in pairs]
-    table = grouped or bool(selected) or relationship_variables is not None
     metadata = None
     if not table:
-        node_ids = {
-            int(ref.key) for row in rows if (ref := entity_identity(row[focus])) is not None
-        }
         # Prefer the declared focus label, including for empty branches.
         hops = list(args.get("hops") or [])
         target_label = str(hops[-1]["target_label"] if hops else args["start_label"])
-        metadata = backend._entity_query_metadata(node_ids, focus, target_label)
+        metadata = backend._entity_query_metadata(complete_node_ids, focus, target_label)
     return dict(
         backend._store(
             output,
@@ -379,8 +487,10 @@ def pattern_query(backend: Any, args: dict[str, Any], *, multi_hop: bool = False
         ):
             var = str(normalized.get("start_as") or str(normalized["start_label"]).lower())
             normalized["select"] = [{"var": var, "property": "name", "alias": "name"}]
-    rows, focus, normalized = prepare_pattern(backend, normalized, require_hops=multi_hop)
-    return finish_pattern(backend, rows, focus, normalized)
+    rows, focus, normalized, node_ids = prepare_pattern(
+        backend, normalized, require_hops=multi_hop, limit_final_rows=True
+    )
+    return finish_pattern(backend, rows, focus, normalized, node_ids=node_ids)
 
 
 def relationship_query(backend: Any, args: dict[str, Any]) -> dict[str, Any]:
@@ -400,7 +510,7 @@ def relationship_query(backend: Any, args: dict[str, Any]) -> dict[str, Any]:
             }
         ],
     }
-    rows, focus, normalized = prepare_pattern(backend, normalized)
+    rows, focus, normalized, _ = prepare_pattern(backend, normalized)
     return finish_pattern(backend, rows, focus, normalized, relationship_variables=(source, target))
 
 
@@ -525,7 +635,7 @@ def optional_count_by_pattern(backend: Any, args: dict[str, Any]) -> dict[str, A
     if not isinstance(optional, dict):
         raise ValueError("optional_relationship must describe a relationship hop")
     source_args = {**args, "metrics": [], "select": []}
-    rows, last, normalized = prepare_pattern(backend, source_args, require_hops=True)
+    rows, last, normalized, _ = prepare_pattern(backend, source_args, require_hops=True)
     contexts = _pattern_var_contexts(str(args["start_label"]), args.get("start_as"), args["hops"])
     grouping = list(args.get("group_by") or [])
     source = str(

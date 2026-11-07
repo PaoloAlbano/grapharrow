@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest.mock import patch
 
 import pyarrow as pa  # type: ignore[import-untyped]
 import pytest
@@ -20,6 +21,7 @@ from grapharrow.use_cases.cypher import (
     _build_match_optional_logical_plan,
     _build_match_with_logical_plan,
     _build_optional_match_logical_plan,
+    _canonical_labels_contains_all_mask,
     _compile_query,
     _edge_match_table,
     _node_binding_table,
@@ -39,6 +41,36 @@ from grapharrow.use_cases.cypher_plan import (
     WithAggregatePlan,
     WithProjectPlan,
 )
+
+
+@pytest.mark.parametrize("disable_planner", ["0", "1"])
+def test_match_reads_canonical_edges_only_when_required(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, disable_planner: str
+) -> None:
+    monkeypatch.setenv("GRAPHARROW_DISABLE_CYPHER_PLANNER", disable_planner)
+    database = Database(tmp_path / "match-datasets")
+    with database.write_transaction() as session:
+        session.query("CREATE (:Person {name: 'Alice'})-[:KNOWS]->(:Person {name: 'Bob'})")
+
+    graph = database._app.repositories.graph
+    with (
+        database.read_transaction() as session,
+        patch.object(graph, "load_edge_table", wraps=graph.load_edge_table) as load_edges,
+    ):
+        result = session.query("MATCH (p:Person) WHERE p.name = 'Alice' RETURN p.name AS name")
+        assert result.rows == ({"name": "Alice"},)
+        load_edges.assert_not_called()
+
+        result = session.query("MATCH (p:Person)-[:KNOWS]->() RETURN p.name AS name")
+        assert result.rows == ({"name": "Alice"},)
+        load_edges.assert_called_once()
+        load_edges.reset_mock()
+
+        result = session.query(
+            "MATCH (p:Person) WHERE NOT EXISTS { (p)-[:KNOWS]->() } RETURN p.name AS name"
+        )
+        assert result.rows == ({"name": "Bob"},)
+        load_edges.assert_called_once()
 
 
 def test_match_logical_plan_uses_node_scan_for_single_node_match() -> None:
@@ -150,6 +182,16 @@ def test_node_property_projection_normalizes_escaped_property_columns() -> None:
     ]
 
 
+def test_canonical_label_mask_ignores_children_of_null_lists() -> None:
+    labels = pa.ListArray.from_arrays(
+        [0, 1, 3, 3, 4],
+        ["Ignored", "`Person`", "Employee", "Person"],
+        mask=pa.array([True, False, False, False]),
+    )
+    mask = _canonical_labels_contains_all_mask(pa.chunked_array([labels]), ("Person", "Employee"))
+    assert mask.to_pylist() == [False, True, False, False]
+
+
 def test_match_logical_plan_pushes_text_predicate_into_node_scan() -> None:
     compiled = _compile_query(
         parse_cypher(
@@ -173,15 +215,18 @@ def test_match_logical_plan_pushes_text_predicate_into_node_scan() -> None:
 def test_node_property_projection_applies_where_pushdown_before_join() -> None:
     canonical = pa.table(
         {
-            "node_id": pa.array([1, 2, 3], type=pa.int64()),
-            "labels": pa.array([["Person"], ["Person"], ["Person"]], type=pa.list_(pa.string())),
-            "properties_json": pa.array(["{}", "{}", "{}"], type=pa.string()),
+            "node_id": pa.array([1, 2, 3, 4], type=pa.int64()),
+            "labels": pa.chunked_array(
+                [[["Person"], ["Person", "Employee"]], [["Person"], ["Pet"]]],
+                type=pa.list_(pa.string()),
+            ),
+            "properties_json": pa.array(["{}", "{}", "{}", "{}"], type=pa.string()),
         }
     )
     property_table = pa.table(
         {
-            "node_id": pa.array([1, 2, 3], type=pa.int64()),
-            "name": pa.array(["Alice", "Bob", "Alice"], type=pa.string()),
+            "node_id": pa.array([1, 2, 3, 4], type=pa.int64()),
+            "name": pa.array(["Alice", "Bob", "Alice", "Bob"], type=pa.string()),
         }
     )
 
@@ -206,7 +251,7 @@ def test_node_property_projection_applies_where_pushdown_before_join() -> None:
             "n.__entity_id": 2,
             "n.__id": 2,
             "n.__join_id": 2,
-            "n.labels": '["Person"]',
+            "n.labels": '["Person", "Employee"]',
             "n.name": "Bob",
         }
     ]

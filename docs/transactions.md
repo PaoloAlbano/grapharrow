@@ -47,14 +47,16 @@ state; separate REST and Bolt processes do not automatically coordinate writers.
 An explicit Bolt transaction also does not detect a later commit from another
 writer before publishing its own state.
 
-Publishing a snapshot pointer does not make an arbitrary set of filesystem or
-object-storage writes one distributed atomic transaction. Object-store behavior
-depends on the backend. The current pointer is written through the generic
-filesystem output stream; atomic replacement and crash-durable publication are
-not guaranteed, including for readers racing a local pointer write.
-General ACID guarantees, multi-writer serialization,
-durable recovery of in-flight transactions and full database isolation levels
-have not been established.
+On the local filesystem, GraphArrow writes `current_snapshot.json` to a
+temporary file in the same directory, flushes it to disk and replaces the
+current file with `os.replace`. A reader sees either the previous complete
+pointer or the new one. An error before replacement leaves the previous
+pointer in place.
+
+This guarantee covers pointer visibility. Power-loss durability of the
+whole snapshot, including the manifest and Parquet files, remains outside
+that guarantee. Object storage continues to publish through its filesystem
+output stream, with visibility depending on the backend.
 
 Use [verification and recovery operations](../README.md) for the supported
 administrative checks, and consult the

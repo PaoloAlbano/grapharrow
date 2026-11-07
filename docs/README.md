@@ -22,6 +22,10 @@ All versioned documents, source code and comments are written in English.
 
 - [ANA Session Resources](benchmarks/ana-session-resources.md): session latency,
   resident memory and retained-state quota accounting on a deterministic graph.
+- [Concurrent ANA Traversals](benchmarks/ana-traversal-stress.md) measures
+  high-degree traversals, small output limits, concurrent workflows, and peak RSS.
+- [Streaming ANA Patterns](benchmarks/ana-pattern-streaming.md) compares
+  pattern latency, memory, and complete branch counts with progressive execution.
 - [Data Access Backend Evaluation](data-access-backend-evaluation.md): the
   rationale for using PyArrow as the storage and execution substrate.
 - [Benchmark Reports](benchmarks/): recorded results, comparisons and supporting profiles.
