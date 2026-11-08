@@ -2,46 +2,202 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      release-build:
+        description: Preserve tested container images for the tag release workflow.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ !inputs.release-build }}
+
+env:
+  UV_NO_PROGRESS: "1"
 
 jobs:
-  checks:
+  quality:
+    name: ${{ matrix.check }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        check: [lint, format, typecheck]
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+      - run: uv sync --locked --python 3.12
+      - name: Lint
+        if: matrix.check == 'lint'
+        run: uv run --frozen ruff check .
+      - name: Validate GitHub Actions workflows
+        if: matrix.check == 'lint'
+        run: |
+          curl --fail --location --retry 3 \
+            --output "$RUNNER_TEMP/actionlint.tar.gz" \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          printf '%s  %s\n' \
+            8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 \
+            "$RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" --directory "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint"
+      - name: Format
+        if: matrix.check == 'format'
+        run: uv run --frozen ruff format --check .
+      - name: Typecheck
+        if: matrix.check == 'typecheck'
+        run: uv run --frozen mypy src
+
+  tests:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(github.event_name == 'pull_request' && '["3.11","3.15"]' || '["3.11","3.12","3.13","3.14","3.15"]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: ${{ matrix.python-version }}
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-      - name: Install locked dependencies
-        run: uv sync --locked --python ${{ matrix.python-version }}
-      - name: Lint
-        run: uv run --frozen ruff check .
-      - name: Check formatting
-        run: uv run --frozen ruff format --check .
-      - name: Check types
-        run: uv run --frozen mypy src
+        with:
+          enable-cache: true
+      - run: uv sync --locked --python ${{ matrix.python-version }}
       - name: Test local backends and interfaces
-        run: uv run --frozen pytest -m "not live_storage"
-      - name: Build distributions
-        run: uv build --no-sources
-      - name: Verify archives and install the wheel in a clean environment
-        run: uv run --frozen python .github/check_distribution.py dist
+        run: uv run --frozen pytest -m "not live_storage and not neo4j_reference"
+
+  distributions:
+    name: Build wheel and source distribution
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+      - name: Build once from the source distribution
+        run: |
+          uv lock --check
+          uv build --no-sources --out-dir dist
+          uv export --locked --no-dev --no-emit-project --output-file dist/runtime-requirements.txt
+          python .github/check_distribution.py dist --archives-only
+          python .github/release_metadata.py --checksums dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: python-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  wheel-smoke:
+    name: Installed wheel / Python ${{ matrix.python-version }}
+    needs: distributions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(github.event_name == 'pull_request' && '["3.11","3.15"]' || '["3.11","3.12","3.13","3.14","3.15"]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: python-distributions
+          path: dist
+      - name: Install and exercise the built wheel outside the checkout
+        run: python .github/check_distribution.py dist
+
+  docker:
+    name: Docker / ${{ matrix.arch }}
+    needs: distributions
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"arch":"amd64","runner":"ubuntu-24.04"}]' || '[{"arch":"amd64","runner":"ubuntu-24.04"},{"arch":"arm64","runner":"ubuntu-24.04-arm"}]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+      - run: uv sync --locked --python 3.12
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: python-distributions
+          path: dist
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build the runtime from the verified wheel
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          version="$(python .github/release_metadata.py --version)"
+          docker buildx build --load --platform "linux/$ARCH" \
+            --build-arg DISTRIBUTION_SOURCE=prebuilt \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$version" \
+            --cache-from "type=gha,scope=runtime-$ARCH" \
+            --cache-to "type=gha,mode=max,scope=runtime-$ARCH" \
+            --tag "grapharrow:check-$ARCH" .
+      - name: Check auth, sessions, persistence and Bolt in the container
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: uv run --frozen python .github/smoke_docker.py "grapharrow:check-$ARCH"
+      - name: Preserve the tested image for publication
+        if: inputs.release-build
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: docker save "grapharrow:check-$ARCH" | gzip > "image-$ARCH.tar.gz"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: inputs.release-build
+        with:
+          name: docker-${{ matrix.arch }}
+          path: image-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+          retention-days: 3
 
   ana-reference:
+    name: ANA and Cypher reference
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
     services:
       neo4j:
         image: neo4j:2026.05.0
@@ -59,18 +215,21 @@ jobs:
           --health-retries 12
           --health-start-period 30s
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-      - name: Install locked dependencies
-        run: uv sync --locked
+        with:
+          enable-cache: true
+      - run: uv sync --locked --python 3.12
       - name: Start the ANA reference HTTP service
         run: |
           key="$(openssl rand -hex 32)"
           echo "::add-mask::$key"
-          auth="$(mktemp "${RUNNER_TEMP}/ana-clients.XXXXXX")"
+          auth="$(mktemp "$RUNNER_TEMP/ana-clients.XXXXXX")"
           printf '{"clients":[{"id":"grapharrow-ci","api_key":"%s"}]}' "$key" > "$auth"
           chmod 644 "$auth"
           docker run -d --name grapharrow-ana-reference --network host \
@@ -89,9 +248,26 @@ jobs:
           GRAPHARROW_TEST_NEO4J_URI: bolt://localhost:7687
           GRAPHARROW_TEST_NEO4J_PASSWORD: grapharrow-reference-ci
           GRAPHARROW_TEST_ANA_URL: http://127.0.0.1:8080
-        run: >-
-          uv run --frozen pytest tests/integration/test_ana_reference.py
-          tests/integration/test_cypher_reference.py
+        run: uv run --frozen pytest -m neo4j_reference
       - name: Stop the reference service
         if: always()
         run: docker rm -f grapharrow-ana-reference
+
+  required:
+    name: CI required
+    if: always()
+    needs: [quality, tests, distributions, wheel-smoke, docker, ana-reference]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every validation job to succeed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python - <<'PYTHON'
+          import json, os
+          results = json.loads(os.environ["RESULTS"])
+          failed = {name: job["result"] for name, job in results.items() if job["result"] != "success"}
+          if failed:
+              raise SystemExit(f"Required CI jobs did not succeed: {failed}")
+          PYTHON

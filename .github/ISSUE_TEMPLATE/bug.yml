@@ -1,0 +1,57 @@
+name: Bug report
+description: Report incorrect behavior with a minimal reproduction.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues and the known Cypher issues guide first.
+        Use synthetic data and remove credentials, private endpoints and personal information.
+  - type: input
+    id: version
+    attributes:
+      label: GraphArrow version or commit
+      placeholder: "0.1.0 or a commit SHA"
+    validations:
+      required: true
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation
+      options: [GitHub release wheel, Docker image, Source checkout, Other]
+    validations:
+      required: true
+  - type: dropdown
+    id: interface
+    attributes:
+      label: Interface
+      options: [Embedded Python, REST, ANA, Bolt, MCP, CLI, Storage or administration]
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include Python and PyArrow versions, OS/architecture and storage backend. For Docker, include the image tag or digest.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include graph setup and the query, tool arguments or Python code that reproduces the problem.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and sanitized error output
+    validations:
+      required: true

@@ -1,0 +1,39 @@
+name: Performance report
+description: Report a reproducible latency or memory problem.
+title: "[Performance]: "
+body:
+  - type: markdown
+    attributes:
+      value: Use synthetic or shareable data. Remove credentials and private endpoints from logs.
+  - type: input
+    id: version
+    attributes:
+      label: GraphArrow version or commit
+    validations:
+      required: true
+  - type: textarea
+    id: workload
+    attributes:
+      label: Workload and reproduction
+      description: Include the interface, query or tool calls, graph size, labels/relationship types and relevant indexes. Describe data generation when possible.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and configuration
+      description: Include Python/PyArrow, OS/architecture, CPU/RAM, storage backend and relevant cache settings.
+    validations:
+      required: true
+  - type: textarea
+    id: measurements
+    attributes:
+      label: Measurements
+      description: Include elapsed time or memory, repetitions, warmup, cold/warm cache and concurrent clients. Confirm that results are correct.
+    validations:
+      required: true
+  - type: textarea
+    id: comparison
+    attributes:
+      label: Expected behavior or comparison
+      description: If this is a regression, include the earlier version and measurements under the same conditions.

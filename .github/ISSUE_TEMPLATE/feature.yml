@@ -1,0 +1,29 @@
+name: Feature request
+description: Describe a use case and the behavior needed to support it.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: GraphArrow currently prioritizes correctness, openCypher coverage and performance. Requests help identify use cases and do not imply an implementation commitment.
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case or problem
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Include example queries or tool calls and expected results where useful.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Current workaround or alternatives
+  - type: textarea
+    id: standard
+    attributes:
+      label: Standard or compatibility reference
+      description: Link to the relevant openCypher, ANA or other specification, if applicable.

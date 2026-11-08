@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import tarfile
 import zipfile
+from email.parser import Parser
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -17,6 +19,7 @@ from pathlib import Path
 import secrets
 import sys
 import grapharrow
+from importlib.metadata import version
 from fastapi.testclient import TestClient
 from grapharrow.app import build_application
 from grapharrow.config import GraphArrowSettings
@@ -27,6 +30,7 @@ assert find_spec("agent_native_graph") is None
 assert find_spec("neo4j") is None
 
 assert Path(grapharrow.__file__).is_relative_to(Path(sys.prefix)), grapharrow.__file__
+assert version('grapharrow') == os.environ['GRAPHARROW_EXPECTED_VERSION']
 token = secrets.token_urlsafe(32)
 auth = Path('clients.json')
 auth.write_text(json.dumps({'clients': [{'id': 'smoke', 'api_key': token, 'profile': 'readonly'}]}))
@@ -35,6 +39,7 @@ os.environ['ANA_AUTH_FILE'] = str(auth.resolve())
 application = build_application('db')
 application.use_cases.graph.create_node(labels=('Device',), properties={'name': 'wheel-device'})
 app = create_rest_app('db', settings=GraphArrowSettings(ana_max_handles_per_session=1))
+assert app.version == version('grapharrow')
 with TestClient(app) as client:
     assert client.get('/health').json() == {'status': 'ok'}
     headers = {'Authorization': 'Bearer ' + token}
@@ -284,6 +289,7 @@ def check_names(names: list[str]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
+    parser.add_argument("--archives-only", action="store_true")
     args = parser.parse_args()
     directory = args.directory.resolve()
     wheels = list(directory.glob("grapharrow-*.whl"))
@@ -295,6 +301,8 @@ def main() -> None:
         check_names(names)
         metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
         metadata = archive.read(metadata_name).decode()
+        expected_version = Parser().parsestr(metadata)["Version"]
+        assert expected_version
         assert "License-Expression: Apache-2.0" in metadata
         assert any(name.endswith("/licenses/LICENSE") for name in names)
         assert any(name.endswith("/licenses/THIRD_PARTY_NOTICES.md") for name in names)
@@ -335,6 +343,17 @@ def main() -> None:
         assert any(
             name.endswith("/scripts/benchmark_cypher_columnar.py") for name in archive.getnames()
         )
+        package_info = next(
+            member
+            for member in archive.getmembers()
+            if member.name.count("/") == 1 and member.name.endswith("/PKG-INFO")
+        )
+        source_info = archive.extractfile(package_info)
+        assert source_info is not None
+        assert Parser().parsestr(source_info.read().decode())["Version"] == expected_version
+    if args.archives_only:
+        print(f"Distribution archive checks passed for GraphArrow {expected_version}.")
+        return
     with TemporaryDirectory(prefix="grapharrow-distribution-") as temporary:
         root = Path(temporary)
         environment = root / "venv"
@@ -345,7 +364,10 @@ def main() -> None:
             ["uv", "pip", "install", "--python", str(python), str(wheels[0]), "httpx", "httpx2"],
             check=True,
         )
-        subprocess.run([str(python), "-I", "-c", SMOKE], cwd=root, check=True)
+        environment_variables = {**os.environ, "GRAPHARROW_EXPECTED_VERSION": expected_version}
+        subprocess.run(
+            [str(python), "-I", "-c", SMOKE], cwd=root, env=environment_variables, check=True
+        )
     print(
         "Distribution checks passed: license, standalone ANA runtime, "
         "private-file exclusions and fresh install."

@@ -53,6 +53,7 @@ packages = ["src/grapharrow"]
 include = [
   "/src", "/tests", "/vendor", "/docs", "/pyproject.toml", "/uv.lock",
   "/README.md", "/LICENSE", "/THIRD_PARTY_NOTICES.md", "/CONTRIBUTING.md",
+  "/.github/release_metadata.py", "/.github/publish_release.py",
   "/Makefile", "/Dockerfile", "/Dockerfile.dev", "/.dockerignore",
   "/scripts/benchmark_backends.py", "/scripts/benchmark_bolt_engines.py",
   "/scripts/benchmark_cypher_engine.py", "/scripts/benchmark_tabular_json.py",

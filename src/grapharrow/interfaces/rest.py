@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any, cast
 
@@ -114,7 +115,7 @@ def create_rest_app(
     container = build_application(path, settings=settings, filesystem=filesystem)
     container.use_cases.admin.initialize()
 
-    app = FastAPI(title="GraphArrow", version="0.1.0")
+    app = FastAPI(title="GraphArrow", version=version("grapharrow"))
     app.state.grapharrow = container
     public_router = APIRouter(prefix=container.settings.rest_prefix)
     protected_router = APIRouter(

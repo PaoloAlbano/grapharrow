@@ -27,6 +27,10 @@ visibility, local writer coordination, conflict handling and object-storage limi
 
 ## Getting Started
 
+See [CI and Releases](docs/releases.md) for the Python test matrix, downloadable
+release wheels and versioned Docker images. Release publication starts when a
+maintainer pushes a matching `v*` tag; it is separate from ordinary main/PR CI.
+
 This project requires Python 3.11+, Git and `uv`. ANA is installed with the
 standard dependencies; no optional extra or adjacent checkout is needed.
 

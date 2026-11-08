@@ -5,6 +5,9 @@ All versioned documents, source code and comments are written in English.
 
 ## Technical guides
 
+- [CI and Releases](releases.md): Python test matrices, tag-driven GitHub Release
+  assets and Docker image versioning for amd64 and arm64.
+
 - [Server Startup and Authentication](server-configuration.md): HTTP/ANA and Bolt
   startup, separate credentials, client examples, bind addresses and Docker.
 - [ANA HTTP Interface](ana-interface.md): default agent tools, RPC, sessions and runtime limits.

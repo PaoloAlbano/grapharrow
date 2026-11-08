@@ -83,5 +83,16 @@ Describe the triggering problem, the resulting behavior and relevant validation.
 Call out public API/storage changes and known limits. Exclude credentials,
 generated datasets, local plans and unrelated benchmark output.
 
-The CI workflow checks Python 3.11 and 3.12, runs local tests and builds the
-distributions. Builds and tests do not publish packages, images or releases.
+The CI workflow tests Python 3.11 and 3.15 on pull requests and Python 3.11
+through 3.15 on main. Lint, formatting and typechecking run separately, once
+each. Real-cloud tests and benchmarks are excluded from ordinary CI.
+
+Open issues through the bug, performance or feature request forms. Include a
+minimal reproduction with synthetic data and sanitized logs; do not include
+credentials, private endpoints or personal information. The pull request
+template asks for the problem, resulting behavior and relevant validation.
+
+The [CI and release guide](docs/releases.md) explains distribution checks and
+tag-driven releases. Main and PR checks build and test artifacts; pushing a
+matching `v*` tag runs full validation and then publishes GitHub Release assets
+and the two Docker architectures. PyPI publication is not configured.
