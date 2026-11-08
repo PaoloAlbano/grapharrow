@@ -14,12 +14,18 @@ they do not fetch the catalog or install the reference package.
 
 ## Start the server
 
-Install GraphArrow and configure the ANA client file:
+Follow [Server Startup and Authentication](server-configuration.md) for a complete
+configuration with separate REST, ANA and Bolt credentials, startup commands,
+client calls and Docker examples. `grapharrow-server` starts REST and ANA in
+one HTTP process; Bolt uses the separate `grapharrow-bolt` command.
+
+For an existing deployment, export `ANA_AUTH_FILE` with the path to a private
+client file and configure the separate REST token before starting HTTP:
 
 ```bash
-uv sync
 export ANA_AUTH_FILE=/path/to/private/ana-clients.json
-uv run grapharrow-server --path /path/to/database
+export GRAPHARROW_SERVER_AUTH_TOKEN='<your-generated-rest-token>'
+uv run --locked grapharrow-server --path /path/to/database --host 127.0.0.1 --port 8000
 ```
 
 The auth file uses the ANA format:

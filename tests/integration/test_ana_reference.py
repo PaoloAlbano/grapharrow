@@ -113,6 +113,24 @@ def rows_key(rows: list[Any]) -> Counter[str]:
     return Counter(json.dumps(row, sort_keys=True, default=str) for row in rows)
 
 
+def assert_schema_examples(item: dict[str, Any], *, label: str | None = None) -> None:
+    """Samples may differ when the reference store reuses deleted node IDs."""
+    if label is not None or "label" in item:
+        owner = label if label is not None else item["label"]
+        sources = [properties for name, properties in NODES if name == owner]
+    else:
+        sources = [
+            props for _, _, rel_type, props in EDGES if rel_type == item["relationship_type"]
+        ]
+    property_name = item.get("property", item.get("name"))
+    population = rows_key([props[property_name] for props in sources if property_name in props])
+    examples = item["examples"]
+    assert len(examples) <= 3
+    assert bool(examples) == bool(population)
+    assert set(rows_key(examples)) <= set(population)
+    assert len(rows_key(examples)) == len(examples)
+
+
 def assert_result(backends: Any, tool: str, args: dict[str, Any], *, ordered: bool = False) -> None:
     native, reference = [fetch(backend, tool, args) for backend in backends]
     assert native["columns"] == reference["columns"]
@@ -392,12 +410,24 @@ def test_schema_planning_and_repair(backends: Any, tool: str, args: dict[str, An
                 assert local[key] == remote[key]
             assert local["safe_start_score"] == pytest.approx(remote["safe_start_score"])
     elif tool == "schema_search":
-        for key in ("query", "labels", "node_properties", "relationship_properties"):
+        for key in ("query", "labels"):
             assert native[key] == reference[key]
+        for key in ("node_properties", "relationship_properties"):
+            for result in (native, reference):
+                for item in result[key]:
+                    assert_schema_examples(item)
+            assert [{k: v for k, v in item.items() if k != "examples"} for item in native[key]] == [
+                {k: v for k, v in item.items() if k != "examples"} for item in reference[key]
+            ]
     elif tool in {"schema_describe_label", "schema_describe_relationship"}:
         fields = ("name", "mandatory") if tool == "schema_describe_label" else ("property",)
-        fields += ("inferred_type", "operators", "examples")
+        fields += ("inferred_type", "operators")
         for result in (native, reference):
+            for item in result["properties"]:
+                if tool == "schema_describe_label":
+                    assert_schema_examples(item, label=args["label"])
+                else:
+                    assert_schema_examples(item | {"relationship_type": args["relationship_type"]})
             result["properties"] = [
                 {field: item[field] for field in fields} for item in result["properties"]
             ]

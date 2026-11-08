@@ -6,7 +6,9 @@ from collections import OrderedDict
 from threading import RLock
 
 from grapharrow.adapters.opencypher import parse_cypher
-from grapharrow.interfaces.opencypher.generated.vendor.opencypher.CypherParser import CypherParser
+from grapharrow.interfaces.opencypher.generated.vendor.opencypher.GraphArrowCypherParser import (
+    GraphArrowCypherParser as CypherParser,
+)
 
 
 class CypherParseCache:

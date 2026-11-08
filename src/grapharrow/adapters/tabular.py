@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import numpy as np
 import orjson
 import pyarrow as pa  # type: ignore[import-untyped]
+import pyarrow.compute as pc  # type: ignore[import-untyped]
 
 _JOIN_JSON_PREFIX = "__grapharrow_join_json__:"
 
@@ -62,6 +64,18 @@ class PyArrowTabularAdapter:
             join_type="inner",
         )
 
+    def sort_window_table(
+        self,
+        table: pa.Table,
+        by: Sequence[tuple[str, str]],
+        *,
+        skip: int,
+        limit: int,
+    ) -> pa.Table:
+        """Sort selected candidates only, retaining legacy null placement."""
+        keys = [(name, direction, "at_end") for name, direction in by]
+        return table.take(sort_window_indices(table, keys, skip=skip, limit=limit))
+
     def left_join(
         self,
         left: pa.Table,
@@ -96,6 +110,36 @@ def _encode_nested_join_columns(table: pa.Table) -> pa.Table:
         )
         updated = updated.set_column(index, field.name, encoded)
     return updated
+
+
+def sort_window_indices(
+    table: pa.Table,
+    by: Sequence[tuple[str, str, str]],
+    *,
+    skip: int = 0,
+    limit: int | None = None,
+    top_k: bool = True,
+) -> pa.Array:
+    """Stable mixed-direction ordering, with O(k) candidate indices for small windows."""
+    if limit == 0 or skip >= table.num_rows:
+        return pa.array([], type=pa.uint64())
+    columns = {f"key_{i}": table[name] for i, (name, _, _) in enumerate(by)}
+    # select_k is unstable; a unique final ordinal makes every comparison total
+    # and preserves input order for ties, including null and NaN values.
+    columns["ordinal"] = pa.array(np.arange(table.num_rows, dtype=np.int64))
+    keys = [(f"key_{i}", direction, nulls) for i, (_, direction, nulls) in enumerate(by)]
+    keys.append(("ordinal", "ascending", "at_end"))
+    ordering = pa.table(columns)
+    bound = table.num_rows if limit is None else min(skip + limit, table.num_rows)
+    if top_k and limit is not None and bound <= table.num_rows // 4:
+        try:
+            candidates = pc.select_k_unstable(ordering, k=bound, sort_keys=keys)
+            ordered = pc.sort_indices(ordering.take(candidates), sort_keys=keys)
+            return pc.take(candidates, ordered).slice(skip, limit)
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
+            pass
+    indices = pc.sort_indices(ordering, sort_keys=keys)
+    return indices.slice(skip, limit)
 
 
 def _json_dumps(value: object) -> str:

@@ -4959,15 +4959,14 @@ def test_invalid_cypher_syntax_raises_query_error(tmp_path: Path) -> None:
             session.query("MATCH (n:Person RETURN n")
 
 
-def test_valid_but_unsupported_cypher_feature_raises_query_error(tmp_path: Path) -> None:
+def test_multiple_with_clauses_preserve_entity_bindings(tmp_path: Path) -> None:
     database = Database(tmp_path / "example-db")
 
     with database.write_transaction() as session:
-        with pytest.raises(
-            QueryError,
-            match="Only a single WITH clause is supported per multi-part query.",
-        ):
-            session.query("MATCH (n:Person) WITH n WITH n RETURN n")
+        session.query("CREATE (:Person {name: 'Alice'})")
+    with database.read_transaction() as session:
+        result = session.query("MATCH (n:Person) WITH n WITH n RETURN n.name AS name")
+    assert result.rows == ({"name": "Alice"},)
 
 
 def test_create_rejects_multi_hop_paths_for_now(tmp_path: Path) -> None:

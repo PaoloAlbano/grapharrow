@@ -83,7 +83,9 @@ Plans can take advantage of existing derived datasets:
 Requested fields allow property loaders to select relevant Parquet columns.
 Supported property predicates filter columnar data before joins. These access
 paths coexist with canonical-table fallbacks; catalog index declarations do
-not imply a physical point-lookup index.
+not all imply a physical point-lookup index. Eligible single-property node
+`range` and `lookup` declarations can use bounded lazy in-memory equality
+indexes; see [Engine Read and Write Optimizations](engine-performance.md).
 
 ## Optional branches and output semantics
 
@@ -105,6 +107,11 @@ The planner does not provide a general physical-plan search, cost model,
 comprehensive join reordering or full separation of logical and physical plans.
 Supported scalar `DISTINCT` paths use Arrow; entity/nested results and some
 expression shapes still require fallbacks.
+
+Multiple read `WITH` stages, `CASE`/`coalesce`, unions and read subqueries also
+use the [composable read runtime](query-execution-architecture.md#composable-read-stages).
+They are supported language features without general lowering into this V1
+planner; they retain Python row materialization and the core Arrow matcher.
 
 ## Validation and measurements
 

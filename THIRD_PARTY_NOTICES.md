@@ -9,6 +9,11 @@ Copyright (c) 2015-2023 "Neo Technology," Network Engine for Objects in Lund AB.
 The grammar is distributed under the Apache License, Version 2.0. Its original
 copyright, license and attribution notices are retained in the vendored sources.
 
+`vendor/opencypher/Cypher.g4` is unchanged. GraphArrow's derived
+`vendor/opencypher/GraphArrowCypher.g4` imports it and adds read subquery syntax.
+The generated `GraphArrowCypher` lexer, parser and visitor reflect those
+extensions and are not an official openCypher release.
+
 The openCypher grammar's attribution notice states that the work was created by
 the collective efforts of the openCypher community. GraphArrow implements a
 subset of the language; it does not claim openCypher conformance or approval by

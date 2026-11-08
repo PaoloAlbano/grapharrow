@@ -15,8 +15,10 @@ make typecheck
 uv run pytest -m "not live_storage"
 ```
 
-ANA is included in the standard installation. Its upstream source is pinned by
-commit in `pyproject.toml` and `uv.lock`; no adjacent repository is required.
+ANA is included in the standard installation and uses GraphArrow's own runtime,
+tool schemas and descriptions. No reference ANA package or adjacent checkout is
+required. The reference server is used only for optional HTTP compatibility
+tests; see the [ANA interface guide](docs/ana-interface.md).
 
 The local suite includes loopback HTTP/Bolt and simulated S3 tests. Real-cloud
 tests are opt-in and require dedicated storage configuration; see
@@ -44,6 +46,36 @@ Run the [differential workflow suite](docs/ana-interface.md#validation) against
 an empty disposable Neo4j database when changing ANA data semantics. Ordinary
 local tests skip it when the reference URI is absent; the separate CI job runs
 it against an isolated service. The fixture refuses preexisting graph data.
+
+## Cypher changes
+
+The parser is generated from `vendor/opencypher/GraphArrowCypher.g4`, which
+imports the unchanged upstream `Cypher.g4`. To regenerate it, obtain the
+ANTLR 4.13.2 complete JAR from the [ANTLR download page](https://www.antlr.org/download.html)
+and use a compatible Java runtime:
+
+```bash
+make generate-cypher-parser ANTLR_JAR=/absolute/path/to/antlr-4.13.2-complete.jar
+```
+
+Commit the derived grammar and its generated lexer, parser, visitor and token
+files together. Keep the original upstream grammar and its notices intact.
+Java and the generator JAR are development tools, not runtime dependencies.
+
+Run the unit and interface comparison suites for query changes. The optional
+Neo4j differential suite shares the reference connection settings used by the
+ANA suite. Point them at an empty disposable database only; the fixtures refuse
+existing data and remove their own test nodes afterwards:
+
+```bash
+export GRAPHARROW_TEST_NEO4J_URI=bolt://127.0.0.1:17687
+export GRAPHARROW_TEST_NEO4J_USER=neo4j
+# Set GRAPHARROW_TEST_NEO4J_PASSWORD to the disposable service's password.
+uv run pytest tests/integration/test_cypher_reference.py
+```
+
+The reference service is used by tests only. GraphArrow executes queries through
+its own engine and does not require the Neo4j driver in a standard installation.
 
 ## Pull requests
 

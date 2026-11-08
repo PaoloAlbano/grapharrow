@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Generator, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -101,12 +101,20 @@ class GraphStateUseCase:
         """Serialize a complete database mutation with other coordinated writers."""
         return self._writer.hold()
 
-    def load_state(self) -> GraphState:
+    def capture_snapshot(self) -> SnapshotManifest:
+        """Pin a published snapshot without loading canonical graph tables."""
+        self._admin_service.initialize()
+        return self._snapshot_store.load_manifest()
+
+    def load_state(self, *, snapshot: SnapshotManifest | None = None) -> GraphState:
         """Load the current catalog, snapshot, and graph records."""
 
         self._admin_service.initialize()
-        catalog = self._catalog_store.load()
-        snapshot = self._snapshot_store.load_manifest()
+        catalog = self._catalog_store.load(
+            version=snapshot.catalog_version if snapshot is not None else None
+        )
+        if snapshot is None:
+            snapshot = self._snapshot_store.load_manifest()
         node_table = self._graph_store.load_node_table(snapshot.nodes)
         edge_table = self._graph_store.load_edge_table(snapshot.edges)
         nodes = tuple(self._graph_store.node_records_from_table(node_table))
@@ -196,6 +204,28 @@ class GraphStateUseCase:
             if selected is not None:
                 return selected
         return None
+
+    def iter_node_property_batches(
+        self,
+        *,
+        snapshot: SnapshotManifest,
+        label: str,
+        columns: list[str],
+        predicates: tuple[ScanPredicate, ...] = (),
+        batch_size: int = 65536,
+    ) -> Generator[pa.RecordBatch, None, None]:
+        """Stream narrow property batches from a pinned snapshot."""
+        return self._graph_store.iter_node_property_batches(
+            snapshot.node_properties,
+            label=label,
+            columns=columns,
+            predicates=predicates,
+            batch_size=batch_size,
+        )
+
+    def load_node_property_schema(self, *, snapshot: SnapshotManifest, label: str) -> pa.Schema:
+        """Inspect physical property encodings before enabling a columnar read."""
+        return self._graph_store.load_node_property_schema(snapshot.node_properties, label=label)
 
     def load_edge_property_table(
         self,

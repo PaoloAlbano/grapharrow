@@ -5,18 +5,24 @@ All versioned documents, source code and comments are written in English.
 
 ## Technical guides
 
-- [ANA HTTP Interface](ana-interface.md): default agent tools, RPC, sessions and compatibility limits.
+- [Server Startup and Authentication](server-configuration.md): HTTP/ANA and Bolt
+  startup, separate credentials, client examples, bind addresses and Docker.
+- [ANA HTTP Interface](ana-interface.md): default agent tools, RPC, sessions and runtime limits.
 - [Interface Comparison](interface-comparison.md): expected and actual graph
   results across Python, REST, Bolt, MCP, ANA and CLI ingestion.
 - [Transactions and Sessions](transactions.md): write visibility, explicit Bolt
   transactions, embedded session behavior and writer-coordination limits.
 - [Cypher V1](cypher-v1.md): supported query features, execution and limitations.
+- [Known Cypher Issues](known-cypher-issues.md): reproducible correctness defects
+  and current conformance limits.
 - [Query Execution Architecture](query-execution-architecture.md): parsing,
   compilation, planning, storage access and public interfaces.
 - [Engine Performance](engine-performance.md): discovery, bounded aggregation and
   ordered limits, physical equality indexes, file reuse, and Cypher syntax caching.
 - [Parquet Predicate Pushdown](parquet-predicate-pushdown.md): reader filters,
   schema checks, residual execution, and row-group pruning.
+- [Columnar Cypher Execution](cypher-columnar-execution.md): narrow property
+  scans and Arrow filters/projections for composable read pipelines.
 - [Planner V1](planner-v1.md): logical operators, supported query shapes and fallback behavior.
 - [MCP Interface](mcp-interface-design.md): the current Cypher-oriented tool interface.
 - [Dependencies and Installation](dependency-compatibility.md): Python and Arrow

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -154,6 +155,37 @@ class GraphRepository:
             [self._absolute_location(dataset_file.path) for dataset_file in selected_files],
             columns=columns,
             predicates=predicates,
+        )
+
+    def iter_node_property_batches(
+        self,
+        files: tuple[DatasetFile, ...],
+        *,
+        label: str,
+        columns: list[str],
+        predicates: tuple[ScanPredicate, ...] = (),
+        batch_size: int = 65536,
+    ) -> Generator[pa.RecordBatch, None, None]:
+        """Stream a property projection from one immutable snapshot."""
+        return self._parquet.iter_dataset_batches(
+            [
+                self._absolute_location(item.path)
+                for item in files
+                if _label_from_node_property_file(item) == label
+            ],
+            columns=columns,
+            predicates=predicates,
+            batch_size=batch_size,
+        )
+
+    def load_node_property_schema(self, files: tuple[DatasetFile, ...], *, label: str) -> pa.Schema:
+        """Inspect the per-label projection before selecting columns or predicates."""
+        return self._parquet.read_dataset_schema(
+            [
+                self._absolute_location(item.path)
+                for item in files
+                if _label_from_node_property_file(item) == label
+            ]
         )
 
     def load_edge_property_table(

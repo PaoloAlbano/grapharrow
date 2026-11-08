@@ -191,6 +191,36 @@ transaction.rollback()
 assert transaction._adjacency_index is None
 assert application.use_cases.cypher.execute(shared_query).rows == ({'name': 'target'},)
 assert shared_index.build_count == 1
+read_queries = [
+    ("RETURN CASE WHEN true THEN coalesce(null, 7) ELSE 1/0 END AS n", ({'n': 7},)),
+    ("WITH 1 AS n WITH n+1 AS m WITH m*2 AS n RETURN n", ({'n': 4},)),
+    ("RETURN 1 AS n UNION RETURN 1 AS n", ({'n': 1},)),
+    ("CALL () { RETURN 1 AS n UNION ALL RETURN 2 AS n } RETURN n ORDER BY n",
+     ({'n': 1}, {'n': 2})),
+    ("MATCH (d:Device) CALL (d) { MATCH (d)-[:LINK]->(t:Target) "
+     "RETURN count(t) AS n } RETURN d.name AS name,n ORDER BY name",
+     ({'name': 'committed', 'n': 0}, {'name': 'wheel-device', 'n': 1})),
+    ("MATCH (d:Device) WHERE EXISTS { MATCH (d)-[:LINK]->(t:Target) "
+     "WITH t WHERE t.name='target' } RETURN d.name AS name",
+     ({'name': 'wheel-device'},)),
+]
+for statement, expected in read_queries:
+    assert application.use_cases.cypher.execute(statement).rows == expected, statement
+original_state_loader = application.use_cases.graph.load_state
+def reject_canonical_state(*args, **kwargs):
+    raise AssertionError('Eligible columnar read materialized canonical graph records')
+application.use_cases.graph.load_state = reject_canonical_state
+try:
+    columnar_query = ("MATCH (d:Device) WHERE d.name='wheel-device' "
+                      "WITH coalesce(d.name,'?') AS name WITH name RETURN name")
+    assert application.use_cases.cypher.execute(columnar_query).rows == ({'name':'wheel-device'},)
+    limited = "MATCH (d:Device) RETURN coalesce(d.name,'?') AS name ORDER BY name LIMIT 1"
+    assert application.use_cases.cypher.execute(limited).rows == ({'name': 'committed'},)
+    assert len(application.use_cases.cypher.execute(
+        "MATCH (d:Device) RETURN coalesce(d.name,'?') AS name LIMIT 1"
+    ).rows) == 1
+finally:
+    application.use_cases.graph.load_state = original_state_loader
 with GraphArrowAgentBackend(application) as seeded:
     materialized = []
     original_materialize = seeded._materialize_nodes
@@ -287,11 +317,24 @@ def main() -> None:
         assert "grapharrow/adapters/writer.py" in names
         assert "grapharrow/adapters/property_index.py" in names
         assert "grapharrow/adapters/query_cache.py" in names
+        assert "grapharrow/use_cases/cypher_expression.py" in names
+        assert "grapharrow/use_cases/cypher_pipeline.py" in names
+        assert "grapharrow/use_cases/cypher_columnar.py" in names
+        assert "grapharrow/use_cases/cypher_window.py" in names
+        assert (
+            "grapharrow/interfaces/opencypher/generated/vendor/opencypher/GraphArrowCypherParser.py"
+        ) in names
         assert "grapharrow/domain/scan.py" in names
         assert "grapharrow/adapters/scan_filter.py" in names
     with tarfile.open(sources[0]) as archive:
         check_names(archive.getnames())
         assert any(name.endswith("/vendor/opencypher/Cypher.g4") for name in archive.getnames())
+        assert any(
+            name.endswith("/vendor/opencypher/GraphArrowCypher.g4") for name in archive.getnames()
+        )
+        assert any(
+            name.endswith("/scripts/benchmark_cypher_columnar.py") for name in archive.getnames()
+        )
     with TemporaryDirectory(prefix="grapharrow-distribution-") as temporary:
         root = Path(temporary)
         environment = root / "venv"

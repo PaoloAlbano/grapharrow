@@ -56,6 +56,7 @@ include = [
   "/Makefile", "/Dockerfile", "/Dockerfile.dev", "/.dockerignore",
   "/scripts/benchmark_backends.py", "/scripts/benchmark_bolt_engines.py",
   "/scripts/benchmark_cypher_engine.py", "/scripts/benchmark_tabular_json.py",
+  "/scripts/benchmark_cypher_columnar.py",
   "/scripts/benchmark_ana_sessions.py",
   "/scripts/benchmark_ana_read_cache.py",
   "/scripts/benchmark_ana_call_state.py",
@@ -72,7 +73,7 @@ testpaths = ["tests/unit", "tests/integration"]
 markers = [
   "integration: marks integration tests that may require additional services or slower setup",
   "live_storage: marks integration tests that target real cloud object storage accounts",
-  "neo4j_reference: compares ANA over HTTP against an explicitly configured disposable reference service",
+  "neo4j_reference: compares ANA workflows and Cypher semantics against a disposable reference service",
 ]
 
 [tool.ruff]

@@ -18,7 +18,9 @@ from grapharrow.adapters.query_cache import CypherParseCache
 from grapharrow.core.errors import CatalogError, QueryError
 from grapharrow.domain import IndexKind, PropertyOwnerKind
 from grapharrow.domain.scan import ScanOperator, ScanPredicate
-from grapharrow.interfaces.opencypher.generated.vendor.opencypher.CypherParser import CypherParser
+from grapharrow.interfaces.opencypher.generated.vendor.opencypher.GraphArrowCypherParser import (
+    GraphArrowCypherParser as CypherParser,
+)
 from grapharrow.repositories import EdgeRecord, NodeRecord
 from grapharrow.use_cases.cypher_plan import (
     AggregateCountPlan,
@@ -37,6 +39,7 @@ from grapharrow.use_cases.cypher_plan import (
     WithAggregatePlan,
     WithProjectPlan,
 )
+from grapharrow.use_cases.cypher_window import limit_optimizations_enabled
 from grapharrow.use_cases.graph import (
     GraphState,
     GraphStateUseCase,
@@ -560,7 +563,11 @@ class CypherQueryUseCase:
         if compatibility_result is not None:
             return compatibility_result
 
-        standalone_return = _execute_standalone_return(normalized, parameters)
+        try:
+            standalone_return = _execute_standalone_return(normalized, parameters)
+        except QueryError:
+            # A composed expression needs the grammar and semantic compiler.
+            standalone_return = None
         if standalone_return is not None:
             return standalone_return
 
@@ -582,7 +589,27 @@ class CypherQueryUseCase:
                 return schema_result
 
         parse_tree = self._parse_cache.parse(query)
-        compiled = _compile_query(parse_tree, parameters)
+        from grapharrow.use_cases.cypher_pipeline import (
+            ReadCompiler,
+            ReadRuntime,
+            contains_updates,
+            needs_pipeline,
+        )
+
+        if needs_pipeline(parse_tree, normalized):
+            return ReadRuntime(self).execute(ReadCompiler(parameters).compile(parse_tree))
+        try:
+            compiled = _compile_query(parse_tree, parameters)
+        except QueryError as original:
+            if contains_updates(parse_tree):
+                raise
+            # Preserve legacy diagnostics when the general compiler also rejects
+            # the query. A newly composable read can use the explicit stages.
+            try:
+                read_query = ReadCompiler(parameters).compile(parse_tree)
+            except QueryError:
+                raise original from None
+            return ReadRuntime(self).execute(read_query)
         writes = (
             isinstance(
                 compiled,
@@ -1352,6 +1379,24 @@ class CypherQueryUseCase:
             )
             return self._apply_order_by(input_table, cast(tuple[OrderByItem, ...], plan.order_by))
         if isinstance(plan, SlicePlan):
+            if (
+                plan.limit is not None
+                and isinstance(plan.input, SortPlan)
+                and limit_optimizations_enabled()
+            ):
+                input_table = self._execute_logical_plan_node(
+                    plan.input.input,
+                    state=state,
+                    adjacency_loader=adjacency_loader,
+                    edge_property_loader=edge_property_loader,
+                    node_property_loader=node_property_loader,
+                )
+                return self._apply_order_by(
+                    input_table,
+                    cast(tuple[OrderByItem, ...], plan.input.order_by),
+                    skip=plan.skip or 0,
+                    limit=plan.limit,
+                )
             input_table = self._execute_logical_plan_node(
                 plan.input,
                 state=state,
@@ -2258,6 +2303,8 @@ class CypherQueryUseCase:
     ) -> pa.Table:
         """Apply this transformation or predicate inside the Cypher pipeline."""
         if order_by is not None:
+            if limit is not None and limit_optimizations_enabled():
+                return self._apply_order_by(table, order_by, skip=skip or 0, limit=limit)
             table = self._apply_order_by(table, order_by)
         if skip is not None:
             table = table.slice(skip)
@@ -2269,6 +2316,9 @@ class CypherQueryUseCase:
         self,
         table: pa.Table,
         order_by_items: tuple[OrderByItem, ...],
+        *,
+        skip: int = 0,
+        limit: int | None = None,
     ) -> pa.Table:
         """Apply this transformation or predicate inside the Cypher pipeline."""
         sort_keys: list[tuple[str, str]] = []
@@ -2286,6 +2336,8 @@ class CypherQueryUseCase:
                     "descending" if item.descending else "ascending",
                 )
             )
+        if limit is not None:
+            return self._tabular.sort_window_table(sorted_table, sort_keys, skip=skip, limit=limit)
         return self._tabular.sort_table(sorted_table, sort_keys)
 
 
@@ -2803,7 +2855,7 @@ def _compatibility_return_columns(query: str) -> tuple[str, ...]:
         return ()
 
     columns: list[str] = []
-    for raw_item in match.group(1).split(","):
+    for raw_item in _split_top_level_items(match.group(1)):
         item = raw_item.strip()
         alias_match = re.search(r"(?is)\s+AS\s+([A-Za-z_][A-Za-z0-9_]*)$", item)
         if alias_match is not None:
@@ -2834,6 +2886,19 @@ def _execute_standalone_return(
         )
         expression = alias_match.group(1).strip() if alias_match is not None else item
         column = alias_match.group(2) if alias_match is not None else expression
+        # This probe path must not consume a composed expression or a UNION
+        # merely because its text starts and ends with a quote.
+        if (
+            re.fullmatch(
+                r"(?is)(?:null|true|false|[+-]?\d+(?:\.\d+)?(?:e[+-]?\d+)?"
+                r"|\$[A-Za-z_][A-Za-z0-9_]*|'[^'\\]*'|\"[^\"\\]*\")",
+                expression,
+            )
+            is None
+        ):
+            return None
+        if column in row:
+            raise QueryError(f"Duplicate output column: {column}")
         value = _parse_value(expression, params)
         columns.append(column)
         row[column] = value
@@ -11012,9 +11077,11 @@ def _extract_list_literal_from_expression(
 
 def _parse_property_reference(text: str) -> tuple[str, str]:
     """Parse this low-level fragment into the normalized internal form."""
-    if "." not in text:
+    name = r"(?:[A-Za-z_][A-Za-z0-9_]*|`(?:``|[^`])+`)"
+    match = re.fullmatch(rf"({name})\.({name})", text)
+    if match is None:
         raise QueryError(f"Expected property reference, got: {text}")
-    variable, field = text.split(".", 1)
+    variable, field = match.groups()
     return variable.strip(), _cypher_name(field.strip())
 
 

@@ -177,6 +177,49 @@ class Case:
     args: dict[str, Any]
 
 
+@pytest.mark.parametrize(
+    "query,expected",
+    [
+        (
+            "MATCH (p:Person) WITH CASE WHEN p.age IS NULL THEN 'missing' "
+            "WHEN p.age>=30 THEN 'older' ELSE 'younger' END AS category "
+            "WITH category,count(*) AS n RETURN category,n ORDER BY category",
+            [
+                {"category": "missing", "n": 1},
+                {"category": "older", "n": 1},
+                {"category": "younger", "n": 3},
+            ],
+        ),
+        (
+            "CALL () { MATCH (p:Person) RETURN p.name AS name "
+            "UNION MATCH (p:Person) RETURN p.name AS name } RETURN name ORDER BY name",
+            [{"name": n} for n in ["Alex", "Alice", "Bob", "Carol"]],
+        ),
+        (
+            "MATCH (c:Company) CALL (c) { MATCH (p:Person)-[:WORKS]->(c) "
+            "RETURN count(p) AS n } RETURN c.name AS company,n ORDER BY company",
+            [
+                {"company": "Acme", "n": 3},
+                {"company": "Beta", "n": 2},
+                {"company": "Empty", "n": 0},
+            ],
+        ),
+        (
+            "MATCH (p:Person) WHERE EXISTS { MATCH (p)-[:WORKS]->(c) "
+            "WHERE c.name='Acme' } RETURN p.name AS name ORDER BY name",
+            [{"name": "Alice"}, {"name": "Bob"}],
+        ),
+    ],
+)
+def test_composable_cypher_matches_across_frontends(
+    interfaces: Interfaces, query: str, expected: list[dict[str, Any]]
+) -> None:
+    results = interfaces.read_cypher(query, {})
+    assert all(result["rows"] == expected for result in results.values())
+    with interfaces.bolt.session() as session, session.begin_transaction() as transaction:
+        assert transaction.run(query).data() == expected
+
+
 def test_selective_traversal_reuses_rest_index_in_ana(interfaces: Interfaces) -> None:
     query = (
         "MATCH (p:Person {name:$name})-[:WORKS]->(c:Company) "

@@ -37,6 +37,7 @@ dist/
 scripts/*
 !scripts/benchmark_bolt_engines.py
 !scripts/benchmark_cypher_engine.py
+!scripts/benchmark_cypher_columnar.py
 !scripts/benchmark_tabular_json.py
 !scripts/benchmark_backends.py
 !scripts/benchmark_ana_sessions.py

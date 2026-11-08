@@ -1,4 +1,4 @@
-"""Server entrypoints for REST and future Bolt interfaces."""
+"""HTTP server entrypoint for REST and the optional ANA interface."""
 
 from __future__ import annotations
 
@@ -16,13 +16,13 @@ def build_server_application(
     *,
     settings: GraphArrowSettings | None = None,
 ) -> FastAPI:
-    """Build the REST server application for a single database path."""
+    """Build the REST and optional ANA application for a single database path."""
 
     return create_rest_app(path, settings=settings)
 
 
 def main() -> int:
-    """Run the REST server entrypoint."""
+    """Run the combined REST and optional ANA HTTP server."""
 
     parser = argparse.ArgumentParser(prog="grapharrow-server")
     parser.add_argument(

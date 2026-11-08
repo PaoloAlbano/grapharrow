@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -80,3 +80,57 @@ class ParquetAdapter:
                 raise
             # Keep unsupported scanner kernels and schema coercions on the residual path.
             return dataset.scanner(columns=columns).to_table()
+
+    def read_dataset_schema(self, paths: list[str | Path]) -> pa.Schema:
+        """Inspect projection types and encoding metadata without reading data rows."""
+        if not paths:
+            return pa.schema([])
+        filesystem = None
+        normalized = []
+        for path in paths:
+            resolved_filesystem, location = self._filesystem.resolve(path)
+            if filesystem is None:
+                filesystem = resolved_filesystem
+            normalized.append(location)
+        return ds.dataset(normalized, filesystem=filesystem, format="parquet").schema
+
+    def iter_dataset_batches(
+        self,
+        paths: list[str | Path],
+        *,
+        columns: list[str],
+        predicates: Sequence[ScanPredicate] = (),
+        batch_size: int = 65536,
+    ) -> Generator[pa.RecordBatch, None, None]:
+        """Yield ordered batches without materializing the complete dataset."""
+        if not paths:
+            return
+        filesystem = None
+        normalized = []
+        for path in paths:
+            resolved, location = self._filesystem.resolve(path)
+            if filesystem is None:
+                filesystem = resolved
+            normalized.append(location)
+        dataset = ds.dataset(normalized, filesystem=filesystem, format="parquet")
+        expression = (
+            dataset_filter(dataset.schema, predicates) if self.filter_pushdown_enabled else None
+        )
+        # Dataset scanners may decode an entire row group before slicing tiny
+        # batches. Use the Parquet batch reader for a genuinely bounded prefix.
+        # Predicates prune row groups only; callers retain the complete residual.
+        for fragment in dataset.get_fragments():
+            try:
+                selected = fragment.split_by_row_group(filter=expression)
+            except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
+                selected = fragment.split_by_row_group()
+            row_groups = [group.id for part in selected for group in part.row_groups]
+            if not row_groups:
+                continue
+            with pq.ParquetFile(fragment.path, filesystem=filesystem, pre_buffer=False) as reader:
+                yield from reader.iter_batches(
+                    batch_size=batch_size,
+                    row_groups=row_groups,
+                    columns=columns,
+                    use_threads=False,
+                )

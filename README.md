@@ -10,7 +10,9 @@ GraphArrow is an embedded property graph database built in Python on top of PyAr
 The project is experimental: query APIs and storage formats are evolving.
 It provides embedded Python, REST, Bolt and ANA agent interfaces. See the
 [supported Cypher subset](docs/cypher-v1.md) and
-[ANA compatibility limits](docs/ana-interface.md) before integrating it.
+[ANA HTTP interface](docs/ana-interface.md) before integrating it.
+Cypher support is incomplete and has [known correctness issues](docs/known-cypher-issues.md),
+including relationship creation, self-loop matching and write results.
 The [transaction and session guide](docs/transactions.md) explains write
 visibility, local writer coordination, conflict handling and object-storage limits.
 
@@ -31,10 +33,44 @@ standard dependencies; no optional extra or adjacent checkout is needed.
 ### Install dependencies
 
 ```bash
-uv sync
+uv sync --locked
 # or
 make sync-dev
 ```
+
+### Start authenticated HTTP and Bolt servers
+
+First follow [Prepare a local configuration](docs/server-configuration.md#prepare-a-local-configuration)
+to generate separate REST, ANA and Bolt credentials. Then, from the repository
+root, start HTTP in one terminal:
+
+```bash
+set -a
+. ./.local-secrets/server.env
+set +a
+uv run --locked grapharrow-server --host 127.0.0.1 --port 8000
+```
+
+This starts REST and ANA together. To also use Bolt, start a second process in
+another terminal:
+
+```bash
+set -a
+. ./.local-secrets/server.env
+set +a
+uv run --locked grapharrow-bolt --host 127.0.0.1 --port 7687 --no-query-log
+```
+
+Both commands use `GRAPHARROW_DATABASE_PATH` from the generated configuration.
+They initialize the database if needed and run in the foreground. Keep them
+running while using a third terminal for clients. The
+[server configuration guide](docs/server-configuration.md) includes REST, ANA
+and Bolt client examples, environment settings, network access and Docker.
+
+REST and Bolt authentication are optional unless configured. ANA credentials
+protect only ANA routes; configure each interface before exposing it. The
+example above binds both listeners to loopback and configures all three
+credentials. Bolt query logging is disabled; it is enabled by default.
 
 ### Run tests
 
@@ -103,35 +139,6 @@ uv run grapharrow-bolt --help
 make bolt-help
 ```
 
-### Run the REST server
-
-```bash
-uv run grapharrow-server --path /tmp/grapharrow-db
-# or
-make serve DB=/tmp/grapharrow-db
-```
-
-The server can also read the database path from `GRAPHARROW_DATABASE_PATH`.
-
-If `GRAPHARROW_SERVER_AUTH_TOKEN` is configured, every REST endpoint except `/v1/health`
-requires `Authorization: Bearer <token>`.
-REST permits unauthenticated writes and administration when that setting is absent.
-ANA credentials are configured separately and do not protect REST routes; see the
-[ANA authentication guide](docs/ana-interface.md#start-the-server).
-
-`grapharrow-bolt` exposes a Bolt 4.4 compatibility server with basic auth,
-`RUN`, `PULL`, `DISCARD`, `RESET`, and `GOODBYE`.
-
-Run it locally with:
-
-```bash
-make bolt DB=/tmp/grapharrow-db PORT=18080
-```
-
-The Bolt server writes lightweight operational logs to stdout, including startup,
-connections, query `RUN` statements, and failures. Query logging is enabled by default
-and can be disabled with `BOLT_ARGS=--no-query-log` or `GRAPHARROW_BOLT_LOG_QUERIES=false`.
-
 ### REST endpoints
 
 Current bootstrap endpoints:
@@ -146,10 +153,19 @@ Current bootstrap endpoints:
 
 ### Example REST calls
 
+In the client terminal, export the generated credentials before making requests:
+
+```bash
+set -a
+. ./.local-secrets/server.env
+set +a
+```
+
 Create a node with the imperative API:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/v1/nodes \
+curl --fail-with-body -X POST http://127.0.0.1:8000/v1/nodes \
+  -H "Authorization: Bearer ${GRAPHARROW_SERVER_AUTH_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "labels": ["Person"],
@@ -163,7 +179,8 @@ curl -X POST http://127.0.0.1:8000/v1/nodes \
 Run a Cypher query:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/v1/query \
+curl --fail-with-body -X POST http://127.0.0.1:8000/v1/query \
+  -H "Authorization: Bearer ${GRAPHARROW_SERVER_AUTH_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "MATCH (n:Person) WHERE n.name = $name RETURN n",
@@ -173,10 +190,20 @@ curl -X POST http://127.0.0.1:8000/v1/query \
   }'
 ```
 
+Create Bob before connecting the two people:
+
+```bash
+curl --fail-with-body -X POST http://127.0.0.1:8000/v1/nodes \
+  -H "Authorization: Bearer ${GRAPHARROW_SERVER_AUTH_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"labels":["Person"],"properties":{"external_id":"bob","name":"Bob"}}'
+```
+
 Create an edge using explicit business-key references:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/v1/edges \
+curl --fail-with-body -X POST http://127.0.0.1:8000/v1/edges \
+  -H "Authorization: Bearer ${GRAPHARROW_SERVER_AUTH_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{
     "source_ref": {
@@ -332,11 +359,10 @@ Build the runtime image:
 docker build -t grapharrow:runtime .
 ```
 
-Run the runtime image:
-
-```bash
-docker run --rm -p 127.0.0.1:8000:8000 -e GRAPHARROW_DATABASE_PATH=/data/grapharrow grapharrow:runtime
-```
+For authenticated HTTP/ANA and Bolt containers sharing a persistent database,
+follow the [Docker server instructions](docs/server-configuration.md#docker).
+The default image command starts HTTP/ANA; Bolt needs its own process. The
+examples map both ports to host loopback and mount credentials read-only.
 
 Build the development image:
 

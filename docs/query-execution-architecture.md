@@ -10,7 +10,7 @@ the embedded API, REST, Bolt and the transport-independent MCP interface.
 embedded / REST / Bolt / MCP
   -> CypherQueryUseCase
   -> openCypher parser and compiled query model
-  -> supported logical plan or direct execution
+  -> supported logical plan, direct execution or composable read stages
   -> graph state and tabular operators
   -> repositories and storage adapters
   -> Parquet datasets, catalog and snapshot manifests
@@ -23,7 +23,9 @@ state and transaction operations in [graph.py](../src/grapharrow/use_cases/graph
 ## Parsing and compilation
 
 The official [openCypher grammar](../vendor/opencypher/Cypher.g4) is vendored
-and parsed through ANTLR. The runtime adapter is
+unchanged. A [derived grammar](../vendor/opencypher/GraphArrowCypher.g4) adds
+read subquery syntax; ANTLR generates the runtime parser from that grammar.
+The runtime adapter is
 [adapters/opencypher.py](../src/grapharrow/adapters/opencypher.py).
 
 Compilation converts the parse tree into typed internal query dataclasses and
@@ -31,8 +33,9 @@ pattern/expression structures. The compiler enforces the executable subset
 after parsing. Valid openCypher syntax can therefore still raise `QueryError`
 when it uses an unsupported GraphArrow feature.
 
-Supported query families include reads, selected `WITH`/`UNWIND` pipelines,
-optional patterns and graph writes. Some metadata/discovery statements have
+Supported query families include reads, multiple `WITH`/`UNWIND` stages,
+unions, read subqueries, optional patterns and selected graph writes.
+Some metadata/discovery statements have
 dedicated compatibility handling. See [Cypher V1](cypher-v1.md) for the current
 scope and restrictions.
 
@@ -63,6 +66,35 @@ General path objects and unrestricted variable-length planning are not implement
 Supported grouped and scalar aggregates include count, sum, average, minimum,
 maximum and collection. Some paths use Python grouping/materialization.
 Optional matching and `UNWIND` also retain row-oriented paths.
+
+### Composable read stages
+
+[cypher_pipeline.py](../src/grapharrow/use_cases/cypher_pipeline.py) compiles
+extended reads into typed match, unwind, projection and subquery-call stages.
+Each `WITH` creates a scope boundary. All union branches and nested subqueries
+are compiled and checked before execution; updating clauses are rejected.
+[cypher_expression.py](../src/grapharrow/use_cases/cypher_expression.py) evaluates
+typed expression trees with null semantics and lazy `CASE`/`coalesce` branches.
+It does not evaluate Python source or send queries to another database.
+
+The runtime lazily captures one `GraphState`, shared by union branches and
+correlated calls, including transaction-local overlays. Constants do not load
+graph state. Matching reuses the existing Arrow matcher and shared adjacency
+loader. Static candidate join indexes are reused within the query across
+correlated invocations, with predicates and correlated properties evaluated
+per incoming row. Projections, grouping, deduplication and subquery joins materialize
+Python rows. This path extends language coverage but is not a streaming or
+fully vectorized engine. Existing supported query shapes retain their planner
+and specialized direct paths. Syntax caching stores only parse trees; parameter
+binding and stage compilation are request-local.
+
+Eligible single-label node scans and projection chains use
+[cypher_columnar.py](../src/grapharrow/use_cases/cypher_columnar.py): narrow
+property reads, conservative Parquet predicates and Arrow expression batches.
+This path avoids canonical graph materialization and can hand a reduced scalar
+prefix to row-based aggregation. Unsupported schemas and expressions fall back
+on the same pinned snapshot. See [columnar execution](cypher-columnar-execution.md)
+for coverage, exactness guards, switches and benchmark reproduction.
 
 ## Storage boundary
 
@@ -116,6 +148,9 @@ not provide a complete MCP network server or an ANA-compatible HTTP surface.
 
 [Cypher tests](../tests/unit/test_cypher.py) exercise compiler, planner, result
 semantics and rejection cases. Interface and storage integration tests verify
-their respective boundaries. [Benchmark reports](benchmarks/) preserve
+their respective boundaries. [Composable read tests](../tests/unit/test_cypher_pipeline.py)
+and [Neo4j comparison tests](../tests/integration/test_cypher_reference.py) check
+scopes, nulls, duplicates, unions and correlated subqueries.
+[Benchmark reports](benchmarks/) preserve
 measurements for specific workloads; performance depends on the chosen path,
 graph shape and storage environment.
