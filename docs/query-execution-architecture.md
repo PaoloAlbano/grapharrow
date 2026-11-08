@@ -51,6 +51,11 @@ produce boolean masks, and projections shape intermediate and final tables.
 Arrow operations.
 
 Fixed-hop typed traversal can use outgoing or incoming adjacency datasets.
+Selective fixed-hop expansions can also use the graph service's shared
+canonical-position index before joins. ANA and Cypher reuse the same bounded
+application cache for immutable edge files; transaction overlays keep private
+indexes. See [Shared Snapshot Adjacency](benchmarks/shared-adjacency.md) for
+execution scope, resource accounting and measurements.
 Anonymous bounded variable-length traversal maintains a frontier and relationship
 uniqueness; selected distinct-endpoint queries have a specialized execution path.
 General path objects and unrestricted variable-length planning are not implemented.
@@ -71,8 +76,11 @@ Repositories expose snapshot data through canonical and derived datasets:
 
 Canonical properties use JSON payloads; derived property datasets expose typed
 columns for filtering and projection. Property loaders can request selected
-Parquet columns. Canonical fallbacks remain available when a derived path does
-not cover the requested fields or shape.
+Parquet columns and eligible scalar predicates. The Parquet adapter applies
+schema-compatible predicates to the dataset scanner, while the executor
+retains its residual filters. See [Parquet Predicate Pushdown](parquet-predicate-pushdown.md)
+for supported shapes, safeguards, and configuration. Canonical fallbacks remain
+available when a derived path does not cover the requested fields or shape.
 
 Filesystem handling sits below query semantics. The configured root can use
 local storage or supported URI-based object storage. Cloud integration tests

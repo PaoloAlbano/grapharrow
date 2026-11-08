@@ -19,6 +19,7 @@ from grapharrow.core.errors import (
     QueryError,
     StorageError,
     TransactionError,
+    WriteConflictError,
 )
 
 
@@ -331,6 +332,13 @@ def _require_server_auth(
 
 def _register_error_handlers(app: FastAPI) -> None:
     """Register the API exception handlers used by this REST application."""
+
+    @app.exception_handler(WriteConflictError)
+    async def write_conflict_handler(_: Request, exc: WriteConflictError) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content=_error("WRITE_CONFLICT", str(exc)),
+        )
 
     @app.exception_handler(NotFoundError)
     async def not_found_handler(_: Request, exc: NotFoundError) -> JSONResponse:

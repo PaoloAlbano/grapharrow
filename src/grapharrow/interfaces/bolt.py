@@ -8,7 +8,7 @@ import socket
 import socketserver
 import struct
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -16,7 +16,7 @@ from typing import Any, cast
 from grapharrow.adapters import FileSystemAdapter
 from grapharrow.app import GraphArrowApplication, build_application
 from grapharrow.config import GraphArrowSettings
-from grapharrow.core.errors import GraphArrowError
+from grapharrow.core.errors import GraphArrowError, WriteConflictError
 from grapharrow.interfaces.cypher_guard import query_requires_write
 from grapharrow.use_cases import CypherQueryUseCase, GraphTransactionUseCase
 from grapharrow.use_cases import cypher as cypher_module
@@ -411,6 +411,7 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
             graph_service=cast(Any, transaction),
             tabular_adapter=server.bolt_app.grapharrow.adapters.tabular,
             index_service=server.bolt_app.grapharrow.use_cases.indexes,
+            parse_cache=server.bolt_app.grapharrow.use_cases.cypher._parse_cache,
         )
         _send_success(self.request, self.codec, {})
 
@@ -438,16 +439,30 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
         try:
             executor = state.transaction_cypher or server.bolt_app.grapharrow.use_cases.cypher
             statement_type = _statement_type_for_query(query)
-            before_state = executor._graph_service.load_state() if statement_type != "r" else None
-            result = executor.execute(query, parameters)
-            after_state = executor._graph_service.load_state() if before_state is not None else None
+            boundary = (
+                server.bolt_app.grapharrow.use_cases.graph.writer_lock()
+                if state.transaction is None and statement_type != "r"
+                else nullcontext()
+            )
+            with boundary:
+                before_state = (
+                    executor._graph_service.load_state() if statement_type != "r" else None
+                )
+                result = executor.execute(query, parameters)
+                after_state = (
+                    executor._graph_service.load_state() if before_state is not None else None
+                )
         except GraphArrowError as exc:
             state.failed = True
             _bolt_log(server, f"query failed: {exc}")
             _send_failure(
                 self.request,
                 self.codec,
-                code="GraphArrow.QueryError",
+                code=(
+                    "Neo.TransientError.Transaction.Outdated"
+                    if isinstance(exc, WriteConflictError)
+                    else "GraphArrow.QueryError"
+                ),
                 message=str(exc),
             )
             return
@@ -515,7 +530,11 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
             _send_failure(
                 self.request,
                 self.codec,
-                code="GraphArrow.QueryError",
+                code=(
+                    "Neo.TransientError.Transaction.Outdated"
+                    if isinstance(exc, WriteConflictError)
+                    else "GraphArrow.QueryError"
+                ),
                 message=str(exc),
             )
             return

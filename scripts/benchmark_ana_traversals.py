@@ -32,6 +32,8 @@ CASES = {
     "hub_eight_limit_10": ("Hub", 8, 10, "expand"),
     "hub_eight_limit_100": ("Hub", 8, 100, "expand"),
     "low_degree_250": ("Seed", 250, 1000, "expand"),
+    "low_degree_one": ("Seed", 1, 10, "expand"),
+    "low_degree_eight": ("Seed", 8, 100, "expand"),
     "hub_pattern_limit_10": ("Hub", 1, 10, "multi_hop_query"),
     "hub_two_hop_limit_10": ("Hub", 1, 10, "two_hop"),
 }
@@ -97,10 +99,12 @@ def worker(args: argparse.Namespace) -> None:
     tool = "multi_hop_query" if kind == "two_hop" else kind
     barrier = Barrier(args.worker_sessions)
     with ExitStack() as stack:
+        setup_started = time.perf_counter_ns()
         backends = [
             stack.enter_context(GraphArrowAgentBackend(app, resource_budget=budget))
             for _ in range(args.worker_sessions)
         ]
+        setup_ms = (time.perf_counter_ns() - setup_started) / 1e6
         handles = [
             backend.call("node_scan", {"label": label, "limit": seed_count})["handle"]
             for backend in backends
@@ -117,9 +121,12 @@ def worker(args: argparse.Namespace) -> None:
         def execute(index: int) -> dict[str, Any]:
             backend = backends[index]
             durations = []
+            cold_call_ms = None
             signatures = set()
             expected_rows = min(limit, seed_count * (args.degree if label == "Hub" else 3))
-            expected_distinct = args.degree // 2 if label == "Hub" else min(args.degree // 2, 252)
+            expected_distinct = (
+                args.degree // 2 if label == "Hub" else min(args.degree // 2, seed_count + 2)
+            )
             if kind == "two_hop":
                 expected_distinct = 8
             for iteration in range(args.warmups + args.repeats):
@@ -161,6 +168,8 @@ def worker(args: argparse.Namespace) -> None:
                 start = time.perf_counter_ns()
                 result = backend.call(tool, call_args)
                 elapsed = (time.perf_counter_ns() - start) / 1e6
+                if iteration == 0:
+                    cold_call_ms = elapsed
                 if iteration >= args.warmups:
                     durations.append(elapsed)
                 assert result["matched_count"] == expected_rows
@@ -183,6 +192,7 @@ def worker(args: argparse.Namespace) -> None:
             assert len(signatures) == 1
             return {
                 "latency_ms": durations,
+                "cold_call_ms": cold_call_ms,
                 "result_sha256": signatures.pop(),
                 "usage": backend.resource_usage,
             }
@@ -198,6 +208,7 @@ def worker(args: argparse.Namespace) -> None:
             {
                 "sessions": results,
                 "wall_ms": wall_ms,
+                "backend_setup_ms": setup_ms,
                 "setup_high_water_rss_bytes": setup_high_water,
                 "high_water_rss_bytes": high_water,
                 "budget_after_close_bytes": budget.used_bytes,

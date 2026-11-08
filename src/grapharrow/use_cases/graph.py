@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
@@ -11,7 +12,10 @@ from typing import Any
 
 import pyarrow as pa  # type: ignore[import-untyped]
 
-from grapharrow.core.errors import NotFoundError, QueryError, SchemaError
+from grapharrow.adapters.adjacency import AdjacencyIndexStore, GraphAdjacency
+from grapharrow.adapters.property_index import PropertyIndexStore
+from grapharrow.adapters.writer import writer_locked
+from grapharrow.core.errors import NotFoundError, QueryError, SchemaError, WriteConflictError
 from grapharrow.domain import (
     CatalogVersion,
     DatasetFile,
@@ -23,6 +27,7 @@ from grapharrow.domain import (
     SnapshotManifest,
     VersionedCatalog,
 )
+from grapharrow.domain.scan import ScanPredicate
 from grapharrow.repositories import (
     CatalogRepository,
     EdgeRecord,
@@ -74,12 +79,27 @@ class GraphStateUseCase:
         catalog_store: CatalogRepository,
         snapshot_store: SnapshotRepository,
         graph_store: GraphRepository,
+        property_index_max_bytes: int = 32 * 1024 * 1024,
+        adjacency_index_max_bytes: int = 32 * 1024 * 1024,
     ) -> None:
         """Wire the repositories and admin service used by the graph state workflows."""
         self._admin_service = admin_service
         self._catalog_store = catalog_store
         self._snapshot_store = snapshot_store
         self._graph_store = graph_store
+        self._writer = snapshot_store.writer
+        self.property_indexes = PropertyIndexStore(property_index_max_bytes)
+        self.adjacency_indexes = AdjacencyIndexStore(adjacency_index_max_bytes)
+
+    def adjacency_for_state(self, state: GraphState | GraphTabularState) -> GraphAdjacency | None:
+        """Reuse immutable topology positions across frontends on this application."""
+        return self.adjacency_indexes.get_or_create(
+            state.snapshot.edges, state.edge_table, node_count=state.node_table.num_rows
+        )
+
+    def writer_lock(self) -> AbstractContextManager[None]:
+        """Serialize a complete database mutation with other coordinated writers."""
+        return self._writer.hold()
 
     def load_state(self) -> GraphState:
         """Load the current catalog, snapshot, and graph records."""
@@ -125,6 +145,7 @@ class GraphStateUseCase:
         snapshot: SnapshotManifest,
         label: str,
         columns: list[str] | None = None,
+        predicates: tuple[ScanPredicate, ...] = (),
     ) -> pa.Table:
         """Load the property-columnar dataset for ``label``."""
 
@@ -132,7 +153,49 @@ class GraphStateUseCase:
             snapshot.node_properties,
             label=label,
             columns=columns,
+            predicates=predicates,
         )
+
+    def lookup_node_property_table(
+        self,
+        *,
+        snapshot: SnapshotManifest,
+        catalog: VersionedCatalog,
+        label: str,
+        equalities: dict[str, object],
+        table: pa.Table | None = None,
+    ) -> pa.Table | None:
+        """Use a declared single-property equality index, or let the caller scan."""
+        for index in catalog.indexes:
+            if (
+                index.owner_kind != "label"
+                or index.owner_name != label
+                or index.kind not in {"range", "lookup"}
+                or not index.case_sensitive
+                or len(index.property_names) != 1
+            ):
+                continue
+            prop = index.property_names[0]
+            if prop not in equalities:
+                continue
+            files = tuple(
+                item
+                for item in snapshot.node_properties
+                if PurePosixPath(item.path).parts[2] == label
+            )
+            selected = self.property_indexes.lookup(
+                files,
+                prop,
+                equalities[prop],
+                lambda: (
+                    table
+                    if table is not None
+                    else self.load_node_property_table(snapshot=snapshot, label=label)
+                ),
+            )
+            if selected is not None:
+                return selected
+        return None
 
     def load_edge_property_table(
         self,
@@ -140,6 +203,7 @@ class GraphStateUseCase:
         snapshot: SnapshotManifest,
         rel_type: str,
         columns: list[str] | None = None,
+        predicates: tuple[ScanPredicate, ...] = (),
     ) -> pa.Table:
         """Load the property-columnar dataset for ``rel_type``."""
 
@@ -147,6 +211,7 @@ class GraphStateUseCase:
             snapshot.edge_properties,
             rel_type=rel_type,
             columns=columns,
+            predicates=predicates,
         )
 
     def load_adjacency_by_source_table(
@@ -179,6 +244,7 @@ class GraphStateUseCase:
         )
         return self._graph_store.load_adjacency_by_dest_table(files)
 
+    @writer_locked
     def create_node(
         self,
         *,
@@ -204,6 +270,7 @@ class GraphStateUseCase:
         )
         return next_state, node
 
+    @writer_locked
     def create_nodes_bulk(
         self,
         *,
@@ -259,6 +326,7 @@ class GraphStateUseCase:
         )
         return next_state, new_nodes_tuple
 
+    @writer_locked
     def create_relationship_with_inline_nodes(
         self,
         *,
@@ -318,6 +386,7 @@ class GraphStateUseCase:
         )
         return next_state, left_node, edge, right_node
 
+    @writer_locked
     def create_edge(
         self,
         *,
@@ -357,6 +426,7 @@ class GraphStateUseCase:
         )
         return next_state, edge
 
+    @writer_locked
     def create_edge_by_reference(
         self,
         *,
@@ -409,6 +479,7 @@ class GraphStateUseCase:
         )
         return next_state, edge
 
+    @writer_locked
     def create_edges_batch(
         self,
         *,
@@ -438,6 +509,7 @@ class GraphStateUseCase:
         )
         return next_state, tuple(new_edges)
 
+    @writer_locked
     def create_edges_bulk(
         self,
         *,
@@ -512,6 +584,7 @@ class GraphStateUseCase:
         )
         return next_state, tuple(new_edges)
 
+    @writer_locked
     def update_properties_batch(
         self,
         *,
@@ -567,6 +640,7 @@ class GraphStateUseCase:
             edges=edges,
         )
 
+    @writer_locked
     def remove_properties_batch(
         self,
         *,
@@ -622,6 +696,7 @@ class GraphStateUseCase:
             edges=edges,
         )
 
+    @writer_locked
     def remove_labels_batch(
         self,
         *,
@@ -659,6 +734,7 @@ class GraphStateUseCase:
             edges=list(state.edges),
         )
 
+    @writer_locked
     def delete_entities_batch(
         self,
         *,
@@ -708,6 +784,7 @@ class GraphStateUseCase:
             edges=remaining_edges,
         )
 
+    @writer_locked
     def publish_records(
         self,
         *,
@@ -748,6 +825,7 @@ class GraphStateUseCase:
             edges=[*previous_state.edges, *new_edges],
         )
 
+    @writer_locked
     def _publish_graph(
         self,
         *,
@@ -757,6 +835,13 @@ class GraphStateUseCase:
         edges: list[EdgeRecord],
     ) -> GraphState:
         """Persist a staged snapshot, update the current pointer, and return the new state."""
+        if (
+            self._snapshot_store.load_manifest() != previous_state.snapshot
+            or self._catalog_store.load() != previous_state.catalog
+        ):
+            raise WriteConflictError(
+                "Database changed since this write began. Retry in a new transaction."
+            )
         if catalog.version != previous_state.catalog.version:
             self._catalog_store.write(catalog)
 
@@ -765,6 +850,9 @@ class GraphStateUseCase:
             snapshot_id=next_snapshot_id,
             nodes=nodes,
             edges=edges,
+            previous_snapshot=previous_state.snapshot,
+            previous_nodes=previous_state.nodes,
+            previous_edges=previous_state.edges,
         )
         manifest = SnapshotManifest(
             snapshot_id=next_snapshot_id,
@@ -782,8 +870,16 @@ class GraphStateUseCase:
         )
         try:
             self._snapshot_store.publish(manifest, staged_relative_path=persisted.staged_dir)
-            node_table = self._graph_store.load_node_table(persisted.nodes)
-            edge_table = self._graph_store.load_edge_table(persisted.edges)
+            node_table = (
+                previous_state.node_table
+                if persisted.nodes == previous_state.snapshot.nodes
+                else self._graph_store.load_node_table(persisted.nodes)
+            )
+            edge_table = (
+                previous_state.edge_table
+                if persisted.edges == previous_state.snapshot.edges
+                else self._graph_store.load_edge_table(persisted.edges)
+            )
             return GraphState(
                 catalog=catalog,
                 snapshot=manifest,
@@ -1054,9 +1150,29 @@ class GraphTransactionUseCase:
     def __init__(self, graph_service: GraphStateUseCase) -> None:
         """Start an isolated in-memory transaction from the current published snapshot."""
         self._graph_service = graph_service
-        self._base_state = graph_service.load_state()
+        with graph_service.writer_lock():
+            self._base_state = graph_service.load_state()
         self._state = self._base_state
         self._closed = False
+        self._adjacency_table: pa.Table | None = None
+        self._adjacency_index: GraphAdjacency | None = None
+
+    def adjacency_for_state(self, state: GraphState | GraphTabularState) -> GraphAdjacency | None:
+        """Share published positions only for the exact base table; isolate overlays."""
+        if self._closed:
+            raise RuntimeError("Transaction is closed")
+        if state.edge_table is self._base_state.edge_table:
+            return self._graph_service.adjacency_for_state(state)
+        if state.edge_table is not self._adjacency_table:
+            self._adjacency_table = state.edge_table
+            size = GraphAdjacency.reservation(
+                state.edge_table.num_rows,
+                (item.name for item in state.catalog.relationship_types),
+                self._graph_service.adjacency_indexes.max_bytes,
+                node_count=state.node_table.num_rows,
+            )
+            self._adjacency_index = GraphAdjacency(reserved_bytes=size) if size else None
+        return self._adjacency_index
 
     def load_state(self) -> GraphState:
         """Return the current transaction-local graph state."""
@@ -1355,6 +1471,8 @@ class GraphTransactionUseCase:
 
         self._ensure_open()
         self._closed = True
+        self._adjacency_table = None
+        self._adjacency_index = None
         if self._state == self._base_state:
             return self._base_state
         return self._graph_service._publish_graph(
@@ -1369,6 +1487,8 @@ class GraphTransactionUseCase:
 
         self._ensure_open()
         self._closed = True
+        self._adjacency_table = None
+        self._adjacency_index = None
         self._state = self._base_state
         return self._base_state
 
@@ -1380,6 +1500,8 @@ class GraphTransactionUseCase:
         edges: list[EdgeRecord],
     ) -> GraphState:
         """Rebuild the transaction-local Arrow tables after an in-memory mutation."""
+        self._adjacency_table = None
+        self._adjacency_index = None
         node_table = pa.table(
             {
                 "node_id": pa.array([node.node_id for node in nodes], type=pa.int64()),

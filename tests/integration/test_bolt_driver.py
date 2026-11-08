@@ -525,3 +525,28 @@ def test_bolt_server_supports_unwind_with_create_loader_shape_without_return(
         {"d.character": "Ned Stark", "d.episode": "S01E09"},
         {"d.character": "Robert Baratheon", "d.episode": "S01E07"},
     ]
+
+
+def test_bolt_stale_transaction_returns_retryable_conflict(tmp_path: Path) -> None:
+    settings = GraphArrowSettings(bolt_host="127.0.0.1", bolt_port=0, bolt_auth_token="secret")
+    with run_bolt_server(tmp_path / "conflicting-transactions", settings=settings) as handle:
+        with GraphDatabase.driver(
+            f"bolt://127.0.0.1:{handle.port}", auth=basic_auth("neo4j", "secret")
+        ) as driver:
+            with driver.session() as first, driver.session() as second:
+                winner, stale = first.begin_transaction(), second.begin_transaction()
+                try:
+                    winner.run("CREATE (:Person {name: 'committed'})").consume()
+                    stale.run("CREATE (:Person {name: 'stale'})").consume()
+                    winner.commit()
+                    with pytest.raises(Neo4jError) as error:
+                        stale.commit()
+                    assert error.value.code == "Neo.TransientError.Transaction.Outdated"
+                    assert error.value.is_retryable()
+                finally:
+                    winner.close()
+                    stale.close()
+            with driver.session() as session:
+                assert session.run("MATCH (p:Person) RETURN p.name AS name").data() == [
+                    {"name": "committed"}
+                ]

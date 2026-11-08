@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -10,13 +11,18 @@ import pyarrow.dataset as ds  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
 from grapharrow.adapters.filesystem import FileSystemAdapter
+from grapharrow.adapters.scan_filter import dataset_filter
+from grapharrow.domain.scan import ScanPredicate
 
 
 class ParquetAdapter:
     """Encapsulate PyArrow Parquet reads and writes behind a small adapter."""
 
-    def __init__(self, filesystem: FileSystemAdapter | None = None) -> None:
+    def __init__(
+        self, filesystem: FileSystemAdapter | None = None, *, filter_pushdown_enabled: bool = True
+    ) -> None:
         self._filesystem = filesystem or FileSystemAdapter()
+        self.filter_pushdown_enabled = filter_pushdown_enabled
 
     def read_table(
         self,
@@ -43,6 +49,7 @@ class ParquetAdapter:
         *,
         schema: pa.Schema | None = None,
         columns: list[str] | None = None,
+        predicates: Sequence[ScanPredicate] = (),
     ) -> pa.Table:
         """Read one logical Parquet dataset from ``paths`` using ``pyarrow.dataset``."""
 
@@ -63,5 +70,13 @@ class ParquetAdapter:
             format="parquet",
             schema=schema,
         )
-        scanner = dataset.scanner(columns=columns)
-        return scanner.to_table()
+        expression = (
+            dataset_filter(dataset.schema, predicates) if self.filter_pushdown_enabled else None
+        )
+        try:
+            return dataset.scanner(columns=columns, filter=expression).to_table()
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
+            if expression is None:
+                raise
+            # Keep unsupported scanner kernels and schema coercions on the residual path.
+            return dataset.scanner(columns=columns).to_table()

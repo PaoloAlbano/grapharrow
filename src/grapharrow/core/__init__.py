@@ -7,6 +7,7 @@ from grapharrow.core.errors import (
     SchemaError,
     StorageError,
     TransactionError,
+    WriteConflictError,
 )
 from grapharrow.core.layout import DatabaseLayout, Location
 
@@ -19,4 +20,5 @@ __all__ = [
     "SchemaError",
     "StorageError",
     "TransactionError",
+    "WriteConflictError",
 ]

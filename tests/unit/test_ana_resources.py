@@ -131,6 +131,7 @@ def test_multistep_set_failure_removes_intermediate_handles(application: Any) ->
 
 
 def test_snapshot_admission_and_close_release_shared_budget(application: Any) -> None:
+    application.settings.ana_adjacency_index_max_bytes_per_session = 0
     with GraphArrowAgentBackend(application) as probe:
         size = probe.resource_usage["bytes"]
     budget = AnaResourceBudget(size * 2 - 1)
@@ -148,6 +149,7 @@ def test_snapshot_admission_and_close_release_shared_budget(application: Any) ->
 
 
 def test_concurrent_workflows_cannot_overbook_shared_capacity(application: Any) -> None:
+    application.settings.ana_adjacency_index_max_bytes_per_session = 0
     with GraphArrowAgentBackend(application) as probe:
         size = probe.resource_usage["bytes"]
     budget = AnaResourceBudget(size * 2 + 1024)

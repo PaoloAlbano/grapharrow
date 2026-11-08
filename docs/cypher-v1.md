@@ -115,8 +115,12 @@ support graph exploration clients. Examples include schema discovery,
 This is a compatibility subset, not general procedure execution.
 
 Index DDL supports selected legacy and named `CREATE INDEX`, `CREATE TEXT INDEX`
-and `DROP INDEX` forms. These statements maintain catalog declarations;
-they do not build general physical secondary indexes or a full-text engine.
+and `DROP INDEX` forms. Case-sensitive, single-property node `range` and
+`lookup` declarations support lazy, bounded in-memory equality indexes for
+eligible scalar property projections. Other index kinds remain catalog
+metadata; there is no full-text engine. See
+[Engine Read and Write Optimizations](engine-performance.md) for scope,
+memory settings, and fallback behavior.
 
 ## Storage and binding tables
 

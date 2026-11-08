@@ -177,6 +177,58 @@ class Case:
     args: dict[str, Any]
 
 
+def test_selective_traversal_reuses_rest_index_in_ana(interfaces: Interfaces) -> None:
+    query = (
+        "MATCH (p:Person {name:$name})-[:WORKS]->(c:Company) "
+        "RETURN c.name AS company ORDER BY c.name"
+    )
+    expected = {"columns": ["company"], "rows": [{"company": "Acme"}] * 2}
+    results = interfaces.read_cypher(query, {"name": "Alice"})
+    assert all(result == expected for result in results.values())
+    container = interfaces.rest.app.state.grapharrow
+    store = container.use_cases.graph.adjacency_indexes
+    assert len(store._entries) == 1
+    index = next(iter(store._entries.values()))[0]
+    assert index.build_count == 1
+    headers = interfaces.session()
+    try:
+        seed = interfaces.call(headers, "node_search", {"label": "Person", "value": "Alice"})
+        expanded = interfaces.call(
+            headers,
+            "expand",
+            {
+                "from": seed["handle"],
+                "source": "person",
+                "relationship_type": "WORKS",
+                "target_label": "Company",
+                "as": "company",
+            },
+        )
+        projected = interfaces.call(
+            headers,
+            "project",
+            {
+                "from": expanded["handle"],
+                "select": [{"var": "company", "property": "name", "alias": "company"}],
+            },
+        )
+        assert interfaces.fetch(headers, projected["handle"]) == expected
+        assert index.build_count == 1 and store.hits > 0
+        with interfaces.bolt.session() as session:
+            with session.begin_transaction() as transaction:
+                assert transaction.run(query, name="Alice").data() == expected["rows"]
+                transaction.run(
+                    "MATCH (p:Person {name:'Alice'})-[r:WORKS]->(c:Company) DELETE r"
+                ).consume()
+                assert transaction.run(query, name="Alice").data() == []
+                transaction.rollback()
+        assert interfaces.rest_query(query, {"name": "Alice"})["rows"] == expected["rows"]
+    finally:
+        response = interfaces.rest.delete("/sessions/current", headers=headers)
+        assert response.status_code == 204
+    assert interfaces.rest.app.state.ana_resource_budget.used_bytes == 0
+
+
 CASES = [
     Case(
         "duplicate-names-and-null",

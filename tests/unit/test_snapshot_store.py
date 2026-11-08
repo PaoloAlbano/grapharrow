@@ -1,13 +1,34 @@
 import os
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 
 import pytest
 
-from grapharrow.core import DatabaseLayout
+from grapharrow.core import DatabaseLayout, WriteConflictError
 from grapharrow.domain import CatalogVersion, DatasetFile, SnapshotId, SnapshotManifest
 from grapharrow.repositories import SnapshotRepository
+
+
+def test_published_manifest_retry_does_not_rewrite_reader_visible_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SnapshotRepository(DatabaseLayout(root=tmp_path / "immutable-manifest"))
+    manifest = store.bootstrap(catalog_version=CatalogVersion(1))
+    pointer = store.load_current_pointer()
+
+    def fail(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Published metadata was rewritten")
+
+    monkeypatch.setattr(store._filesystem, "write_json", fail)
+    monkeypatch.setattr(store._filesystem, "replace_json", fail)
+    assert store.publish(manifest) == pointer
+    assert store.write_manifest(manifest).exists()
+    with pytest.raises(WriteConflictError):
+        store.publish(replace(manifest, commit_txid=manifest.commit_txid + 1))
+    with pytest.raises(WriteConflictError):
+        store.write_manifest(replace(manifest, commit_txid=manifest.commit_txid + 1))
 
 
 def test_snapshot_store_can_publish_and_load_a_manifest(tmp_path: Path) -> None:

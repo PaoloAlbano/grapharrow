@@ -6,8 +6,9 @@ from pathlib import Path
 from typing import Any, cast
 
 from grapharrow.adapters import FileSystemAdapter
+from grapharrow.adapters.writer import WriterCoordinator, writer_locked
 from grapharrow.core import DatabaseLayout
-from grapharrow.core.errors import StorageError
+from grapharrow.core.errors import StorageError, WriteConflictError
 from grapharrow.domain import CatalogVersion, CurrentSnapshotPointer, DatasetFile, SnapshotId
 from grapharrow.domain.snapshot import ChecksumAlgorithm, DatasetKind, SnapshotManifest
 
@@ -23,6 +24,12 @@ class SnapshotRepository:
         """Bind the layout and filesystem used to manage manifests and the current pointer."""
         self._layout = layout
         self._filesystem = filesystem or FileSystemAdapter()
+        self._writer = WriterCoordinator(layout.root, self._filesystem)
+
+    @property
+    def writer(self) -> WriterCoordinator:
+        """Return the coordinator shared by this database's mutation paths."""
+        return self._writer
 
     @property
     def layout(self) -> DatabaseLayout:
@@ -35,6 +42,7 @@ class SnapshotRepository:
 
         return self._filesystem.exists(self._layout.current_snapshot_path)
 
+    @writer_locked
     def write_manifest(self, manifest: SnapshotManifest) -> str | Path:
         """Persist a snapshot manifest without publishing it."""
 
@@ -42,10 +50,17 @@ class SnapshotRepository:
         self.validate_manifest(manifest)
 
         manifest_path = self._manifest_path(manifest.snapshot_id)
+        if self._filesystem.exists(manifest_path) and self.current_exists():
+            current = self.load_current_pointer()
+            if manifest.snapshot_id.value <= current.snapshot_id.value:
+                if self.load_manifest(manifest.snapshot_id) != manifest:
+                    raise WriteConflictError("Published snapshot manifests cannot be overwritten.")
+                return manifest_path
         payload = self._serialize_manifest(manifest)
         self._filesystem.write_json(manifest_path, payload)
         return manifest_path
 
+    @writer_locked
     def stage_manifest(
         self,
         manifest: SnapshotManifest,
@@ -71,6 +86,7 @@ class SnapshotRepository:
         self._filesystem.write_json(manifest_path, payload)
         return manifest_path
 
+    @writer_locked
     def publish(
         self,
         manifest: SnapshotManifest,
@@ -79,6 +95,16 @@ class SnapshotRepository:
     ) -> CurrentSnapshotPointer:
         """Persist and publish a snapshot as the current reader-visible state."""
 
+        if self.current_exists():
+            current = self.load_current_pointer()
+            if manifest == self.load_manifest():
+                return current
+            if (
+                manifest.parent_snapshot_id is not None
+                and manifest.parent_snapshot_id != current.snapshot_id
+                or manifest.snapshot_id.value <= current.snapshot_id.value
+            ):
+                raise WriteConflictError("Snapshot changed. Retry from the current snapshot.")
         if staged_relative_path is not None:
             staged_manifest_path = self.stage_manifest(
                 manifest,
@@ -128,12 +154,15 @@ class SnapshotRepository:
         if self.current_exists():
             return self.load_manifest()
 
-        manifest = SnapshotManifest.empty(
-            snapshot_id=SnapshotId(1),
-            catalog_version=catalog_version,
-        )
-        self.publish(manifest)
-        return manifest
+        with self._writer.hold():
+            if self.current_exists():
+                return self.load_manifest()
+            manifest = SnapshotManifest.empty(
+                snapshot_id=SnapshotId(1),
+                catalog_version=catalog_version,
+            )
+            self.publish(manifest)
+            return manifest
 
     def validate_manifest(self, manifest: SnapshotManifest) -> None:
         """Validate that a manifest is structurally coherent before publication."""

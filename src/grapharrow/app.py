@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from grapharrow.adapters import (
@@ -12,6 +12,7 @@ from grapharrow.adapters import (
     ParquetAdapter,
     PyArrowTabularAdapter,
 )
+from grapharrow.adapters.query_cache import CypherParseCache
 from grapharrow.config import GraphArrowSettings
 from grapharrow.core import DatabaseLayout
 from grapharrow.repositories import CatalogRepository, GraphRepository, SnapshotRepository
@@ -21,6 +22,7 @@ from grapharrow.use_cases import (
     GraphStateUseCase,
     IndexCatalogUseCase,
 )
+from grapharrow.use_cases.ana_schema_cache import SnapshotSchemaCache
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +64,7 @@ class GraphArrowApplication:
     adapters: GraphArrowAdapters
     repositories: GraphArrowRepositories
     use_cases: GraphArrowUseCases
+    _ana_schema_cache: SnapshotSchemaCache = field(default_factory=SnapshotSchemaCache, repr=False)
 
 
 def build_application(
@@ -80,7 +83,10 @@ def build_application(
     adapters = GraphArrowAdapters(
         bulk_input=BulkInputAdapter(),
         filesystem=resolved_filesystem,
-        parquet=ParquetAdapter(filesystem=resolved_filesystem),
+        parquet=ParquetAdapter(
+            filesystem=resolved_filesystem,
+            filter_pushdown_enabled=resolved_settings.parquet_filter_pushdown_enabled,
+        ),
         opencypher=OpenCypherAdapter(),
         tabular=PyArrowTabularAdapter(),
     )
@@ -106,12 +112,18 @@ def build_application(
         catalog_store=repositories.catalog,
         snapshot_store=repositories.snapshot,
         graph_store=repositories.graph,
+        property_index_max_bytes=resolved_settings.property_index_max_bytes,
+        adjacency_index_max_bytes=resolved_settings.adjacency_index_max_bytes,
     )
     index_use_case = IndexCatalogUseCase(catalog_store=repositories.catalog)
     cypher_use_case = CypherQueryUseCase(
         graph_service=graph_use_case,
         tabular_adapter=adapters.tabular,
         index_service=index_use_case,
+        parse_cache=CypherParseCache(
+            resolved_settings.cypher_parse_cache_max_entries,
+            resolved_settings.cypher_parse_cache_max_source_bytes,
+        ),
     )
     use_cases = GraphArrowUseCases(
         admin=admin_use_case,

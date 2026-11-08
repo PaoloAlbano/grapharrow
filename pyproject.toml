@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.27.0"]
+requires = ["hatchling>=1.33.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -15,13 +15,13 @@ authors = [
 ]
 dependencies = [
   "antlr4-python3-runtime>=4.13.2",
-  "fastapi>=0.135.2",
-  "orjson>=3.11.9",
-  "pandas>=3.0.2",
-  "pyarrow>=20.0.0",
-  "pydantic>=2.12.5",
-  "pydantic-settings>=2.13.1",
-  "uvicorn>=0.42.0",
+  "fastapi>=0.162.0",
+  "orjson>=3.13.0",
+  "pandas>=3.1.1",
+  "pyarrow>=26.0.1",
+  "pydantic>=2.14.3",
+  "pydantic-settings>=2.16.2",
+  "uvicorn>=0.54.0",
 ]
 
 [project.scripts]
@@ -31,17 +31,18 @@ grapharrow-bolt = "grapharrow.interfaces.bolt:main"
 
 [dependency-groups]
 benchmark = [
-  "duckdb",
-  "polars",
+  "duckdb>=2.0.0",
+  "polars>=2.1.0",
 ]
 dev = [
   "antlr4-tools>=0.2.2",
   "httpx>=0.28.1",
-  "mypy>=1.15.0",
-  "moto[server]>=5.1.0",
-  "pytest>=8.3.5",
-  "ruff>=0.11.0",
-  "neo4j>=6.1.0",
+  "httpx2>=2.16.0",
+  "mypy>=2.4.1",
+  "moto[server]>=5.2.5",
+  "pytest>=9.2.0",
+  "ruff>=0.17.4",
+  "neo4j>=6.4.1",
   "pytest-cov>=7.1.0",
 ]
 
@@ -56,7 +57,13 @@ include = [
   "/scripts/benchmark_backends.py", "/scripts/benchmark_bolt_engines.py",
   "/scripts/benchmark_cypher_engine.py", "/scripts/benchmark_tabular_json.py",
   "/scripts/benchmark_ana_sessions.py",
+  "/scripts/benchmark_ana_read_cache.py",
+  "/scripts/benchmark_ana_call_state.py",
+  "/scripts/benchmark_engine_optimizations.py",
+  "/scripts/benchmark_parquet_pushdown.py",
   "/scripts/benchmark_ana_traversals.py",
+  "/scripts/benchmark_shared_adjacency.py",
+  "/scripts/benchmark_ana_seed_discovery.py",
 ]
 
 [tool.pytest.ini_options]
@@ -90,11 +97,7 @@ omit = ["src/grapharrow/interfaces/opencypher/generated/*"]
 omit = ["src/grapharrow/interfaces/opencypher/generated/*"]
 
 [[tool.mypy.overrides]]
-module = ["antlr4", "antlr4.*"]
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = ["pandas", "pandas.*"]
+module = ["antlr4"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

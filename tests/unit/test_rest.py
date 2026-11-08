@@ -1,9 +1,25 @@
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from grapharrow.config import GraphArrowSettings
+from grapharrow.core.errors import WriteConflictError
 from grapharrow.interfaces.rest import create_rest_app
+
+
+def test_rest_write_conflict_is_a_409_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = create_rest_app(tmp_path / "conflict")
+
+    def fail(query: str, params: object = None) -> object:
+        raise WriteConflictError("Database changed. Retry in a new transaction.")
+
+    monkeypatch.setattr(app.state.grapharrow.use_cases.cypher, "execute", fail)
+    response = TestClient(app).post("/v1/query", json={"query": "CREATE (:Person)"})
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "WRITE_CONFLICT"
 
 
 def test_rest_health_reports_a_bootstrapped_database(tmp_path: Path) -> None:

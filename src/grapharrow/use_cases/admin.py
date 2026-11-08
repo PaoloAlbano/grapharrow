@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from grapharrow.adapters import FileSystemAdapter
+from grapharrow.adapters.writer import writer_locked
 from grapharrow.core import DatabaseLayout
 from grapharrow.domain import (
     CatalogVersion,
@@ -70,14 +71,20 @@ class DatabaseAdminUseCase:
         self._snapshot_store = snapshot_store
         self._graph_store = graph_store
         self._filesystem = filesystem or FileSystemAdapter()
+        self._writer = snapshot_store.writer
 
     def initialize(self) -> InitializationResult:
         """Create the base layout, catalog, and first empty snapshot."""
 
-        self._layout.ensure_base_directories()
-        catalog = self._catalog_store.bootstrap()
-        snapshot = self._snapshot_store.bootstrap(catalog_version=catalog.version)
-        return InitializationResult(catalog=catalog, snapshot=snapshot)
+        if self._catalog_store.exists() and self._snapshot_store.current_exists():
+            return InitializationResult(
+                catalog=self._catalog_store.load(), snapshot=self._snapshot_store.load_manifest()
+            )
+        with self._writer.hold():
+            self._layout.ensure_base_directories()
+            catalog = self._catalog_store.bootstrap()
+            snapshot = self._snapshot_store.bootstrap(catalog_version=catalog.version)
+            return InitializationResult(catalog=catalog, snapshot=snapshot)
 
     def verify(self, *, verify_checksums: bool = False) -> VerificationReport:
         """Verify that the current catalog and snapshot are readable and consistent."""
@@ -135,6 +142,7 @@ class DatabaseAdminUseCase:
             warnings=tuple(warnings),
         )
 
+    @writer_locked
     def recover(
         self,
         *,
@@ -168,6 +176,7 @@ class DatabaseAdminUseCase:
             warnings=tuple(warnings),
         )
 
+    @writer_locked
     def compact(self) -> SnapshotManifest:
         """Rewrite the current graph state into a fresh snapshot and rebuild derived files."""
 
@@ -203,6 +212,7 @@ class DatabaseAdminUseCase:
             self._graph_store.cleanup_staged(persisted.staged_dir)
         return manifest
 
+    @writer_locked
     def vacuum(self) -> tuple[str, ...]:
         """Remove manifests and data files that are not referenced by the current snapshot."""
 

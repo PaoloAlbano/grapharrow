@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass
 from threading import Lock
 from typing import Any
@@ -99,12 +101,66 @@ def retained_size(value: Any) -> int:
 class AnaResources:
     """Track retained snapshot, handles, lineage and the most recent fetched page."""
 
-    def __init__(self, limits: AnaLimits, budget: AnaResourceBudget, snapshot: Any) -> None:
+    def __init__(
+        self,
+        limits: AnaLimits,
+        budget: AnaResourceBudget,
+        snapshot: Any,
+        *,
+        shared_state: Any = None,
+        reserved_bytes: int = 0,
+    ) -> None:
+        if type(reserved_bytes) is not int or reserved_bytes < 0:
+            raise ValueError("Reserved bytes must be a non-negative integer")
         self.limits, self.budget = limits, budget
         self.snapshot_bytes = retained_size(snapshot)
+        if shared_state is not None:
+            # Charge a complete share even when it aliases this workflow's snapshot.
+            self.snapshot_bytes += retained_size(shared_state)
+        self.snapshot_bytes += reserved_bytes
         self.handles: dict[str, tuple[int, int, int]] = {}
+        self._rows = 0
+        self._handle_bytes = 0
+        self._changes: dict[str, tuple[int, int, int] | None] | None = None
         self.bytes = 0
         self._set_bytes(self.snapshot_bytes)
+
+    @contextmanager
+    def track_changes(self) -> Iterator[None]:
+        """Restore only modified charges and aggregate counters if a call fails."""
+        if self._changes is not None:
+            raise RuntimeError("An ANA resource call is already in progress")
+        before_bytes, before_rows, before_handles = self.bytes, self._rows, self._handle_bytes
+        changes: dict[str, tuple[int, int, int] | None] = {}
+        self._changes = changes
+        try:
+            yield
+        except BaseException:
+            for key, previous in changes.items():
+                if previous is None:
+                    self.handles.pop(key, None)
+                else:
+                    self.handles[key] = previous
+            self._rows, self._handle_bytes = before_rows, before_handles
+            # Restore an existing admission without rechecking a changed workflow limit.
+            self.budget.adjust(before_bytes - self.bytes)
+            self.bytes = before_bytes
+            raise
+        finally:
+            self._changes = None
+
+    def _remember(self, key: str) -> None:
+        if self._changes is not None and key not in self._changes:
+            self._changes[key] = self.handles.get(key)
+
+    def register_handle(self, key: str, count: int, row_bytes: int, size: int) -> None:
+        """Record a reservation after its handle has been published successfully."""
+        if key in self.handles:
+            raise RuntimeError("ANA handle already has a resource charge")
+        self._remember(key)
+        self.handles[key] = (count, row_bytes, size)
+        self._rows += count
+        self._handle_bytes += size
 
     def _set_bytes(self, value: int) -> None:
         if value > self.limits.max_bytes:
@@ -114,11 +170,24 @@ class AnaResources:
         self.budget.adjust(value - self.bytes)
         self.bytes = value
 
+    def reserve_snapshot_capacity(self, size: int) -> bool:
+        """Reserve optional acceleration during setup without rejecting the base view."""
+        if type(size) is not int or size < 0:
+            raise ValueError("Snapshot capacity must be a non-negative integer")
+        if self._changes is not None:
+            raise RuntimeError("Snapshot capacity must be reserved before tool calls")
+        try:
+            self._set_bytes(self.bytes + size)
+        except AnaQuotaExceeded:
+            return False
+        self.snapshot_bytes += size
+        return True
+
     @property
     def usage(self) -> dict[str, int]:
         return {
             "handles": len(self.handles),
-            "rows": sum(value[0] for value in self.handles.values()),
+            "rows": self._rows,
             "bytes": self.bytes,
             "snapshot_bytes": self.snapshot_bytes,
         }
@@ -126,7 +195,7 @@ class AnaResources:
     def reserve_handle(self, rows: list[dict[str, Any]], header: Any) -> tuple[int, int]:
         if self.limits.max_handles is not None and len(self.handles) >= self.limits.max_handles:
             raise AnaQuotaExceeded("ANA workflow handle quota reached; start a new workflow")
-        if self.usage["rows"] + len(rows) > self.limits.max_rows:
+        if self._rows + len(rows) > self.limits.max_rows:
             raise AnaQuotaExceeded(
                 "ANA workflow row quota reached; reduce the result limit or start a new workflow"
             )
@@ -136,10 +205,11 @@ class AnaResources:
         return row_bytes, size
 
     def finalize(self, store: Any, touched: set[str], last_fetch: Any) -> None:
-        sizes = dict(self.handles)
+        sizes = {}
+        total_rows, total_handles = self._rows, self._handle_bytes
         for key in touched:
             handle = store.handles[key]
-            count, row_bytes, _ = sizes[key]
+            count, row_bytes, previous_size = self.handles[key]
             # Shared operations publish rows only once; later finalization may
             # remove hidden ranking fields, or attach columns/metadata/lineage.
             # Keep the original row charge when fields shrink, and avoid a
@@ -161,21 +231,21 @@ class AnaResources:
                 + sys.getsizeof(vars(handle))
             )
             sizes[key] = (len(handle.rows), row_bytes, size)
-        if sum(value[0] for value in sizes.values()) > self.limits.max_rows:
+            total_rows += len(handle.rows) - count
+            total_handles += size - previous_size
+        if total_rows > self.limits.max_rows:
             raise AnaQuotaExceeded("ANA workflow row quota reached")
-        self._set_bytes(
-            self.snapshot_bytes
-            + sum(value[2] for value in sizes.values())
-            + retained_size(last_fetch)
-        )
-        self.handles = sizes
-
-    def restore(self, handles: dict[str, tuple[int, int, int]], size: int) -> None:
-        self._set_bytes(size)
-        self.handles = handles
+        total_bytes = self.snapshot_bytes + total_handles + retained_size(last_fetch)
+        for key, charge in sizes.items():
+            self._remember(key)
+            self.handles[key] = charge
+        self._rows, self._handle_bytes = total_rows, total_handles
+        # Allocate and journal updates before the final shared-budget admission.
+        self._set_bytes(total_bytes)
 
     def close(self) -> None:
         self.budget.adjust(-self.bytes)
         self.bytes = 0
         self.snapshot_bytes = 0
         self.handles.clear()
+        self._rows = self._handle_bytes = 0

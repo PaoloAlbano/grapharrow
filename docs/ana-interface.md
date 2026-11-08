@@ -57,6 +57,10 @@ Use `--no-ana` or `GRAPHARROW_ANA_ENABLED=false` to disable the interface.
 | `GRAPHARROW_ANA_MAX_ROWS_PER_SESSION` | `100000` | Sum of rows retained across workflow handles |
 | `GRAPHARROW_ANA_MAX_BYTES_PER_SESSION` | `67108864` | Accounted snapshot, handle, lineage and page bytes (64 MiB) |
 | `GRAPHARROW_ANA_MAX_TOTAL_BYTES` | `536870912` | Shared accounted bytes for the HTTP application (512 MiB) |
+| `GRAPHARROW_ANA_READ_CACHE_ENABLED` | `false` | Enable workflow-local candidate caching for `entity_resolve` and `value_search` |
+| `GRAPHARROW_ANA_READ_CACHE_MAX_BYTES_PER_SESSION` | `4194304` | Reserved read-cache capacity inside workflow and server byte quotas (4 MiB, minimum 1024 bytes) |
+| `GRAPHARROW_ANA_ADJACENCY_INDEX_MAX_BYTES_PER_SESSION` | `8388608` | Ceiling for the computed adjacency-index reservation; `0` disables it (8 MiB) |
+| `GRAPHARROW_ADJACENCY_INDEX_MAX_BYTES` | `33554432` | Shared engine adjacency-cache ceiling per application; `0` disables it for ANA and Cypher (32 MiB) |
 
 Existing REST routes keep their configured prefix, `/v1` by default. ANA uses
 the compatible root paths; a root REST prefix is rejected when ANA is enabled.
@@ -169,14 +173,32 @@ State is process-local; use one worker. This initial backend loads snapshot
 tables and property projections into memory for each session. Handle composition
 operates on materialized Python rows.
 
+Overlapping workflows in one application reuse schema discovery for an identical
+snapshot manifest. Each workflow receives its own schema copy, including nested
+values returned to native callers. The cache holds weak references, so entries
+can be collected when workflows release their references. A changed snapshot
+gets a separate entry. Workflow setup pins canonical and property tables together
+under the database coordinator before discovering or reusing the schema.
+
 Quotas count retained state. Snapshot admission includes canonical Arrow tables,
 property projections, schema and lookup structures. Handle charges include rows,
 metadata, lineage and the most recent fetched page. Shared objects can be charged
 again across handles; these are approximate accounting bytes, rather than RSS.
+Each workflow is conservatively charged for its schema copy and the complete
+shared schema entry. The cache is scoped to one application instance.
 A tool exceeding its quota rolls back its new handles and lineage. Existing
 handles and the previous fetched page remain usable. `allow_large` cannot bypass
 server quotas. Delete a workflow to release its resources; idle expiry and
 shutdown also release its budget.
+
+Call rollback journals only newly created handles, replaced lineage entries,
+and modified resource charges. Row and handle-byte totals are maintained
+incrementally, so checkpointing and quota finalization do not copy or sum the
+entire workflow's maps. Failed calls remove their new handles and restore replaced lineage, the previous
+fetched page, and resource accounting. Neutral preparations in
+the optional read cache retain their documented lifecycle. Tool execution,
+payload construction and explicitly enumerating all handles can still grow
+with the amount of data involved.
 
 The handle count ceiling is disabled by default; row and byte quotas remain
 active. Set a positive `GRAPHARROW_ANA_MAX_HANDLES_PER_SESSION` to enable an
@@ -191,6 +213,99 @@ The shared budget covers one HTTP application instance; separate processes do
 not coordinate it. Embedded callers can pass the same `AnaResourceBudget` to
 multiple backends to share a budget. See the
 [session resource benchmark](benchmarks/ana-session-resources.md) for measured costs.
+
+## Adjacency lookups
+
+ANA traversal tools pin a compact index from the shared graph engine when its
+conservative reservation fits the configured ceiling and the remaining workflow
+and server byte budgets. Otherwise they use the scan path. The reservation is
+included in `snapshot_bytes`; it is computed from edge count, node count and
+relationship types, rather than always reserving the full 8 MiB ceiling. It
+reduces the budget available for handles. Set
+`GRAPHARROW_ANA_ADJACENCY_INDEX_MAX_BYTES_PER_SESSION=0` to disable it for new
+workflows, or raise the ceiling to admit larger indexes. The application-wide
+`GRAPHARROW_ADJACENCY_INDEX_MAX_BYTES` ceiling must also admit the entry.
+
+The first participating traversal builds outgoing and incoming lists of canonical edge-row
+positions, grouped by relationship type and endpoint. Single-source lookups
+binary-search endpoint keys. Larger frontiers use Arrow lookups over typed
+endpoint keys and gather the matching positions in batches. Results retain
+canonical edge order, parallel relationships, direction semantics and single
+emission of self-loops in bidirectional expansions. Limited expansions still
+compute complete branch membership for compatible union counts.
+
+No handles, entity payloads or relationship-property copies are retained in the
+index. A completed index may remain after a later tool admission failure because
+its capacity was already reserved. An interrupted build publishes neither
+direction. Workflow shutdown releases its index reference and reservation. A
+bounded application LRU can retain the prepared index for later workflows and
+Cypher queries using the same immutable edge files. Unchanged files can reuse an
+index across snapshots; changed files receive another entry. Handles, lineage
+and entity ownership remain independent. No new disk format or persistent
+dataset is required. Building the index and gathering Arrow
+buffers use temporary memory beyond the retained-state reservation. See the
+[shared-engine benchmark](benchmarks/shared-adjacency.md) for cross-interface
+measurements and cache/transaction limits.
+
+## Seed filters and entity ranking
+
+Pattern execution applies validated start-variable filters before constructing
+seed entity payloads. Eligible native scalar predicates use Arrow masks and
+declared equality indexes. Other predicates read narrow property rows and use
+the existing Python rules. Selection preserves canonical order and the scope
+of an input handle; it does not apply the final result limit early. All filters
+remain residual checks. Conversion failures cannot be skipped by pushing a
+later predicate ahead of them, and hop validation retains its existing order.
+
+`entity_resolve` preselects ranked finalists before decoding and scoring every
+property row in Python. Supported ASCII rows use vectorized scores, context
+ranking and bounded selection for hits and alternatives, with canonical order
+as a tie breaker. Unicode, escaped/nonstandard aliases and nullable description
+cases retain Python scoring. The selected union is rescored by the existing
+implementation. Legacy/lossy or incomplete projections, small labels (fewer
+than 64 nodes), long search strings (more than 64 lowercased characters), and
+unsupported kernels use conservative pruning or the original scan path.
+
+These changes apply through native ANA and HTTP without enabling result
+caching. They preserve best-match classes, alternatives, reverse matches,
+context scores, scalar errors and workflow-owned references. Temporary Arrow
+masks and ranking tables can still grow with the label size. See the
+[seed and discovery benchmark](benchmarks/ana-seed-discovery.md) for timing,
+allocation measurements and limitations.
+
+## Optional read cache
+
+Set `GRAPHARROW_ANA_READ_CACHE_ENABLED=true` before opening new workflows to
+enable a bounded LRU cache for `entity_resolve` and `value_search`. The cache
+stores immutable candidate IDs and scores from the workflow's pinned snapshot.
+Every call creates a new handle, records its own lineage, and passes ordinary
+handle admission. Entity payloads are materialized with the workflow's owner
+identity when returned. Each workflow owns its cache.
+
+Cache keys include the operation, label, search input, context terms where
+applicable, effective limit, and property/match mode for value searches.
+Output variable aliases and `keep_entities` can reuse the same candidate
+selection while receiving independently constructed results. Oversized entries
+are served uncached. Candidate-computation errors are recomputed on later calls.
+Expiry or deletion of the workflow clears its entries.
+
+The configured capacity is reserved in full when the workflow opens and counts
+inside `GRAPHARROW_ANA_MAX_BYTES_PER_SESSION` and
+`GRAPHARROW_ANA_MAX_TOTAL_BYTES`. The default reservation is 4 MiB for an
+enabled workflow, including when its cache is empty. This reduces the budget
+available for other workflow state. Storage is allocated as entries arrive.
+Completed candidate preparations may remain cached after a later handle-quota
+failure because their capacity is already reserved; the failed call's handles
+and lineage still roll back.
+
+Native `resource_usage` adds `cache_used_bytes`, `cache_reserved_bytes`,
+`cache_hits`, and `cache_misses` while this option is active. Used bytes are a
+conservative estimate including keys and LRU container overhead. Reservations
+and entries are released on workflow close. Enable this option for workloads
+that repeat discovery inputs within one workflow; unique inputs still require
+candidate computation while the full cache capacity remains reserved. Use
+[the cache benchmark runner](../scripts/benchmark_ana_read_cache.py) to compare
+cold and repeated queries with caching enabled and disabled in your environment.
 
 GraphArrow performs graph reads over its snapshot and composes results in its
 own workflow store. Neo4j and the reference ANA server are only used for the

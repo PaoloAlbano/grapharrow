@@ -13,8 +13,14 @@ All versioned documents, source code and comments are written in English.
 - [Cypher V1](cypher-v1.md): supported query features, execution and limitations.
 - [Query Execution Architecture](query-execution-architecture.md): parsing,
   compilation, planning, storage access and public interfaces.
+- [Engine Performance](engine-performance.md): discovery, bounded aggregation and
+  ordered limits, physical equality indexes, file reuse, and Cypher syntax caching.
+- [Parquet Predicate Pushdown](parquet-predicate-pushdown.md): reader filters,
+  schema checks, residual execution, and row-group pruning.
 - [Planner V1](planner-v1.md): logical operators, supported query shapes and fallback behavior.
 - [MCP Interface](mcp-interface-design.md): the current Cypher-oriented tool interface.
+- [Dependencies and Installation](dependency-compatibility.md): Python and Arrow
+  requirements, locked environments, runtime installs, and storage compatibility.
 - [Real Object Storage Testing](real-object-storage-testing.md): optional live
   integration tests for S3, GCS and Azure.
 
@@ -26,6 +32,10 @@ All versioned documents, source code and comments are written in English.
   high-degree traversals, small output limits, concurrent workflows, and peak RSS.
 - [Streaming ANA Patterns](benchmarks/ana-pattern-streaming.md) compares
   pattern latency, memory, and complete branch counts with progressive execution.
+- [Shared Snapshot Adjacency](benchmarks/shared-adjacency.md) compares the common
+  engine through native Cypher, REST, Bolt, explicit transactions and ANA workflows.
+- [ANA Seed Filtering and Ranked Discovery](benchmarks/ana-seed-discovery.md)
+  measures filtering before payload construction and uncached entity resolution.
 - [Data Access Backend Evaluation](data-access-backend-evaluation.md): the
   rationale for using PyArrow as the storage and execution substrate.
 - [Benchmark Reports](benchmarks/): recorded results, comparisons and supporting profiles.

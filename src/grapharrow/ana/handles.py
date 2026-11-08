@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -69,6 +71,14 @@ class Handle:
         )
 
 
+@dataclass(slots=True)
+class HandleChanges:
+    """Undo only writes made by the current, serialized workflow call."""
+
+    created: set[str] = field(default_factory=set)
+    lineage: dict[str, list[dict[str, Any]] | None] = field(default_factory=dict)
+
+
 class HandleStore:
     """Retain materialized results within one workflow."""
 
@@ -77,6 +87,29 @@ class HandleStore:
         self.counter = 0
         self.handles: dict[str, Handle] = {}
         self.lineage: dict[str, list[dict[str, Any]]] = {}
+        self._changes: HandleChanges | None = None
+
+    @contextmanager
+    def track_changes(self) -> Iterator[HandleChanges]:
+        """Roll back newly published handles and replaced lineage on failure."""
+        if self._changes is not None:
+            raise RuntimeError("An ANA handle-store call is already in progress")
+        changes = HandleChanges()
+        self._changes = changes
+        try:
+            yield changes
+        except BaseException:
+            for name in changes.created:
+                self.handles.pop(name, None)
+                self.lineage.pop(name, None)
+            for name, previous in changes.lineage.items():
+                if previous is None:
+                    self.lineage.pop(name, None)
+                else:
+                    self.lineage[name] = previous
+            raise
+        finally:
+            self._changes = None
 
     def store(
         self,
@@ -92,6 +125,8 @@ class HandleStore:
         handle = Handle(
             name, rows, focus, kind, _columns(rows) if columns is None else columns, metadata or {}
         )
+        if self._changes is not None:
+            self._changes.created.add(name)
         self.handles[name] = handle
         entity_hint = (
             "Use the entity variables in this handle for additional graph operations."
@@ -152,6 +187,9 @@ class HandleStore:
                 "produced": self.summary(self.handles[handle]),
             }
         )
+        changes = self._changes
+        if changes is not None and handle not in changes.created and handle not in changes.lineage:
+            changes.lineage[handle] = self.lineage.get(handle)
         self.lineage[handle] = lineage[-24:]
 
     def clear(self) -> None:

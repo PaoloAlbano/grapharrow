@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from grapharrow.core import DatabaseLayout
-from grapharrow.domain import DatasetFile, SnapshotManifest
+from grapharrow.domain import DatasetFile, SnapshotId, SnapshotManifest
 from grapharrow.repositories import CatalogRepository, GraphRepository, SnapshotRepository
 from grapharrow.use_cases import DatabaseAdminUseCase
 
@@ -37,9 +37,9 @@ def test_admin_service_verify_flags_missing_manifest_files(tmp_path: Path) -> No
     snapshot_store = SnapshotRepository(layout=layout)
     manifest = snapshot_store.load_manifest()
     broken_manifest = SnapshotManifest(
-        snapshot_id=manifest.snapshot_id,
-        parent_snapshot_id=manifest.parent_snapshot_id,
-        commit_txid=manifest.commit_txid,
+        snapshot_id=SnapshotId(manifest.snapshot_id.value + 1),
+        parent_snapshot_id=manifest.snapshot_id,
+        commit_txid=manifest.commit_txid + 1,
         created_at=manifest.created_at,
         catalog_version=manifest.catalog_version,
         nodes=(

@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import Any, cast
 
 from grapharrow.adapters import FileSystemAdapter
+from grapharrow.adapters.writer import WriterCoordinator, writer_locked
 from grapharrow.core import DatabaseLayout
-from grapharrow.core.errors import CatalogError
+from grapharrow.core.errors import CatalogError, WriteConflictError
 from grapharrow.domain import (
     CatalogVersion,
     LabelDefinition,
@@ -39,6 +40,12 @@ class CatalogRepository:
         """Describe special object lifecycle or protocol behavior for this type."""
         self._layout = layout
         self._filesystem = filesystem or FileSystemAdapter()
+        self._writer = WriterCoordinator(layout.root, self._filesystem)
+
+    @property
+    def writer(self) -> WriterCoordinator:
+        """Return the coordinator shared by this database's mutation paths."""
+        return self._writer
 
     @property
     def layout(self) -> DatabaseLayout:
@@ -51,12 +58,19 @@ class CatalogRepository:
 
         return self._filesystem.exists(self._layout.current_catalog_path)
 
+    @writer_locked
     def write(self, catalog: VersionedCatalog) -> str | Path:
         """Persist ``catalog`` and update the current catalog pointer."""
 
         self._layout.ensure_base_directories()
 
         catalog_path = self._catalog_version_path(catalog.version)
+        if self.exists():
+            current = self.load()
+            if catalog == current:
+                return catalog_path
+            if catalog.version.value <= current.version.value:
+                raise WriteConflictError("Catalog changed. Reload it before writing a new version.")
         payload = self._serialize_catalog(catalog)
         self._filesystem.write_json(catalog_path, payload)
 
@@ -64,7 +78,7 @@ class CatalogRepository:
             "version": catalog.version.value,
             "path": self._layout.relative_path(catalog_path),
         }
-        self._filesystem.write_json(self._layout.current_catalog_path, pointer)
+        self._filesystem.replace_json(self._layout.current_catalog_path, pointer)
         return catalog_path
 
     def load(self, version: CatalogVersion | None = None) -> VersionedCatalog:
@@ -83,9 +97,12 @@ class CatalogRepository:
         if self.exists():
             return self.load()
 
-        catalog = VersionedCatalog.empty(version=CatalogVersion(1))
-        self.write(catalog)
-        return catalog
+        with self._writer.hold():
+            if self.exists():
+                return self.load()
+            catalog = VersionedCatalog.empty(version=CatalogVersion(1))
+            self.write(catalog)
+            return catalog
 
     def _catalog_version_path(self, version: CatalogVersion) -> str | Path:
         """Handle this internal helper step for the surrounding public workflow."""

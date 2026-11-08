@@ -27,3 +27,7 @@ class StorageError(GraphArrowError):
 
 class TransactionError(GraphArrowError):
     """Raised when transactional operations fail."""
+
+
+class WriteConflictError(TransactionError):
+    """The database changed after a writer captured its base state."""

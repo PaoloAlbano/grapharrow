@@ -12,7 +12,7 @@ It provides embedded Python, REST, Bolt and ANA agent interfaces. See the
 [supported Cypher subset](docs/cypher-v1.md) and
 [ANA compatibility limits](docs/ana-interface.md) before integrating it.
 The [transaction and session guide](docs/transactions.md) explains write
-visibility and the current single-writer assumptions.
+visibility, local writer coordination, conflict handling and object-storage limits.
 
 ## Goals
 

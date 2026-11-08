@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+import math
+import sys
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
+from functools import cmp_to_key
+from heapq import nlargest, nsmallest
 from itertools import islice
-from typing import Any
+from typing import Any, overload
 from uuid import uuid4
 
 import pyarrow as pa  # type: ignore[import-untyped]
@@ -28,6 +32,7 @@ from grapharrow.ana.values import (
     _validate_membership_operand,
     equal,
 )
+from grapharrow.use_cases.ana_seed import select_node_ids
 
 _BATCH_SOURCE_THRESHOLD = 8
 _EDGE_ROW_BATCH_SIZE = 256
@@ -109,7 +114,23 @@ def validate_filter(flt: dict[str, Any]) -> None:
     _validate_membership_operand(op, flt.get("value"))
 
 
-def initial_rows(backend: Any, args: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
+@overload
+def initial_rows(
+    backend: Any, args: dict[str, Any], filters: None = None
+) -> tuple[list[dict[str, Any]], str]: ...
+
+
+@overload
+def initial_rows(
+    backend: Any, args: dict[str, Any], filters: list[dict[str, Any]]
+) -> tuple[Iterable[dict[str, Any]], str]: ...
+
+
+def initial_rows(
+    backend: Any,
+    args: dict[str, Any],
+    filters: list[dict[str, Any]] | None = None,
+) -> tuple[Iterable[dict[str, Any]], str]:
     label = str(args["start_label"])
     variable = str(args.get("start_as") or label.lower())
     nodes = backend._label_ids.get(label, [])
@@ -128,6 +149,22 @@ def initial_rows(backend: Any, args: dict[str, Any]) -> tuple[list[dict[str, Any
                 continue
             allowed.add(source_node_id(row[variable], backend._owner))
         nodes = [node for node in nodes if node in allowed]
+    if filters:
+
+        def selected_rows() -> Iterator[dict[str, Any]]:
+            selected = select_node_ids(
+                backend,
+                label,
+                nodes,
+                filters,
+                lambda props, flt: matches({variable: {"properties": props}}, flt),
+            )
+            for entity in backend._materialize_nodes(selected):
+                yield {variable: entity, "__rel_ids": []}
+
+        # Predicate evaluation remains lazy, after eager hop validation, just
+        # like the original filter pipeline.
+        return selected_rows(), variable
     return [
         {variable: entity, "__rel_ids": []} for entity in backend._materialize_nodes(nodes)
     ], variable
@@ -172,8 +209,7 @@ def iter_extend_rows(
         raise ValueError(f"Unknown relationship_type {rel_type!r}")
     if rel_var in {source, target}:
         raise ValueError("Relationship and node variables must be distinct")
-    edges = backend._state.edge_table
-    edges = edges.filter(pc.equal(edges["rel_type"], rel_type))
+    scan_edges = backend._traversal_edges(rel_type, properties=True)
     source_column, target_column = (
         ("src_id", "dst_id") if direction == "out" else ("dst_id", "src_id")
     )
@@ -184,7 +220,14 @@ def iter_extend_rows(
         emitted = 0
         while batch := list(islice(inputs, _EDGE_ROW_BATCH_SIZE)):
             node_ids = [source_node_id(row[source], backend._owner) for row in batch]
-            candidates = edges_for_sources(edges, node_ids, (source_column,), max_batch_rows=4096)
+            candidates = backend._edges_for_sources(
+                rel_type,
+                node_ids,
+                (source_column,),
+                properties=True,
+                max_batch_rows=4096,
+                scan_edges=scan_edges,
+            )
             for row, selected in zip(batch, candidates, strict=True):
                 for edge in selected:
                     edge_id = str(edge["edge_id"])
@@ -280,7 +323,12 @@ def prepare_pattern(
             raise ValueError("Metric references an unknown pattern variable")
         if metric.get("op") not in {"count", "count_distinct", "sum", "avg", "min", "max"}:
             raise ValueError(f"Unsupported metric op: {metric.get('op')}")
-    initial, current = initial_rows(backend, normalized)
+    start = str(normalized.get("start_as") or str(normalized["start_label"]).lower())
+    initial, current = initial_rows(
+        backend,
+        normalized,
+        [flt for flt in normalized_filters if str(flt["var"]) == start],
+    )
     rows: Iterable[dict[str, Any]] = initial
     matched_node_ids: set[int] | None = None
     pending = list(normalized_filters)
@@ -338,47 +386,196 @@ def aggregate_rows(
     metrics = list(args.get("metrics") or [])
     columns = [str(item.get("alias") or item["property"]) for item in grouping]
     columns += [str(metric["alias"]) for metric in metrics]
-    groups: dict[Any, tuple[list[Any], list[dict[str, Any]]]] = {}
+    groups: dict[Any, tuple[list[Any], list[_MetricAccumulator]]] = {}
     if not grouping:
-        groups[()] = ([], [])
+        groups[()] = ([], [_MetricAccumulator(metric) for metric in metrics])
     for row in rows:
         values = [_row_property(row, str(item["var"]), str(item["property"])) for item in grouping]
         key = freeze(values)
-        groups.setdefault(key, (values, []))[1].append(row)
+        group = groups.get(key)
+        if group is None:
+            group = (values, [_MetricAccumulator(metric) for metric in metrics])
+            groups[key] = group
+        for accumulator in group[1]:
+            accumulator.add(row)
     result = []
-    for values, members in groups.values():
+    for values, accumulators in groups.values():
         out = dict(zip(columns[: len(grouping)], values, strict=True))
-        for metric in metrics:
-            op, var, alias = str(metric["op"]), str(metric["var"]), str(metric["alias"])
-            value: Any
-            if op == "count":
-                value = sum(row.get(var) is not None for row in members)
-            elif op == "count_distinct":
-                value = len(
-                    {
-                        freeze(_metric_identity(row, var))
-                        for row in members
-                        if row.get(var) is not None
-                    }
-                )
-            else:
-                scalars = [
-                    _metric_scalar_value(row, var, metric.get("property")) for row in members
-                ]
-                scalars = [item for item in scalars if item is not None]
-                if op == "sum":
-                    value = sum(scalars)
-                elif op == "avg":
-                    value = sum(scalars) / len(scalars) if scalars else None
-                elif op == "min":
-                    value = min(scalars) if scalars else None
-                elif op == "max":
-                    value = max(scalars) if scalars else None
-                else:
-                    raise ValueError(f"Unsupported metric op: {op}")
-            out[alias] = value
+        for metric, accumulator in zip(metrics, accumulators, strict=True):
+            out[str(metric["alias"])] = accumulator.result()
         result.append(out)
     return result, columns
+
+
+class _StreamingSum:
+    """Match built-in sum, including CPython 3.12 floating-point compensation."""
+
+    __slots__ = ("total", "correction", "generic", "values")
+
+    def __init__(self) -> None:
+        self.total: Any = 0
+        self.correction = 0.0
+        self.generic = False
+        # Future runtimes may change sum again; retain scalars rather than assume their algorithm.
+        self.values: list[Any] | None = [] if sys.version_info >= (3, 13) else None
+
+    def add(self, value: Any) -> None:
+        if self.values is not None:
+            self.values.append(value)
+        elif sys.version_info >= (3, 12) and type(self.total) is float and not self.generic:
+            if type(value) is float:
+                updated = self.total + value
+                self.correction += (
+                    (self.total - updated) + value
+                    if abs(self.total) >= abs(value)
+                    else (value - updated) + self.total
+                )
+                self.total = updated
+            elif isinstance(value, int) and -sys.maxsize - 1 <= value <= sys.maxsize:
+                self.total += value
+            else:
+                self.total = self.result() + value
+                self.correction = 0.0
+                self.generic = True
+        else:
+            self.total = self.total + value
+            if type(self.total) is int and not -sys.maxsize - 1 <= self.total <= sys.maxsize:
+                self.generic = True
+
+    def result(self) -> Any:
+        if self.values is not None:
+            return sum(self.values)
+        if self.correction and math.isfinite(self.correction):
+            return self.total + self.correction
+        return self.total
+
+
+class _MetricAccumulator:
+    """Retain scalar aggregate state, and identities only for exact distinct counts."""
+
+    __slots__ = ("op", "var", "prop", "count", "total", "extreme", "seen")
+
+    def __init__(self, metric: dict[str, Any]) -> None:
+        self.op, self.var = str(metric["op"]), str(metric["var"])
+        self.prop = metric.get("property")
+        self.count = 0
+        self.total = _StreamingSum()
+        self.extreme: Any = None
+        self.seen: set[Any] = set()
+        if self.op not in {"count", "count_distinct", "sum", "avg", "min", "max"}:
+            raise ValueError(f"Unsupported metric op: {self.op}")
+
+    def add(self, row: dict[str, Any]) -> None:
+        if self.op == "count":
+            self.count += row.get(self.var) is not None
+        elif self.op == "count_distinct":
+            if row.get(self.var) is not None:
+                self.seen.add(freeze(_metric_identity(row, self.var)))
+        else:
+            value = _metric_scalar_value(row, self.var, self.prop)
+            if value is None:
+                return
+            if self.op in {"sum", "avg"}:
+                self.total.add(value)
+            elif self.count == 0:
+                self.extreme = value
+            elif self.op == "min":
+                self.extreme = min(self.extreme, value)
+            else:
+                self.extreme = max(self.extreme, value)
+            self.count += 1
+
+    def result(self) -> Any:
+        if self.op == "count":
+            return self.count
+        if self.op == "count_distinct":
+            return len(self.seen)
+        if self.op == "sum":
+            return self.total.result()
+        if self.op == "avg":
+            return self.total.result() / self.count if self.count else None
+        return self.extreme
+
+
+def _order_keys(
+    args: dict[str, Any], columns: list[str], grouped: bool
+) -> list[tuple[Any, Any, bool]]:
+    specs = []
+    for order in args.get("order_by") or []:
+        direction = str(order.get("direction", "asc")).lower()
+        if direction not in {"asc", "desc"}:
+            raise ValueError("Order direction must be asc or desc")
+        field = order.get("field")
+        if not field and grouped:
+            field = next(
+                (
+                    str(item.get("alias") or item["property"])
+                    for item in args.get("group_by") or []
+                    if item["var"] == order.get("var") and item["property"] == order.get("property")
+                ),
+                None,
+            )
+        if field and field not in columns:
+            raise ValueError(f"Unknown order field: {field}")
+        specs.append((field, order, direction == "desc"))
+    return specs
+
+
+def _pair_order_value(pair: Any, field: Any, order: Any) -> Any:
+    value = (
+        pair[1].get(field)
+        if field
+        else _row_property(pair[0], str(order.get("var")), str(order.get("property")))
+    )
+    return value is None, value
+
+
+def _compare_pairs(left: Any, right: Any, specs: list[tuple[Any, Any, bool]]) -> int:
+    for field, order, descending in specs:
+        lhs = _pair_order_value(left, field, order)
+        rhs = _pair_order_value(right, field, order)
+        compared = (lhs > rhs) - (lhs < rhs)
+        if compared:
+            return int(-compared if descending else compared)
+    return 0
+
+
+def _order_selection(specs: list[tuple[Any, Any, bool]]) -> tuple[Any, Any]:
+    if len(specs) == 1:
+        field, order, descending = specs[0]
+        return (nlargest if descending else nsmallest), lambda pair: _pair_order_value(
+            pair, field, order
+        )
+    return nsmallest, cmp_to_key(lambda left, right: _compare_pairs(left, right, specs))
+
+
+def _can_bound_order(backend: Any, args: dict[str, Any], grouped: bool) -> bool:
+    """Preserve full stable-sort behavior for NaNs and untyped historical projections."""
+    if grouped:
+        return False
+    tables = getattr(backend, "_property_tables", {})
+    aliases = {
+        str(item.get("alias") or item["property"]): item["property"]
+        for item in args.get("select") or []
+    }
+    for order in args.get("order_by") or []:
+        prop = aliases.get(order.get("field"), order.get("property"))
+        for table in tables.values():
+            if prop not in table.column_names:
+                continue
+            field = table.schema.field(prop)
+            if (field.metadata or {}).get(b"grapharrow.encoding") != b"native":
+                return False
+            if pa.types.is_floating(field.type):
+                if pc.any(pc.is_nan(table[prop])).as_py():
+                    return False
+            elif not (
+                pa.types.is_integer(field.type)
+                or pa.types.is_boolean(field.type)
+                or pa.types.is_string(field.type)
+            ):
+                return False
+    return True
 
 
 def finish_pattern(
@@ -396,15 +593,20 @@ def finish_pattern(
     table = grouped or bool(selected) or relationship_variables is not None
     limit = _int_arg(args, "limit", 1, min_value=1) if args.get("limit") is not None else None
     ordered = bool(args.get("order_by"))
+    bounded_order = ordered and limit is not None and _can_bound_order(backend, args, grouped)
     complete_node_ids = node_ids if node_ids is not None else set()
     pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    columns = [str(item.get("alias") or item["property"]) for item in selected]
+    if relationship_variables and not selected:
+        columns = ["source", "target"]
     if grouped:
         output, columns = aggregate_rows(rows, args)
+        specs = _order_keys(args, columns, grouped)
+        select_best, order_key = _order_selection(specs)
         pairs = [(row, row) for row in output]
     else:
-        columns = [str(item.get("alias") or item["property"]) for item in selected]
-        if relationship_variables and not selected:
-            columns = ["source", "target"]
+        specs = _order_keys(args, columns, grouped)
+        select_best, order_key = _order_selection(specs)
         variables = _distinct_projection_vars(args)
         seen = set()
         for row in rows:
@@ -432,34 +634,22 @@ def finish_pattern(
             if ordered or limit is None or len(pairs) < limit:
                 # Ordering may reference original bindings outside the projection.
                 pairs.append((row if ordered else projected, projected))
-    for order in reversed(args.get("order_by") or []):
-        direction = str(order.get("direction", "asc")).lower()
-        if direction not in {"asc", "desc"}:
-            raise ValueError("Order direction must be asc or desc")
-        field = order.get("field")
-        if not field and grouped:
-            field = next(
-                (
-                    str(item.get("alias") or item["property"])
-                    for item in args.get("group_by") or []
-                    if item["var"] == order.get("var") and item["property"] == order.get("property")
-                ),
-                None,
-            )
-        if field and field not in columns:
-            raise ValueError(f"Unknown order field: {field}")
+                if bounded_order and limit is not None and len(pairs) >= max(2 * limit, 32):
+                    pairs = select_best(limit, pairs, key=order_key)
+    if ordered:
+        if bounded_order:
+            pairs = select_best(limit, pairs, key=order_key)
+        else:
+            for field, order, descending in reversed(specs):
 
-        def key(pair: Any, field: Any = field, order: Any = order) -> Any:
-            value = (
-                pair[1].get(field)
-                if field
-                else _row_property(pair[0], str(order.get("var")), str(order.get("property")))
-            )
-            return value is None, value
+                def full_key(pair: Any, field: Any = field, order: Any = order) -> Any:
+                    return _pair_order_value(pair, field, order)
 
-        pairs.sort(key=key, reverse=direction == "desc")
-    if args.get("limit") is not None:
-        pairs = pairs[: _int_arg(args, "limit", 1, min_value=1)]
+                pairs.sort(key=full_key, reverse=descending)
+            if limit is not None:
+                pairs = pairs[:limit]
+    elif limit is not None:
+        pairs = pairs[:limit]
     output = [pair[1] for pair in pairs]
     metadata = None
     if not table:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from grapharrow.adapters.writer import writer_locked
 from grapharrow.core.errors import CatalogError
 from grapharrow.domain import CatalogVersion, IndexDefinition, IndexKind, PropertyOwnerKind
 from grapharrow.repositories import CatalogRepository
@@ -16,12 +17,14 @@ class IndexCatalogUseCase:
         """Bind index operations to the catalog repository used by the database."""
 
         self._catalog_store = catalog_store
+        self._writer = catalog_store.writer
 
     def list_indexes(self) -> tuple[IndexDefinition, ...]:
         """Return the index declarations stored in the current catalog."""
 
         return self._catalog_store.bootstrap().indexes
 
+    @writer_locked
     def create_index(
         self,
         *,
@@ -78,6 +81,7 @@ class IndexCatalogUseCase:
         self._catalog_store.write(next_catalog)
         return index
 
+    @writer_locked
     def drop_index(self, *, name: str, if_exists: bool = False) -> IndexDefinition | None:
         """Remove one logical index declaration by name and persist the next catalog version."""
 

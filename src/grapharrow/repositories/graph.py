@@ -12,7 +12,8 @@ import pyarrow as pa  # type: ignore[import-untyped]
 
 from grapharrow.adapters import FileSystemAdapter, ParquetAdapter, PyArrowTabularAdapter
 from grapharrow.core import DatabaseLayout, Location
-from grapharrow.domain import DatasetFile, SnapshotId
+from grapharrow.domain import DatasetFile, SnapshotId, SnapshotManifest
+from grapharrow.domain.scan import ScanPredicate
 from grapharrow.domain.snapshot import DatasetKind
 
 NODE_SCHEMA = pa.schema(
@@ -140,6 +141,7 @@ class GraphRepository:
         *,
         label: str,
         columns: list[str] | None = None,
+        predicates: tuple[ScanPredicate, ...] = (),
     ) -> pa.Table:
         """Load the property-projection dataset for ``label``."""
 
@@ -151,6 +153,7 @@ class GraphRepository:
         return self._parquet.read_dataset_table(
             [self._absolute_location(dataset_file.path) for dataset_file in selected_files],
             columns=columns,
+            predicates=predicates,
         )
 
     def load_edge_property_table(
@@ -159,6 +162,7 @@ class GraphRepository:
         *,
         rel_type: str,
         columns: list[str] | None = None,
+        predicates: tuple[ScanPredicate, ...] = (),
     ) -> pa.Table:
         """Load the property-projection dataset for ``rel_type``."""
 
@@ -170,6 +174,7 @@ class GraphRepository:
         return self._parquet.read_dataset_table(
             [self._absolute_location(dataset_file.path) for dataset_file in selected_files],
             columns=columns,
+            predicates=predicates,
         )
 
     def load_nodes(self, files: tuple[DatasetFile, ...]) -> list[NodeRecord]:
@@ -238,6 +243,9 @@ class GraphRepository:
         snapshot_id: SnapshotId,
         nodes: list[NodeRecord],
         edges: list[EdgeRecord],
+        previous_snapshot: SnapshotManifest | None = None,
+        previous_nodes: tuple[NodeRecord, ...] | None = None,
+        previous_edges: tuple[EdgeRecord, ...] | None = None,
     ) -> PersistedGraph:
         """Write graph records for ``snapshot_id`` and return manifest file metadata."""
 
@@ -270,41 +278,72 @@ class GraphRepository:
         self._filesystem.create_dir(self._parent(staged_nodes_path))
         self._filesystem.create_dir(self._parent(staged_edges_path))
 
-        self._parquet.write_table(_nodes_table(nodes), staged_nodes_path)
-        self._parquet.write_table(_edges_table(edges), staged_edges_path)
-
-        self._filesystem.copy_file(staged_nodes_path, final_nodes_path)
-        self._filesystem.copy_file(staged_edges_path, final_edges_path)
+        same_nodes = (
+            previous_snapshot is not None
+            and previous_nodes is not None
+            and list(previous_nodes) == nodes
+        )
+        same_edges = (
+            previous_snapshot is not None
+            and previous_edges is not None
+            and list(previous_edges) == edges
+        )
+        if not same_nodes:
+            self._parquet.write_table(_nodes_table(nodes), staged_nodes_path)
+            self._filesystem.copy_file(staged_nodes_path, final_nodes_path)
+        if not same_edges:
+            self._parquet.write_table(_edges_table(edges), staged_edges_path)
+            self._filesystem.copy_file(staged_edges_path, final_edges_path)
+        node_groups = _unchanged_node_groups(previous_nodes, nodes)
+        edge_groups = _unchanged_edge_groups(previous_edges, edges)
+        label_groups = _unchanged_label_groups(previous_nodes, nodes)
+        topology_groups = _unchanged_topology_groups(previous_edges, edges)
 
         node_label_files = self._persist_node_label_indexes(
             snapshot_id=snapshot_id,
             nodes=nodes,
             staged_dir=staged_dir,
+            reuse_files=previous_snapshot.node_labels if previous_snapshot is not None else (),
+            unchanged=label_groups,
         )
         node_property_files = self._persist_node_property_tables(
             snapshot_id=snapshot_id,
             nodes=nodes,
             staged_dir=staged_dir,
+            reuse_files=previous_snapshot.node_properties if previous_snapshot is not None else (),
+            unchanged=node_groups,
         )
         adjacency_files = self._persist_adjacency_by_source(
             snapshot_id=snapshot_id,
             edges=edges,
             staged_dir=staged_dir,
+            reuse_files=previous_snapshot.adjacency_by_source
+            if previous_snapshot is not None
+            else (),
+            unchanged=topology_groups,
         )
         adjacency_by_dest_files = self._persist_adjacency_by_dest(
             snapshot_id=snapshot_id,
             edges=edges,
             staged_dir=staged_dir,
+            reuse_files=previous_snapshot.adjacency_by_dest
+            if previous_snapshot is not None
+            else (),
+            unchanged=topology_groups,
         )
         edge_property_files = self._persist_edge_property_tables(
             snapshot_id=snapshot_id,
             edges=edges,
             staged_dir=staged_dir,
+            reuse_files=previous_snapshot.edge_properties if previous_snapshot is not None else (),
+            unchanged=edge_groups,
         )
 
         persisted = PersistedGraph(
             staged_dir=self._layout.relative_path(staged_dir),
-            nodes=(
+            nodes=previous_snapshot.nodes
+            if same_nodes and previous_snapshot is not None
+            else (
                 _dataset_file_for(
                     path=final_nodes_path,
                     layout=self._layout,
@@ -315,7 +354,9 @@ class GraphRepository:
                     max_key=max((record.node_id for record in nodes), default=None),
                 ),
             ),
-            edges=(
+            edges=previous_snapshot.edges
+            if same_edges and previous_snapshot is not None
+            else (
                 _dataset_file_for(
                     path=final_edges_path,
                     layout=self._layout,
@@ -369,6 +410,8 @@ class GraphRepository:
         snapshot_id: SnapshotId,
         nodes: list[NodeRecord],
         staged_dir: Location,
+        reuse_files: tuple[DatasetFile, ...] = (),
+        unchanged: set[str] | None = None,
     ) -> tuple[DatasetFile, ...]:
         """Write one derived node-label dataset per label to accelerate label-based scans."""
         dataset_files: list[DatasetFile] = []
@@ -378,6 +421,10 @@ class GraphRepository:
                 by_label.setdefault(label, []).append(node.node_id)
 
         for label, node_ids in sorted(by_label.items()):
+            reused = tuple(item for item in reuse_files if Path(item.path).parent.name == label)
+            if unchanged is not None and label in unchanged and reused:
+                dataset_files.extend(reused)
+                continue
             final_path = self._join(
                 self._layout.node_labels_dir,
                 label,
@@ -415,6 +462,8 @@ class GraphRepository:
         snapshot_id: SnapshotId,
         edges: list[EdgeRecord],
         staged_dir: Location,
+        reuse_files: tuple[DatasetFile, ...] = (),
+        unchanged: set[str] | None = None,
     ) -> tuple[DatasetFile, ...]:
         """Write one adjacency-by-source dataset per relationship type for typed traversals."""
         dataset_files: list[DatasetFile] = []
@@ -423,6 +472,10 @@ class GraphRepository:
             by_type.setdefault(edge.rel_type, []).append(edge)
 
         for rel_type, typed_edges in sorted(by_type.items()):
+            reused = tuple(item for item in reuse_files if Path(item.path).parent.name == rel_type)
+            if unchanged is not None and rel_type in unchanged and reused:
+                dataset_files.extend(reused)
+                continue
             final_path = self._join(
                 self._layout.adjacency_by_source_dir,
                 rel_type,
@@ -470,6 +523,8 @@ class GraphRepository:
         snapshot_id: SnapshotId,
         edges: list[EdgeRecord],
         staged_dir: Location,
+        reuse_files: tuple[DatasetFile, ...] = (),
+        unchanged: set[str] | None = None,
     ) -> tuple[DatasetFile, ...]:
         """Write one adjacency-by-destination dataset per relationship type."""
         dataset_files: list[DatasetFile] = []
@@ -478,6 +533,10 @@ class GraphRepository:
             by_type.setdefault(edge.rel_type, []).append(edge)
 
         for rel_type, typed_edges in sorted(by_type.items()):
+            reused = tuple(item for item in reuse_files if Path(item.path).parent.name == rel_type)
+            if unchanged is not None and rel_type in unchanged and reused:
+                dataset_files.extend(reused)
+                continue
             final_path = self._join(
                 self._layout.adjacency_by_dest_dir,
                 rel_type,
@@ -525,6 +584,8 @@ class GraphRepository:
         snapshot_id: SnapshotId,
         nodes: list[NodeRecord],
         staged_dir: Location,
+        reuse_files: tuple[DatasetFile, ...] = (),
+        unchanged: set[str] | None = None,
     ) -> tuple[DatasetFile, ...]:
         """Write one property-columnar dataset per label to avoid JSON decoding on hot reads."""
         dataset_files: list[DatasetFile] = []
@@ -534,6 +595,10 @@ class GraphRepository:
                 by_label.setdefault(label, []).append(node)
 
         for label, typed_nodes in sorted(by_label.items()):
+            reused = tuple(item for item in reuse_files if Path(item.path).parent.name == label)
+            if unchanged is not None and label in unchanged and reused:
+                dataset_files.extend(reused)
+                continue
             final_path = self._join(
                 self._layout.node_properties_dir,
                 label,
@@ -571,6 +636,8 @@ class GraphRepository:
         snapshot_id: SnapshotId,
         edges: list[EdgeRecord],
         staged_dir: Location,
+        reuse_files: tuple[DatasetFile, ...] = (),
+        unchanged: set[str] | None = None,
     ) -> tuple[DatasetFile, ...]:
         """Write one property-columnar dataset per relationship type for relation-heavy queries."""
         dataset_files: list[DatasetFile] = []
@@ -579,6 +646,10 @@ class GraphRepository:
             by_type.setdefault(edge.rel_type, []).append(edge)
 
         for rel_type, typed_edges in sorted(by_type.items()):
+            reused = tuple(item for item in reuse_files if Path(item.path).parent.name == rel_type)
+            if unchanged is not None and rel_type in unchanged and reused:
+                dataset_files.extend(reused)
+                continue
             final_path = self._join(
                 self._layout.edge_properties_dir,
                 rel_type,
@@ -610,6 +681,58 @@ class GraphRepository:
                 )
             )
         return tuple(dataset_files)
+
+
+def _unchanged_node_groups(
+    previous: tuple[NodeRecord, ...] | None, current: list[NodeRecord]
+) -> set[str]:
+    before: dict[str, list[NodeRecord]] = {}
+    after: dict[str, list[NodeRecord]] = {}
+    for node in previous or ():
+        for label in node.labels:
+            before.setdefault(label, []).append(node)
+    for node in current:
+        for label in node.labels:
+            after.setdefault(label, []).append(node)
+    return {label for label, records in after.items() if before.get(label) == records}
+
+
+def _unchanged_label_groups(
+    previous: tuple[NodeRecord, ...] | None, current: list[NodeRecord]
+) -> set[str]:
+    before: dict[str, list[int]] = {}
+    after: dict[str, list[int]] = {}
+    for node in previous or ():
+        for label in node.labels:
+            before.setdefault(label, []).append(node.node_id)
+    for node in current:
+        for label in node.labels:
+            after.setdefault(label, []).append(node.node_id)
+    return {label for label, ids in after.items() if before.get(label) == ids}
+
+
+def _unchanged_edge_groups(
+    previous: tuple[EdgeRecord, ...] | None, current: list[EdgeRecord]
+) -> set[str]:
+    before: dict[str, list[EdgeRecord]] = {}
+    after: dict[str, list[EdgeRecord]] = {}
+    for edge in previous or ():
+        before.setdefault(edge.rel_type, []).append(edge)
+    for edge in current:
+        after.setdefault(edge.rel_type, []).append(edge)
+    return {kind for kind, records in after.items() if before.get(kind) == records}
+
+
+def _unchanged_topology_groups(
+    previous: tuple[EdgeRecord, ...] | None, current: list[EdgeRecord]
+) -> set[str]:
+    before: dict[str, list[tuple[int, int, int]]] = {}
+    after: dict[str, list[tuple[int, int, int]]] = {}
+    for edge in previous or ():
+        before.setdefault(edge.rel_type, []).append((edge.edge_id, edge.src_id, edge.dst_id))
+    for edge in current:
+        after.setdefault(edge.rel_type, []).append((edge.edge_id, edge.src_id, edge.dst_id))
+    return {kind for kind, records in after.items() if before.get(kind) == records}
 
 
 def _nodes_table(records: list[NodeRecord]) -> pa.Table:
@@ -657,7 +780,29 @@ def _node_property_table(records: list[NodeRecord]) -> pa.Table:
         columns[property_name] = _property_column_array(
             [record.properties.get(property_name) for record in records]
         )
-    return pa.table(columns)
+    fields = []
+    for name in columns:
+        if name == "node_id":
+            fields.append(
+                pa.field(
+                    name,
+                    columns[name].type,
+                    metadata={"grapharrow.encoding": "reserved-collision"}
+                    if name in property_names
+                    else None,
+                )
+            )
+            continue
+        values = [record.properties.get(name) for record in records]
+        types = {type(value) for value in values if value is not None}
+        encoding = "native" if len(types) <= 1 and types <= {str, bool, int, float} else "json"
+        if types and types <= {int, float} and len(types) > 1:
+            encoding = "lossy"
+        fields.append(
+            pa.field(name, columns[name].type, metadata={"grapharrow.encoding": encoding})
+        )
+    # Older projections without encoding metadata remain readable through the canonical fallback.
+    return pa.Table.from_arrays(list(columns.values()), schema=pa.schema(fields))
 
 
 def _edge_property_table(records: list[EdgeRecord]) -> pa.Table:
