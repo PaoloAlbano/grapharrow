@@ -1,4 +1,4 @@
-"""Run the openCypher M23 scenarios against the GraphArrow query API."""
+"""Run openCypher TCK scenarios against the GraphArrow query API."""
 
 from __future__ import annotations
 

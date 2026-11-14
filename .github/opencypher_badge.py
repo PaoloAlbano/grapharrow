@@ -9,6 +9,12 @@ from collections import Counter
 from pathlib import Path
 from xml.sax.saxutils import escape
 
+TCK_LABEL = "openCypher 2024.3"
+# M23 and 2024.3 have identical active scenario IDs, tags and steps.
+M23_TO_2024_3 = (
+    "fb89f50aef68674582bcd65250a6c668713159132e436943b89cb5cae9d6b13b",
+    "e8ad66bce297a65ecd16d25c15675dd98fde80e78446965b8fc9ff88ccd22054",
+)
 PASSING = {"passed", "negative_passed"}
 UNEXPECTED = {
     "error_side_effects",
@@ -23,9 +29,9 @@ UNEXPECTED = {
 
 
 def render_badge(message: str, color: str) -> str:
-    label = "openCypher M23"
+    label = TCK_LABEL
     message = escape(message, {'"': "&quot;"})
-    left, right = 112, 154
+    left, right = 128, 154
     width = left + right
     return f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="20"
      role="img" aria-label="{label}: {message}">
@@ -54,14 +60,17 @@ def report_status(report: Path, baseline: Path) -> tuple[str, bool]:
 
     passed = {row["id"] for row in rows if row["status"] in PASSING}
     previous = json.loads(baseline.read_text()) if baseline.exists() else None
-    if previous and previous["features_sha256"] != summary["features_sha256"]:
-        raise ValueError("The audit corpus differs from the published baseline")
+    if previous:
+        previous_corpus = previous["features_sha256"]
+        current_corpus = summary["features_sha256"]
+        if previous_corpus != current_corpus and (previous_corpus, current_corpus) != M23_TO_2024_3:
+            raise ValueError("The audit corpus differs from the published baseline")
     lost = sorted(set(previous["passing_ids"]) - passed) if previous else []
     unexpected = sum(counts[status] for status in UNEXPECTED)
     percentage = len(passed) / len(rows)
     message = f"{percentage:.1%} ({len(passed):,}/{len(rows):,})"
     with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as output:
-        output.write(f"## openCypher M23\n\n**{message} scenarios passed.**\n\n")
+        output.write(f"## {TCK_LABEL}\n\n**{message} scenarios passed.**\n\n")
         for status, count in sorted(counts.items()):
             output.write(f"- `{status}` {count:,}\n")
         if lost:

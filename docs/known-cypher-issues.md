@@ -134,11 +134,11 @@ establish identical write semantics for every ANA tool.
 ## Remaining semantic validation and standard coverage gaps
 
 The engine is not certified as conformant with the
-[openCypher M23 TCK](https://github.com/opencypher/openCypher/tree/1.0.0-M23/tck).
+[openCypher 2024.3 TCK](https://github.com/opencypher/openCypher/tree/2024.3/tck).
 Remaining gaps include:
 
 - some errors still have an unclassified detail or differ from the
-  expected openCypher M23 classification;
+  expected TCK classification;
 - general procedures, unbounded traversal and updates inside subqueries or
   `UNION` remain outside the supported subset;
 - named time zones are limited to years 1 through 9999;
@@ -148,17 +148,17 @@ Remaining gaps include:
 The local unit suite and selected differential tests cover narrower workloads.
 Their passing counts must not be presented as complete openCypher coverage.
 
-## openCypher M23 audit
+## openCypher 2024.3 audit
 
-The [openCypher M23 workflow](https://github.com/PaoloAlbano/grapharrow/actions/workflows/opencypher.yml)
+The [openCypher 2024.3 workflow](https://github.com/PaoloAlbano/grapharrow/actions/workflows/opencypher.yml)
 runs exclusively on `main`, after pushes or on manual dispatch. It
-checks an exact revision of the upstream M23 corpus through GraphArrow's
+checks the corpus at the pinned upstream `2024.3` commit through GraphArrow's
 embedded query API and pins the time zone database for reproducible historical
 offsets. Each run includes the upstream and GraphArrow commit SHAs,
 an outcome for each scenario, and a summary.
 
 The README badge shows the percentage and count of passing scenarios over all
-cases selected by M23, excluding cases tagged `@ignore` upstream. Unsupported
+cases in the pinned corpus, excluding cases tagged `@ignore` upstream. Unsupported
 procedure fixtures, blocked setups and unverified errors stay in the
 denominator. A red badge indicates an audit failure, an unexpected result
 or a regression against the previous successful run. The badge and baseline
