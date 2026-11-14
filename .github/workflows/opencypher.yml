@@ -36,12 +36,16 @@ jobs:
         with:
           enable-cache: true
       - name: Run the pinned scenarios
+        env:
+          # Use the pinned Python tzdata instead of runner-specific historical offsets.
+          PYTHONTZPATH: ""
         run: |
           report="$RUNNER_TEMP/opencypher-report"
           mkdir -p "$report"
           printf 'grapharrow=%s\nopencypher=%s\n' "$GITHUB_SHA" \
             "$(git -C upstream-opencypher rev-parse HEAD)" > "$report/revisions.txt"
-          uv run --locked --with gherkin-official==29.0.0 python .github/audit_opencypher.py \
+          uv run --locked --with gherkin-official==29.0.0 --with tzdata==2026.6 \
+            python .github/audit_opencypher.py \
             --features upstream-opencypher/tck/features --output "$report/cases.jsonl"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()

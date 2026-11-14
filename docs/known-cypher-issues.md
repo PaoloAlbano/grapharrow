@@ -154,7 +154,8 @@ Their passing counts must not be presented as complete openCypher coverage.
 The [openCypher M23 workflow](https://github.com/PaoloAlbano/grapharrow/actions/workflows/opencypher.yml)
 runs exclusively on `main`, after pushes or on manual dispatch. It
 checks an exact revision of the upstream M23 corpus through GraphArrow's
-embedded query API. Each run includes the upstream and GraphArrow commit SHAs,
+embedded query API and pins the time zone database for reproducible historical
+offsets. Each run includes the upstream and GraphArrow commit SHAs,
 an outcome for each scenario, and a summary.
 
 The README badge shows the percentage and count of passing scenarios over all

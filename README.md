@@ -5,7 +5,9 @@
 # GraphArrow
 
 [![CI](https://github.com/PaoloAlbano/grapharrow/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/PaoloAlbano/grapharrow/actions/workflows/ci.yml)
+[![Code coverage on main](https://codecov.io/gh/PaoloAlbano/grapharrow/branch/main/graph/badge.svg)](https://app.codecov.io/gh/PaoloAlbano/grapharrow/branch/main)
 [![openCypher M23](https://raw.githubusercontent.com/PaoloAlbano/grapharrow/badges/opencypher.svg)](https://github.com/PaoloAlbano/grapharrow/actions/workflows/opencypher.yml)
+[![Python 3.11, 3.12, 3.13, 3.14, and 3.15](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14%20%7C%203.15-blue)](https://github.com/PaoloAlbano/grapharrow/actions/workflows/ci.yml?query=branch%3Amain)
 [![Release](https://img.shields.io/github/v/release/PaoloAlbano/grapharrow)](https://github.com/PaoloAlbano/grapharrow/releases/latest)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 

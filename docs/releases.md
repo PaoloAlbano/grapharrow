@@ -8,7 +8,9 @@ versions are separate contracts.
 ## Continuous integration
 
 The CI workflow runs on pull requests, pushes to `main`, and manual dispatch.
-Feature-branch pushes do not start a second run in addition to their pull request.
+The separate coverage workflow runs the local test suite on Python 3.12 for
+every branch push and uploads the report to Codecov using `CODECOV_TOKEN`.
+The README displays the Codecov result for `main`.
 
 | Check | Pull requests | Main and release tags |
 | --- | --- | --- |
