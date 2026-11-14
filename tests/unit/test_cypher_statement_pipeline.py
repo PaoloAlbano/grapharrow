@@ -33,6 +33,28 @@ def test_failed_return_rolls_back_create(tmp_path: Path) -> None:
     assert Database(tmp_path / "db")._app.use_cases.graph.load_state() == before
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        "CREATE (n:First)-[:R]->(), (n:Second)-[:R]->()",
+        "MATCH ()-[r]->() CREATE ()-[r]->()",
+        "MATCH (a)-[r]->(b) MERGE (a)-[r]->(b)",
+    ],
+)
+def test_write_rebinding_fails_during_compilation(tmp_path: Path, query: str) -> None:
+    db = Database(tmp_path / "db")
+    graph = db._app.use_cases.graph
+    before = graph.load_state()
+    with db.write_transaction() as session, pytest.raises(QueryError) as caught:
+        session.query(query)
+    assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+        "SyntaxError",
+        "compile",
+        "VariableAlreadyBound",
+    )
+    assert graph.load_state() == before
+
+
 def test_consecutive_creates_share_bindings_and_publish_once(tmp_path: Path) -> None:
     db = Database(tmp_path / "db")
     before = db._app.use_cases.graph.load_state().snapshot.snapshot_id.value

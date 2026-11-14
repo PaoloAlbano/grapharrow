@@ -216,6 +216,16 @@ class WriteCompiler(ReadCompiler):
                 right = node_spec(step.oC_NodePattern(), standalone=False)
                 relationship = step.oC_RelationshipPattern()
                 detail = relationship.oC_RelationshipDetail()
+                variable = None if detail is None else detail.oC_Variable()
+                name = (
+                    identifier(variable.getText())
+                    if variable is not None
+                    else self.state.next_variable()
+                )
+                if name in visible:
+                    raise QueryError.syntax(
+                        f"Relationship variable already bound: {name}", "VariableAlreadyBound"
+                    )
                 if detail is not None and detail.oC_RangeLiteral() is not None:
                     raise QueryError.syntax(
                         "Variable-length relationships are not allowed in CREATE or MERGE.",
@@ -232,16 +242,6 @@ class WriteCompiler(ReadCompiler):
                     raise QueryError.syntax(
                         "CREATE requires a directed relationship with a single arrow.",
                         "RequiresDirectedRelationship",
-                    )
-                variable = detail.oC_Variable()
-                name = (
-                    identifier(variable.getText())
-                    if variable is not None
-                    else self.state.next_variable()
-                )
-                if name in visible:
-                    raise QueryError.syntax(
-                        f"Relationship variable already bound: {name}", "VariableAlreadyBound"
                     )
                 if variable is not None:
                     visible[name] = "relationship"

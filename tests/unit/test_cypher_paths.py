@@ -50,7 +50,12 @@ def test_named_write_returns_path_with_latest_properties(tmp_path: Path, verb: s
     [
         ("MATCH p = (p:A)-[:R]->() RETURN p", "VariableAlreadyBound"),
         ("MATCH (p:A) MATCH p = ()-[:R]->() RETURN p", "VariableAlreadyBound"),
+        ("MATCH (p:A)-[:R]->(), p = ()-[:R]->() RETURN p", "VariableAlreadyBound"),
+        ("MATCH ()-[p:R]->(), p = ()-[:R]->() RETURN p", "VariableAlreadyBound"),
+        ("MATCH ()-[p*]->(), p = ()-[:R]->() RETURN p", "VariableAlreadyBound"),
+        ("MATCH ()-[p*]->() MATCH p = ()-[:R]->() RETURN p", "VariableAlreadyBound"),
         ("MATCH p = ()-[:R]->(), (p:A) RETURN p", "VariableTypeConflict"),
+        ("MATCH p = ()-[*]->() MATCH (p:A) RETURN p", "VariableTypeConflict"),
     ],
 )
 def test_path_alias_conflict_is_a_compile_error(tmp_path: Path, query: str, detail: str) -> None:
@@ -58,6 +63,7 @@ def test_path_alias_conflict_is_a_compile_error(tmp_path: Path, query: str, deta
         with pytest.raises(QueryError) as caught:
             session.query(query)
     assert caught.value.phase == "compile"
+    assert caught.value.category == "SyntaxError"
     assert caught.value.detail == detail
 
 

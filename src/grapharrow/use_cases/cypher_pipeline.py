@@ -374,7 +374,8 @@ class ReadCompiler:
             initial = dict(scope)
             stages: list[Stage] = []
             returned = None
-            for part in ordered_clauses(single):
+            clauses = ordered_clauses(single)
+            for index, part in enumerate(clauses):
                 kind = rule(part)
                 if kind == "oC_With" and not stages and legacy_outer is not None:
                     imported = self._legacy_import(part, legacy_outer)
@@ -382,6 +383,13 @@ class ReadCompiler:
                         visible.update(imported)
                         initial.update(imported)
                 if kind == "oC_ReadingClause":
+                    previous = clauses[index - 1] if index else None
+                    if part.oC_Match() is not None and (
+                        previous is None
+                        or rule(previous) != "oC_ReadingClause"
+                        or previous.oC_Match() is None
+                    ):
+                        self.validate_following_match_paths(clauses, index, visible)
                     stage, visible = self.reading(part, visible)
                 elif kind in {"oC_With", "oC_Return"}:
                     stage, visible = self.projection(
@@ -501,6 +509,8 @@ class ReadCompiler:
         patterns_list: list[core.CompiledPattern] = []
         paths = []
         parts = pattern.oC_PatternPart()
+        if any(part.oC_Variable() is not None for part in parts):
+            self.validate_path_bindings(parts, scope)
         multiple_paths = (
             sum(
                 bool(part.oC_AnonymousPatternPart().oC_PatternElement().oC_PatternElementChain())
@@ -598,15 +608,6 @@ class ReadCompiler:
         }
 
         for path in paths:
-            if path.name in visible:
-                detail = (
-                    "VariableTypeConflict"
-                    if path.name not in scope
-                    and path.name in bindings
-                    and path.name not in (*path.nodes, *path.relationships)
-                    else "VariableAlreadyBound"
-                )
-                raise QueryError.syntax(f"Cannot bind path variable {path.name}.", detail)
             visible[path.name] = "path"
 
         def check(value: Any) -> None:
@@ -651,6 +652,61 @@ class ReadCompiler:
         if predicate is not None:
             validate_predicate(predicate)
         return MatchStage(patterns, bindings, predicate, optional, tuple(paths)), visible
+
+    @staticmethod
+    def validate_following_match_paths(clauses: list[Any], index: int, scope: Scope) -> None:
+        """Check consecutive MATCH declarations before planning their traversals."""
+        end = index + 1
+        while end < len(clauses):
+            clause = clauses[end]
+            if rule(clause) != "oC_ReadingClause" or clause.oC_Match() is None:
+                break
+            end += 1
+        if end == index + 1:
+            return
+        parts = [
+            part
+            for clause in clauses[index:end]
+            for part in clause.oC_Match().oC_Pattern().oC_PatternPart()
+        ]
+        if any(part.oC_Variable() is not None for part in parts):
+            ReadCompiler.validate_path_bindings(parts, scope)
+
+    @staticmethod
+    def validate_path_bindings(parts: list[Any], scope: Scope) -> None:
+        """Check path declarations in pattern order, before compiling relationship bounds."""
+        bound = set(scope)
+        declared_paths: set[str] = set()
+        for part in parts:
+            element = part.oC_AnonymousPatternPart().oC_PatternElement()
+            while element.oC_NodePattern() is None:
+                element = element.oC_PatternElement()
+            binding_nodes = [element.oC_NodePattern()]
+            for step in element.oC_PatternElementChain():
+                binding_nodes.append(step.oC_NodePattern())
+                detail = step.oC_RelationshipPattern().oC_RelationshipDetail()
+                if detail is not None:
+                    binding_nodes.append(detail)
+            entities = {
+                identifier(node.oC_Variable().getText())
+                for node in binding_nodes
+                if node.oC_Variable() is not None
+            }
+            alias = part.oC_Variable()
+            if alias is not None:
+                name = identifier(alias.getText())
+                if name in bound or name in entities:
+                    raise QueryError.syntax(
+                        f"Cannot bind path variable {name}.", "VariableAlreadyBound"
+                    )
+                declared_paths.add(name)
+                bound.add(name)
+            if conflicts := entities & declared_paths:
+                name = min(conflicts)
+                raise QueryError.syntax(
+                    f"Cannot use path variable {name} as an entity.", "VariableTypeConflict"
+                )
+            bound.update(entities)
 
     def projection(
         self, node: Any, scope: Scope, globals: Scope, *, terminal: bool

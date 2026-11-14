@@ -683,8 +683,9 @@ class CypherQueryUseCase:
         if not composable and not needs_pipeline(tree, source, params):
             try:
                 compiled = _compile_query(tree, params)
-            except QueryError:
-                pass
+            except QueryError as error:
+                if error.detail == "VariableAlreadyBound":
+                    raise
             else:
                 create_patterns = (
                     compiled.patterns
@@ -4140,6 +4141,7 @@ def _compile_create_patterns(
         raise QueryError("CREATE pattern clause is required.")
 
     compiled_parts: list[CompiledPattern] = []
+    bound_nodes: set[str] = set()
     for part_ctx in pattern_parts:
         if part_ctx.oC_Variable() is not None:
             raise QueryError("Named pattern parts are not supported yet.")
@@ -4170,6 +4172,19 @@ def _compile_create_patterns(
                     raise QueryError.syntax(
                         "Exactly one relationship type is required.", "NoSingleRelationshipType"
                     )
+        nodes = (
+            (compiled,)
+            if isinstance(compiled, NodePattern)
+            else (compiled.start, *(step.node for step in compiled.steps))
+        )
+        for node in nodes:
+            if node.variable in bound_nodes and (node.labels or node.properties):
+                raise QueryError.syntax(
+                    f"CREATE cannot redefine variable '{node.variable}' "
+                    "with inline labels or properties.",
+                    "VariableAlreadyBound",
+                )
+            bound_nodes.add(node.variable)
         compiled_parts.append(compiled)
     return tuple(compiled_parts)
 
@@ -4300,6 +4315,10 @@ def _compile_merge_relationship_pattern(
     step = compiled.steps[0]
     if step.variable_length:
         raise QueryError("Variable-length relationships are not supported yet in MERGE.")
+    if step.variable is not None and step.variable in bound_variables:
+        raise QueryError.syntax(
+            f"Relationship variable already bound: {step.variable}", "VariableAlreadyBound"
+        )
     if step.rel_type is None:
         raise QueryError("MATCH ... MERGE requires an explicit relationship type.")
     left_bound = _classify_merge_node_binding(compiled.start, bound_variables)
