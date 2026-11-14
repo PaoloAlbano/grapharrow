@@ -4027,16 +4027,86 @@ def test_match_supports_connected_multiple_node_pattern_parts(tmp_path: Path) ->
     assert result.rows == ({"a.name": "Alice"},)
 
 
-def test_match_rejects_disconnected_multiple_pattern_parts(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "match",
+    ["MATCH (a:Person), (c:Company)", "MATCH (a:Person) WITH a MATCH (c:Company)"],
+)
+def test_match_returns_cartesian_product_of_disconnected_nodes(tmp_path: Path, match: str) -> None:
     database = Database(tmp_path / "example-db")
 
     with database.write_transaction() as session:
         session.add_node(labels=["Person"], properties={"name": "Alice"})
+        session.add_node(labels=["Person"], properties={"name": "Bob"})
         session.add_node(labels=["Company"], properties={"name": "Acme"})
+        session.add_node(labels=["Company"], properties={"name": "Globex"})
 
     with database.read_transaction() as session:
-        with pytest.raises(QueryError, match="Disconnected pattern parts"):
-            session.query("MATCH (a:Person), (c:Company) RETURN a.name, c.name")
+        result = session.query(f"{match} RETURN a.name, c.name ORDER BY a.name, c.name")
+
+    assert result.rows == tuple(
+        {"a.name": person, "c.name": company}
+        for person in ("Alice", "Bob")
+        for company in ("Acme", "Globex")
+    )
+
+
+def test_optional_match_preserves_each_input_row_after_cartesian_match(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+    with database.write_transaction() as session:
+        session.query("CREATE (:Candidate {value: 1}), (:Candidate {value: 2})")
+    with database.read_transaction() as session:
+        result = session.query(
+            "UNWIND [1, 1, 3] AS key WITH key "
+            "OPTIONAL MATCH (n:Candidate) WHERE n.value = key "
+            "RETURN key, n.value AS value ORDER BY key"
+        )
+    assert result.rows == (
+        {"key": 1, "value": 1},
+        {"key": 1, "value": 1},
+        {"key": 3, "value": None},
+    )
+
+
+def test_cartesian_paths_preserve_relationship_uniqueness_per_clause(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+    with database.write_transaction() as session:
+        session.query("CREATE (a:A)-[:R]->(b:B), (a)-[:R]->(b)")
+    with database.read_transaction() as session:
+        first = "MATCH (:A)-[:R]->(:B)"
+        same_clause = session.query(f"{first}, (:A)-[:R]->(:B) RETURN count(*) AS total")
+        separate_clauses = session.query(f"{first} MATCH (:A)-[:R]->(:B) RETURN count(*) AS total")
+    assert same_clause.rows == ({"total": 2},)
+    assert separate_clauses.rows == ({"total": 4},)
+
+
+def test_match_path_parts_return_zero_when_one_part_has_no_match(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+    with database.write_transaction() as session:
+        session.query("CREATE (:A)-[:R]->(:B)")
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (a:A)-[:R]->(:B), (:Missing)-[:R]->(a) RETURN count(*) AS total"
+        )
+    assert result.rows == ({"total": 0},)
+
+
+def test_optional_match_preserves_a_bound_path_endpoint(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+    with database.write_transaction() as session:
+        session.query("CREATE ()-[:T]->({name: 'Mark'})")
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH ()-->(x) OPTIONAL MATCH (x)-->(y) WHERE y.name = 'bar' RETURN x.name"
+        )
+    assert result.rows == ({"x.name": "Mark"},)
+
+
+def test_merge_matches_all_relationships_between_disconnected_nodes(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+    with database.write_transaction() as session:
+        session.query("CREATE (a:A)-[:R]->(b:B), (a)-[:R]->(b)")
+        result = session.query("MATCH (a:A), (b:B) MERGE (a)-[r:R]->(b) RETURN count(r) AS total")
+    assert result.rows == ({"total": 2},)
 
 
 def test_match_supports_disconnected_bounded_node_lookup_parts(tmp_path: Path) -> None:

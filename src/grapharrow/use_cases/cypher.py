@@ -697,7 +697,11 @@ class CypherQueryUseCase:
                     isinstance(pattern, PathPattern) and len(pattern.steps) > 1
                     for pattern in create_patterns
                 )
-                if not multi_hop_create:
+                multipart_match_merge = (
+                    isinstance(compiled, CompiledMatchMergeQuery)
+                    and len(compiled.match_patterns) > 1
+                )
+                if not multi_hop_create and not multipart_match_merge:
                     LegacyValidator(params).validate(tree)
                     with _query_phase("runtime"):
                         return self._execute_write(
@@ -5860,7 +5864,6 @@ def _match_patterns_table(
         where_pushdown_predicate=where_pushdown_predicate,
     )
     bound_variables = set(_pattern_variables(patterns[0]))
-    allow_disconnected_cross_join = _is_bounded_node_lookup_pattern(patterns[0])
     captures_relationships = any(
         isinstance(pattern, PathPattern) and pattern.capture_relationships for pattern in patterns
     )
@@ -5898,19 +5901,15 @@ def _match_patterns_table(
             edge_property_loader=edge_property_loader,
             where_pushdown_predicate=where_pushdown_predicate,
         )
+        if captures_relationships and not next_table.num_rows:
+            return next_table
         shared_variables = tuple(sorted(bound_variables & pattern_variables))
         if not shared_variables:
-            if not allow_disconnected_cross_join or not _is_bounded_node_lookup_pattern(pattern):
-                raise QueryError("Disconnected pattern parts are not supported yet.")
             matched = _cross_join_tables(matched, next_table, tabular)
             bound_variables.update(pattern_variables)
-            allow_disconnected_cross_join = (
-                allow_disconnected_cross_join and _is_bounded_node_lookup_pattern(pattern)
-            )
             continue
 
-        # The executor only supports connected pattern parts for now, so every
-        # additional pattern is joined back on the already-bound node ids.
+        # Shared variables must retain their entity identities.
         next_table = _project_joinable_pattern_table(
             next_table,
             pattern_variables=pattern_variables,
@@ -5926,11 +5925,6 @@ def _match_patterns_table(
         bound_variables.update(pattern_variables)
 
     return matched
-
-
-def _is_bounded_node_lookup_pattern(pattern: CompiledPattern) -> bool:
-    """Return true for disconnected node lookups that are safe to cross join."""
-    return isinstance(pattern, NodePattern) and bool(pattern.properties)
 
 
 def _can_match_path_pattern_from_input_table(
@@ -6068,6 +6062,9 @@ def _match_patterns_from_input_table(
         return input_table
 
     matched = input_table
+    # A preceding path join may have consumed the join key of an endpoint.
+    for variable in _node_variables_in_patterns(patterns):
+        matched = _ensure_join_id_column(matched, variable)
     bound_variables = _entity_variables_from_table(matched)
     for pattern in patterns:
         next_table = _match_single_pattern_table(
@@ -6084,10 +6081,9 @@ def _match_patterns_from_input_table(
         pattern_variables = set(_pattern_variables(pattern))
         shared_variables = tuple(sorted(bound_variables & pattern_variables))
         if not shared_variables:
-            if not _pattern_has_property_reference_values(pattern):
-                raise QueryError("MATCH after WITH requires a pattern connected to the WITH scope.")
             matched = _cross_join_tables(matched, next_table, tabular)
-            matched = _apply_deferred_pattern_reference_filters(matched, pattern)
+            if _pattern_has_property_reference_values(pattern):
+                matched = _apply_deferred_pattern_reference_filters(matched, pattern)
         else:
             next_table = _project_joinable_pattern_table(
                 next_table,
@@ -6138,6 +6134,12 @@ def _optional_match_patterns_from_input_table(
             edge_property_loader=edge_property_loader,
         )
 
+    # Correlate by input row so a Cartesian match, or two rows carrying the
+    # same node with different scalar values, gets the correct null fallback.
+    row_id = "__grapharrow_optional_row_id"
+    input_table = _append_row_index_column(input_table, row_id)
+    for variable in _node_variables_in_patterns(patterns):
+        input_table = _ensure_join_id_column(input_table, variable)
     matched = _match_patterns_from_input_table(
         input_table,
         nodes,
@@ -6166,10 +6168,8 @@ def _optional_match_patterns_from_input_table(
     }
     shared_variables = input_variables & optional_variables
     projected_optional = _project_joinable_pattern_table(
-        matched,
-        pattern_variables=optional_variables,
-        shared_variables=shared_variables,
-    )
+        matched, pattern_variables=optional_variables - shared_variables, shared_variables=set()
+    ).append_column(row_id, matched[row_id])
     projected_optional = _with_missing_optional_columns(
         projected_optional,
         [
@@ -6178,15 +6178,11 @@ def _optional_match_patterns_from_input_table(
             if not any(column_name.startswith(f"{variable}.") for variable in shared_variables)
         ],
     )
-    join_keys = [
-        _binding_column_name(variable, "__join_id") for variable in sorted(shared_variables)
-    ]
     return tabular.left_join(
         input_table,
         projected_optional,
-        left_keys=join_keys,
-        right_keys=join_keys,
-    )
+        left_keys=row_id,
+    ).drop_columns([row_id])
 
 
 def _can_use_optional_direct_path(

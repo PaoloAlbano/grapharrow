@@ -148,7 +148,9 @@ class LegacyValidator:
                 return "any"
         return "any"
 
-    def pattern(self, node: Any, scope: dict[str, str], *, creating: bool) -> dict[str, str]:
+    def pattern(
+        self, node: Any, scope: dict[str, str], *, creating: bool, validate_properties: bool = True
+    ) -> dict[str, str]:
         visible = dict(scope)
         properties = []
         relationships: set[str] = set()
@@ -178,8 +180,9 @@ class LegacyValidator:
             value = part.oC_Properties()
             if value is not None:
                 properties.append(value)
-        for value in properties:
-            self.expression(value, scope if creating else visible)
+        if validate_properties:
+            for value in properties:
+                self.expression(value, scope if creating else visible)
         return visible
 
     def projection(self, node: Any, scope: dict[str, str], *, terminal: bool) -> dict[str, str]:

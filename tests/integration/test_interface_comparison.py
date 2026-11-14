@@ -591,6 +591,11 @@ def test_bolt_null_property_removal_commit_and_rollback(interfaces: Interfaces) 
             "RETURN p.name AS name,collect(x) AS nodes ORDER BY name",
             [{"name": name, "nodes": []} for name in ["Alex", "Alice", "Bob", "Carol"]],
         ),
+        (
+            "MATCH (p:Person), (c:Company) WHERE p.name = 'Alice' "
+            "RETURN p.name AS person, c.name AS company ORDER BY company",
+            [{"person": "Alice", "company": name} for name in ["Acme", "Beta", "Empty"]],
+        ),
     ],
 )
 def test_semantic_results_match_across_query_interfaces(

@@ -141,8 +141,7 @@ Remaining gaps include:
   expected openCypher M23 classification;
 - general procedures, unbounded traversal and updates inside subqueries or
   `UNION` remain outside the supported subset;
-- named time zones are limited to years 1 through 9999, and temporal queries
-  are subject to the same disconnected-pattern restrictions as other queries;
+- named time zones are limited to years 1 through 9999;
 - unsupported initialization queries can block a TCK scenario during setup;
 - nesting and bounded traversal limits restrict some valid standard queries.
 

@@ -15,6 +15,8 @@ from functools import cmp_to_key
 from heapq import nsmallest
 from typing import Any
 
+import pyarrow.compute as pc  # type: ignore[import-untyped]
+
 from grapharrow.core import property_codec
 from grapharrow.core.errors import QueryError
 from grapharrow.domain import SnapshotManifest
@@ -149,6 +151,7 @@ def needs_pipeline(tree: Any, source: str, parameters: Mapping[str, object] | No
             "distinct",
             "{",
             "=",
+            ",",
         )
     ):
         return False
@@ -156,6 +159,15 @@ def needs_pipeline(tree: Any, source: str, parameters: Mapping[str, object] | No
     updating = any(rule(node) == "oC_UpdatingClause" for node in nodes)
     for node in nodes:
         name = rule(node)
+        if (
+            name == "oC_Match"
+            and sum(
+                bool(part.oC_AnonymousPatternPart().oC_PatternElement().oC_PatternElementChain())
+                for part in node.oC_Pattern().oC_PatternPart()
+            )
+            > 1
+        ):
+            return True
         if name == "oC_PatternPart" and node.oC_Variable() is not None:
             return True
         if name == "oC_ProjectionItem" and any(
@@ -488,7 +500,22 @@ class ReadCompiler:
 
         patterns_list: list[core.CompiledPattern] = []
         paths = []
-        for part in pattern.oC_PatternPart():
+        parts = pattern.oC_PatternPart()
+        multiple_paths = (
+            sum(
+                bool(part.oC_AnonymousPatternPart().oC_PatternElement().oC_PatternElementChain())
+                for part in parts
+            )
+            > 1
+        )
+        if multiple_paths:
+            from grapharrow.use_cases.cypher_validation import LegacyValidator
+
+            # Diagnose binding conflicts before attempting to compile expansions.
+            LegacyValidator(self.parameters).pattern(
+                pattern, {}, creating=False, validate_properties=False
+            )
+        for part in parts:
             alias = part.oC_Variable()
             compiled = core._compile_pattern_element(
                 part.oC_AnonymousPatternPart().oC_PatternElement(),
@@ -502,7 +529,7 @@ class ReadCompiler:
             if isinstance(compiled, core.NodePattern):
                 compiled = replace(compiled, variable=identifier(compiled.variable))
             else:
-                capture = any(
+                capture = multiple_paths or any(
                     step.variable_length
                     and ((step.min_hops, step.max_hops) != (1, 1))
                     and (
@@ -561,7 +588,9 @@ class ReadCompiler:
                     raise QueryError(
                         f"MATCH after WITH cannot reuse scalar binding '{name}' as a graph entity."
                     )
-                raise QueryError(f"MATCH variable {name} must be a {kind}")
+                raise QueryError.syntax(
+                    f"MATCH variable {name} must be a {kind}", "VariableTypeConflict"
+                )
         visible = scope | {
             name: kind
             for name, kind in bindings.items()
@@ -945,6 +974,27 @@ class ReadRuntime:
                 required_fields=required_fields,
                 adjacency_by_source_loader=self.executor._adjacency_loader_for_state(state),
             )
+            if table.num_rows and recorded_steps:
+                previous_columns: list[str] = []
+                masks: list[Any] = []
+                for pattern in patterns:
+                    if (
+                        not isinstance(pattern, core.PathPattern)
+                        or not pattern.capture_relationships
+                    ):
+                        continue
+                    columns = [
+                        column
+                        for step in pattern.steps
+                        for column in core._path_edge_id_columns(step)
+                    ]
+                    masks.extend(
+                        pc.fill_null(pc.not_equal(table[left], table[right]), True)
+                        for left in previous_columns
+                        for right in columns
+                    )
+                    previous_columns.extend(columns)
+                table = core._filter_table_with_masks(table, masks)
             index = {}
             for entry in table.to_pylist():
                 binding: Row = {}

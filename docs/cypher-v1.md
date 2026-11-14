@@ -78,8 +78,11 @@ ORDER BY name
 LIMIT 20
 ```
 
-Disconnected patterns are restricted: selected bounded node lookups are
-supported, while unrestricted implicit Cartesian products are not.
+Disconnected parts in `MATCH` produce a Cartesian product. For example, `MATCH
+(p:Person), (c:Company)` pairs every person with every company. `WHERE` can
+filter the pairs, and `OPTIONAL MATCH` preserves an input row with nulls for new
+bindings when no combination satisfies that clause. A relationship can appear
+only once across the pattern parts of a single `MATCH`.
 
 ### Expressions and aggregation
 
@@ -424,7 +427,7 @@ The engine is not a complete openCypher implementation. Important limits include
 
 - updating subqueries, unit subqueries and unrestricted multi-part updates;
 - arbitrary procedure calls beyond the implemented discovery subset;
-- unbounded traversal and unrestricted disconnected pattern matching;
+- unbounded traversal;
 - expression/function combinations outside the implemented read subset;
 - a planner that covers only selected read shapes.
 
