@@ -35,7 +35,6 @@ def database(tmp_path: Path) -> Database:
         "MATCH () RETURN *",
         "MATCH (n) WITH n, count(*) RETURN n",
         "MATCH (n) RETURN DISTINCT n.name ORDER BY n.p",
-        "MATCH (n) WITH n.name AS name, min(n.p) AS p ORDER BY sum(n.p) RETURN name,p",
         "RETURN false AND 123 AS value",
         "RETURN true OR [] AS value",
         "MATCH (n:Missing) RETURN false AND 'x' AS value",
@@ -47,6 +46,44 @@ def database(tmp_path: Path) -> Database:
 def test_invalid_bindings_and_types_raise_query_error(database: Database, query: str) -> None:
     with database.read_transaction() as session, pytest.raises(QueryError):
         session.query(query)
+
+
+@pytest.mark.parametrize(
+    "query, detail",
+    [
+        ("MATCH (n:A) WITH n.name AS name ORDER BY count(n) RETURN name", "InvalidAggregation"),
+        ("MATCH (n:A) RETURN n.name AS name ORDER BY count(n)", "InvalidAggregation"),
+        (
+            "MATCH (n:A) WITH n, min(n.p) AS p ORDER BY sum(n.p) + 1 RETURN n, p",
+            "InvalidAggregation",
+        ),
+        (
+            "MATCH (n:A) WITH n.name AS name, min(n.p) AS p ORDER BY sum(n.p) + 1 RETURN name, p",
+            "UndefinedVariable",
+        ),
+        (
+            "MATCH (n:A) WITH n.name AS name, n.p AS value "
+            "WITH name, min(value) AS p ORDER BY sum(value) RETURN name, p",
+            "UndefinedVariable",
+        ),
+    ],
+)
+def test_order_by_rejects_new_aggregate(database: Database, query: str, detail: str) -> None:
+    with database.read_transaction() as session, pytest.raises(QueryError) as error:
+        session.query(query)
+
+    assert error.value.category == "SyntaxError"
+    assert error.value.phase == "compile"
+    assert error.value.detail == detail
+
+
+@pytest.mark.parametrize("sort_key", ["p", "min(n.p)"])
+def test_order_by_accepts_projected_aggregation(database: Database, sort_key: str) -> None:
+    with database.read_transaction() as session:
+        result = session.query(
+            f"MATCH (n:A) WITH n.name AS name, min(n.p) AS p ORDER BY {sort_key} RETURN name, p"
+        )
+    assert result.rows == ({"name": "C", "p": 1}, {"name": "B", "p": 2})
 
 
 @pytest.mark.parametrize(

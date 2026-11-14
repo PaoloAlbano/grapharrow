@@ -791,24 +791,39 @@ class ReadCompiler:
         ordering = []
         order = body.oC_Order()
         if order is not None:
+            projected_aggregates = [
+                e for _, item in items for e in _expression_nodes(item) if e.kind == "aggregate"
+            ]
+            restrict_order_scope = aggregated or body.DISTINCT() is not None
+            sort_aliases = set(projected)
             for part in order.oC_SortItem():
                 expression = self.expressions.compile(part.oC_Expression(), scope | output)
-                projected_aggregates = [
-                    e for _, item in items for e in _expression_nodes(item) if e.kind == "aggregate"
-                ]
-                if any(
-                    e.kind == "aggregate" and e not in projected_aggregates
+                new_aggregates = [
+                    e
                     for e in _expression_nodes(expression)
+                    if e.kind == "aggregate" and e not in projected_aggregates
+                ]
+                if restrict_order_scope and any(
+                    not _grouping_valid(arg, grouping, sort_aliases)
+                    for aggregate in new_aggregates
+                    for arg in aggregate.arguments
                 ):
-                    raise QueryError("ORDER BY cannot introduce a non-projected aggregate")
-                if (aggregated or body.DISTINCT() is not None) and not _grouping_valid(
+                    raise QueryError.syntax(
+                        "ORDER BY aggregate references a non-projected variable",
+                        "UndefinedVariable",
+                    )
+                if new_aggregates:
+                    raise QueryError.syntax(
+                        "ORDER BY cannot introduce a non-projected aggregate", "InvalidAggregation"
+                    )
+                if restrict_order_scope and not _grouping_valid(
                     expression,
                     tuple(
                         e
                         for _, e in items
                         if e.kind in {"variable", "property", "literal", "aggregate"}
                     ),
-                    set(projected),
+                    sort_aliases,
                 ):
                     raise QueryError(
                         "ORDER BY references a non-projected value after aggregation or DISTINCT"
