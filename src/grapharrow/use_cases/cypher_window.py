@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from grapharrow.core.errors import QueryError
+from grapharrow.core.errors import QueryError, QueryPhase
 from grapharrow.use_cases.cypher_expression import Expression, ExpressionEvaluator
 
 
@@ -20,9 +20,24 @@ def window_value(
 ) -> int:
     if expression is None:
         return default
-    value = evaluator.evaluate(expression, {})
-    if type(value) is not int or value < 0:
-        raise QueryError("SKIP and LIMIT require nonnegative integers")
+    return check_window_value(evaluator.evaluate(expression, {}), phase="runtime")
+
+
+def check_window_value(value: object, *, phase: QueryPhase) -> int:
+    if type(value) is not int:
+        raise QueryError(
+            "SKIP and LIMIT require nonnegative integers",
+            category="SyntaxError",
+            phase=phase,
+            detail="InvalidArgumentType",
+        )
+    if value < 0:
+        raise QueryError(
+            "SKIP and LIMIT require nonnegative integers",
+            category="SyntaxError",
+            phase=phase,
+            detail="NegativeIntegerArgument",
+        )
     return value
 
 

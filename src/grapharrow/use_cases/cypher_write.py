@@ -124,6 +124,8 @@ class WriteCompiler(ReadCompiler):
             else:
                 stage, scope = self.update(clause, scope)
             stages.append(stage)
+        if self.deferred_traversal_errors:
+            raise self.deferred_traversal_errors[0]
         if not any(
             isinstance(stage, CreateStage | MergeStage | SetStage | DeleteStage) for stage in stages
         ):
@@ -160,7 +162,8 @@ class WriteCompiler(ReadCompiler):
                 "null",
             }:
                 raise QueryError.syntax(
-                    "DELETE requires a node, relationship or path.", "InvalidDelete"
+                    "DELETE requires a node, relationship or path.",
+                    "InvalidDelete" if target.kind == "labels" else "InvalidArgumentType",
                 )
         return DeleteStage(targets, node.DETACH() is not None), scope
 

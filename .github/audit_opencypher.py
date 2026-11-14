@@ -418,7 +418,9 @@ def run_case(case, timeout=10):
                             expected_error=text,
                         )
                     expected = re.fullmatch(
-                        r"(?:a|an) (\w+) should be raised at (compile time|runtime): (\w+)", text
+                        r"(?:a|an) (\w+) should be raised at "
+                        r"(compile time|runtime|any time): (\w+|\*)",
+                        text,
                     )
                     record.update(
                         expected_error=text,
@@ -437,10 +439,10 @@ def run_case(case, timeout=10):
                         unverified = True
                         continue
                     category, phase, detail = expected.groups()
-                    if (category, phase.removesuffix(" time"), detail) != (
-                        error.category,
-                        error.phase,
-                        error.detail,
+                    if (
+                        category != error.category
+                        or (phase != "any time" and phase.removesuffix(" time") != error.phase)
+                        or (detail != "*" and detail != error.detail)
                     ):
                         return finish("error_mismatch")
                     continue

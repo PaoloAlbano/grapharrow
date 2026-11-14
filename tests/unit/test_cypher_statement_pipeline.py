@@ -22,6 +22,51 @@ def test_syntax_error_reports_compile_phase_and_position(tmp_path: Path) -> None
     assert error.column == 7
 
 
+@pytest.mark.parametrize(
+    ("query", "params", "category", "phase"),
+    [
+        ("WITH 1 AS n RETURN n.value", {}, "TypeError", "compile"),
+        ("WITH $n AS n RETURN n.value", {"n": 1}, "TypeError", "runtime"),
+        ("WITH $n AS n RETURN n[0]", {"n": 1}, "TypeError", "runtime"),
+        ("RETURN any(x IN [false] WHERE x % 2 = 0)", {}, "SyntaxError", "compile"),
+        ("RETURN any(x IN $xs WHERE x % 2 = 0)", {"xs": [False]}, "TypeError", "runtime"),
+        ("MATCH (n) WHERE (n) RETURN n", {}, "SyntaxError", "compile"),
+        ("MATCH p = ()-[*]->() WHERE p.name = 'x' RETURN p", {}, "SyntaxError", "compile"),
+        ("MATCH p = ()-[*]->() RETURN size(p)", {}, "SyntaxError", "compile"),
+        ("RETURN 1 SKIP 1.5", {}, "SyntaxError", "compile"),
+        ("RETURN 1 LIMIT $n", {"n": 1.5}, "SyntaxError", "runtime"),
+        ("WITH 1 AS x RETURN x LIMIT 1.5", {}, "SyntaxError", "compile"),
+        ("WITH 1 AS x RETURN x SKIP $n", {"n": 1.5}, "SyntaxError", "runtime"),
+        ("MATCH (n) DELETE 1 + 1", {}, "SyntaxError", "compile"),
+    ],
+)
+def test_invalid_argument_type_reports_category_and_phase(
+    tmp_path: Path, query: str, params: dict[str, object], category: str, phase: str
+) -> None:
+    with (
+        Database(tmp_path / "db").write_transaction() as session,
+        pytest.raises(QueryError) as caught,
+    ):
+        session.query(query, params)
+    assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+        category,
+        phase,
+        "InvalidArgumentType",
+    )
+
+
+@pytest.mark.parametrize("tail", ["RETURN length(p)", "CREATE (:Unexpected)"])
+def test_named_unbounded_traversal_has_no_executable_plan(tmp_path: Path, tail: str) -> None:
+    db = Database(tmp_path / "db")
+    graph = db._app.use_cases.graph
+    before = graph.load_state()
+    with db.write_transaction() as session, pytest.raises(QueryError) as caught:
+        session.query(f"MATCH p = ()-[*]->() {tail}")
+    assert caught.value.detail == "UnboundedTraversal"
+    assert caught.value.phase == "compile"
+    assert graph.load_state() == before
+
+
 def test_failed_return_rolls_back_create(tmp_path: Path) -> None:
     db = Database(tmp_path / "db")
     graph = db._app.use_cases.graph

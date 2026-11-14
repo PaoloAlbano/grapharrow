@@ -49,6 +49,24 @@ class Expression:
     kind: str
     value: Any = None
     arguments: tuple[Expression, ...] = ()
+    parameter: bool = False
+
+
+def known_kind(expression: Expression, scope: Scope) -> str:
+    """Identify statically known types while leaving parameter values to runtime."""
+    if expression.kind == "variable":
+        return scope[expression.value]
+    if expression.kind in {"list", "map"}:
+        return expression.kind
+    if expression.kind == "literal" and not expression.parameter:
+        return {
+            type(None): "null",
+            bool: "bool",
+            int: "number",
+            float: "number",
+            str: "string",
+        }.get(type(expression.value), "any")
+    return "any"
 
 
 def rule(node: Any) -> str:
@@ -88,7 +106,7 @@ class ExpressionCompiler:
             parameter = identifier(node.getText()[1:])
             if parameter not in self.parameters:
                 raise QueryError.missing_parameter(parameter)
-            return Expression("literal", self.parameters[parameter])
+            return Expression("literal", self.parameters[parameter], parameter=True)
         if name == "oC_ListLiteral":
             return Expression("list", arguments=tuple(build(p) for p in node.oC_Expression()))
         if name == "oC_MapLiteral":
@@ -172,6 +190,8 @@ class ExpressionCompiler:
                 raise QueryError.unsupported(f"Unsupported scalar function: {function}")
             elif len(arguments) != arities[function]:
                 raise QueryError(f"{function} requires {arities[function]} argument")
+            if function == "size" and known_kind(arguments[0], scope) == "path":
+                raise QueryError.invalid_type("size() requires a list or string", phase="compile")
             entity_types = {
                 "id": {"node", "relationship"},
                 "labels": {"node"},
@@ -216,7 +236,12 @@ class ExpressionCompiler:
             binding = filtering.oC_IdInColl()
             variable = identifier(binding.oC_Variable().getText())
             collection = build(binding.oC_Expression())
-            local = scope | {variable: "any"}
+            kinds = (
+                {known_kind(item, scope) for item in collection.arguments} - {"null"}
+                if collection.kind == "list"
+                else set()
+            )
+            local = scope | {variable: next(iter(kinds)) if len(kinds) == 1 else "any"}
             where = filtering.oC_Where()
             predicate = (
                 self.compile(where.oC_Expression(), local)
@@ -241,6 +266,18 @@ class ExpressionCompiler:
             for part in parts[1:]:
                 part_name = rule(part)
                 if part_name == "oC_PropertyLookup":
+                    operand_kind = known_kind(expression, scope)
+                    if operand_kind == "path":
+                        raise QueryError.invalid_type(
+                            "Property access requires a node, relationship or map", phase="compile"
+                        )
+                    if operand_kind in {"bool", "number", "string", "list"}:
+                        raise QueryError(
+                            "Property access requires a node, relationship or map",
+                            category="TypeError",
+                            phase="compile",
+                            detail="InvalidArgumentType",
+                        )
                     expression = Expression(
                         "property", identifier(part.oC_PropertyKeyName().getText()), (expression,)
                     )
@@ -339,7 +376,15 @@ class ExpressionCompiler:
                 if not hasattr(c, "getRuleIndex") and c.getText().strip()
             ]
             for operator, part in zip(operators, parts[1:], strict=True):
-                result = Expression("binary", operator, (result, build(part)))
+                operands = (result, build(part))
+                if operator == "%" and any(
+                    known_kind(value, scope) in {"bool", "string", "list", "map"}
+                    for value in operands
+                ):
+                    raise QueryError.invalid_type(
+                        "Arithmetic requires numeric operands", phase="compile"
+                    )
+                result = Expression("binary", operator, operands)
             return result
         if name == "oC_UnaryAddOrSubtractExpression":
             if re.fullmatch(r"[+-]\d+", node.getText()):
@@ -846,12 +891,17 @@ class ExpressionEvaluator:
             positions = [evaluate(p) for p in args[1:]]
             if kind == "index" and isinstance(collection, dict):
                 if positions[0] is not None and not isinstance(positions[0], str):
-                    raise QueryError("Map indexes must be strings")
+                    raise QueryError(
+                        "Map indexes must be strings",
+                        category="TypeError",
+                        phase="runtime",
+                        detail="MapElementAccessByNonString",
+                    )
                 return collection.get(positions[0])
             if not isinstance(collection, list | tuple):
-                raise QueryError("Indexing requires a list or map")
+                raise QueryError.invalid_type("Indexing requires a list or map", phase="runtime")
             if any(p is not None and type(p) is not int for p in positions):
-                raise QueryError("List indexes must be integers")
+                raise QueryError.invalid_type("List indexes must be integers", phase="runtime")
             if kind == "slice":
                 if any(
                     explicit and position is None

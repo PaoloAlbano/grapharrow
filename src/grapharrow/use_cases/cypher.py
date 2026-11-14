@@ -43,7 +43,7 @@ from grapharrow.use_cases.cypher_plan import (
     WithAggregatePlan,
     WithProjectPlan,
 )
-from grapharrow.use_cases.cypher_window import limit_optimizations_enabled
+from grapharrow.use_cases.cypher_window import check_window_value, limit_optimizations_enabled
 from grapharrow.use_cases.graph import (
     GraphState,
     GraphStateUseCase,
@@ -4377,6 +4377,7 @@ def _compile_pattern_element(
     allow_relationship_variables: bool,
     allow_ranged_bindings: bool = False,
     compile_properties: Callable[[Any], dict[str, object]] | None = None,
+    defer_unbounded: Callable[[QueryError], None] | None = None,
 ) -> NodePattern | PathPattern:
     """Compile this Cypher fragment into the internal structures used later."""
     if element_ctx is None:
@@ -4407,6 +4408,7 @@ def _compile_pattern_element(
                 compile_properties,
                 allow_variable=allow_relationship_variables,
                 allow_ranged_bindings=allow_ranged_bindings,
+                defer_unbounded=defer_unbounded,
             )
         )
         steps.append(
@@ -4490,6 +4492,7 @@ def _compile_relationship_pattern(
     *,
     allow_variable: bool,
     allow_ranged_bindings: bool = False,
+    defer_unbounded: Callable[[QueryError], None] | None = None,
 ) -> tuple[str | None, str | None, tuple[str, ...], dict[str, object], str, int, int]:
     """Compile this Cypher fragment into the internal structures used later."""
     if relationship_ctx is None:
@@ -4522,9 +4525,16 @@ def _compile_relationship_pattern(
         rel_type = rel_type_alternatives[0] if len(rel_type_alternatives) == 1 else None
 
     properties = compile_properties(detail.oC_Properties())
-    min_hops, max_hops = _compile_range_literal(
-        detail.oC_RangeLiteral(), allow_ranged_bindings=allow_ranged_bindings
-    )
+    try:
+        min_hops, max_hops = _compile_range_literal(
+            detail.oC_RangeLiteral(), allow_ranged_bindings=allow_ranged_bindings
+        )
+    except QueryError as error:
+        if defer_unbounded is None or error.detail != "UnboundedTraversal":
+            raise
+        # The compiler will raise this error after checking the remaining scopes.
+        defer_unbounded(error)
+        min_hops, max_hops = 1, 1
     if not allow_ranged_bindings and (min_hops, max_hops) != (1, 1):
         if direction == "undirected":
             raise QueryError("Variable-length undirected relationships are not supported yet.")
@@ -4567,6 +4577,12 @@ def _compile_range_literal(
             raise QueryError("Variable-length relationships are limited to at most 5 hops.")
         return min_hops, max_hops
 
+    if re.fullmatch(r"\*(?:\d*\.\.)?", text):
+        raise QueryError(
+            "Only exact or fully bounded variable-length relationships are supported for now.",
+            category="UnsupportedFeature",
+            detail="UnboundedTraversal",
+        )
     raise QueryError(
         "Only exact or fully bounded variable-length relationships are supported for now."
     )
@@ -5422,10 +5438,10 @@ def _compile_optional_int(
         return None
 
     value = _compile_value_expression(clause_ctx.oC_Expression(), params)
-    if type(value) is not int or value < 0:
-        keyword = "SKIP" if isinstance(clause_ctx, CypherParser.OC_SkipContext) else "LIMIT"
-        raise QueryError(f"{keyword} requires a nonnegative integer value.")
-    return value
+    phase: QueryPhase = (
+        "runtime" if clause_ctx.oC_Expression().getText().startswith("$") else "compile"
+    )
+    return check_window_value(value, phase=phase)
 
 
 def _compile_where(

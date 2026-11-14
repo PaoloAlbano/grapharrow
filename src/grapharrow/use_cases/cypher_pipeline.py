@@ -34,6 +34,7 @@ from grapharrow.use_cases.cypher_expression import (
     freeze,
     has_aggregate,
     identifier,
+    known_kind,
     property_value,
     public_value,
     rule,
@@ -42,7 +43,11 @@ from grapharrow.use_cases.cypher_expression import (
     validate_predicate,
 )
 from grapharrow.use_cases.cypher_path import PathValue
-from grapharrow.use_cases.cypher_window import limit_optimizations_enabled, window_value
+from grapharrow.use_cases.cypher_window import (
+    check_window_value,
+    limit_optimizations_enabled,
+    window_value,
+)
 from grapharrow.use_cases.graph import (
     GraphState,
     GraphStateUseCase,
@@ -239,10 +244,9 @@ def ordered_clauses(single: Any) -> list[Any]:
 
 
 def expression_kind(expression: Expression, scope: Scope) -> str:
-    if expression.kind == "variable":
-        return scope[expression.value]
-    if expression.kind == "literal" and expression.value is None:
-        return "null"
+    kind = known_kind(expression, scope)
+    if expression.kind == "variable" or kind != "any" or expression.parameter:
+        return kind
     if expression.kind == "property":
         base = expression.arguments[0]
         if expression_kind(base, scope) in {"node", "relationship"}:
@@ -333,6 +337,7 @@ class ReadCompiler:
         self.parameters = dict(parameters)
         self.state = core._CompilerState()
         self.expressions = ExpressionCompiler(parameters, self._exists)
+        self.deferred_traversal_errors: list[QueryError] = []
 
     def compile(self, tree: Any) -> ReadQuery:
         if contains_updates(tree):
@@ -343,7 +348,10 @@ class ReadCompiler:
         if regular is None:
             raise QueryError("Expected a read query")
         self.reserve_variables(regular)
-        return self.regular(regular, {})
+        query = self.regular(regular, {})
+        if self.deferred_traversal_errors:
+            raise self.deferred_traversal_errors[0]
+        return query
 
     def reserve_variables(self, node: Any) -> None:
         self.state.reserved_variables = frozenset(
@@ -534,6 +542,9 @@ class ReadCompiler:
                 allow_relationship_variables=True,
                 allow_ranged_bindings=True,
                 compile_properties=compile_properties,
+                defer_unbounded=self.deferred_traversal_errors.append
+                if alias is not None
+                else None,
             )
 
             if isinstance(compiled, core.NodePattern):
@@ -651,6 +662,15 @@ class ReadCompiler:
             raise QueryError("MATCH WHERE cannot contain an aggregate")
         if predicate is not None:
             validate_predicate(predicate)
+            if predicate.kind == "variable" and visible[predicate.value] in {
+                "node",
+                "relationship",
+                "relationship_list",
+                "path",
+            }:
+                raise QueryError.invalid_type(
+                    "A predicate must evaluate to a boolean or null", phase="compile"
+                )
         return MatchStage(patterns, bindings, predicate, optional, tuple(paths)), visible
 
     @staticmethod
@@ -803,6 +823,8 @@ class ReadCompiler:
             expression = self.expressions.compile(part.oC_Expression(), {})
             if has_aggregate(expression):
                 raise QueryError("SKIP and LIMIT cannot contain aggregates")
+            if expression.kind == "literal" and not expression.parameter:
+                check_window_value(expression.value, phase="compile")
             return expression
 
         return ProjectionStage(
