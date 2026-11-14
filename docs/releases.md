@@ -42,7 +42,7 @@ container restart. The runtime interpreter is Python 3.12 for both architectures
 ## Preparing a release
 
 Run `make version` to show the checkout version. After CI passes on the commit
-you want to release, update your local `main` and fetch the tags.
+you want to release, update your local `main`.
 
 | Command | Example result |
 | --- | --- |
@@ -51,16 +51,19 @@ you want to release, update your local `main` and fetch the tags.
 | `make version BUMP=patch` | `0.1.0` → `0.1.1` |
 | `make version BUMP=tag VERSION=0.2.0` | Explicit tag `v0.2.0` |
 
-The bump commands calculate the next version from the highest stable tag
-reachable from local `main`. Each command creates an annotated local tag on
-`HEAD` and prints the push command. For example:
+The release commands fetch `main` and tags from `origin` and require local
+`main` to match the fetched revision. The bump commands calculate the next
+version from the highest reachable stable tag. Each command creates an
+annotated tag and pushes it to `origin`, starting the release workflow.
 
 ```sh
 git switch main
-git pull --ff-only --tags origin main
+git pull --ff-only origin main
 make version BUMP=minor
-git push origin v0.2.0
 ```
+
+If the push fails, the command keeps the local tag and prints how to retry
+the push for that tag.
 
 **The repository owner starts a release by pushing the `v*` tag.** The
 repository's GitHub tag ruleset restricts creation of those tags to the

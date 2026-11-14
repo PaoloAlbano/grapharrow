@@ -46,8 +46,8 @@ help:
 	@printf "  make benchmark-ana-sessions      Measure ANA session latency and memory\n"
 	@printf "  make test-interface-comparison   Compare public graph interfaces and save results\n"
 	@printf "  make version                     Show the checkout version\n"
-	@printf "  make version BUMP=major|minor|patch  Create the next stable tag locally\n"
-	@printf "  make version BUMP=tag VERSION=X.Y.Z  Create a specific stable tag locally\n"
+	@printf "  make version BUMP=major|minor|patch  Create and push the next stable tag\n"
+	@printf "  make version BUMP=tag VERSION=X.Y.Z  Create and push a specific stable tag\n"
 	@printf "  make clean        Remove local tool caches\n"
 
 version:

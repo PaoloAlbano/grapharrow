@@ -73,25 +73,40 @@ def version_repo(
     return version, tmp_path
 
 
+@pytest.fixture
+def version_remote(
+    version_repo: tuple[Any, Path], tmp_path_factory: pytest.TempPathFactory
+) -> Path:
+    version, root = version_repo
+    remote = tmp_path_factory.mktemp("release-origin")
+    version.run(root, "git", "init", "-q", "--bare", "-b", "main", str(remote))
+    version.run(root, "git", "remote", "add", "origin", str(remote))
+    version.run(root, "git", "push", "origin", "refs/heads/main:refs/heads/main")
+    return remote
+
+
 def test_version_tag_requires_committed_metadata_and_refuses_duplicates(
-    version_repo: tuple[Any, Path],
+    version_repo: tuple[Any, Path], version_remote: Path
 ) -> None:
     version, root = version_repo
     path = root / "uv.lock"
     original = path.read_text()
     path.write_text(original.replace("0.1.0", "0.2.0"))
     with pytest.raises(ValueError, match="Commit or restore"):
-        version.tag_version(root, "tag", "0.2.0")
+        version.publish_version(root, "tag", "0.2.0")
     assert not version.run(root, "git", "tag", "--list")
     path.write_text(original)
-    tag = version.tag_version(root, "tag", "0.2.0")
+    tag = version.publish_version(root, "tag", "0.2.0")
     assert tag == "v0.2.0"
     assert version.run(root, "git", "cat-file", "-t", tag) == "tag"
     assert version.run(root, "git", "rev-parse", f"{tag}^{{commit}}") == version.run(
         root, "git", "rev-parse", "HEAD"
     )
+    assert version.run(version_remote, "git", "rev-parse", f"refs/tags/{tag}") == version.run(
+        root, "git", "rev-parse", f"refs/tags/{tag}"
+    )
     with pytest.raises(ValueError, match="already exists"):
-        version.tag_version(root, "tag", "0.2.0")
+        version.publish_version(root, "tag", "0.2.0")
 
 
 @pytest.mark.parametrize("checkout", [("-b", "feature"), ("--detach", "HEAD")])
@@ -101,21 +116,49 @@ def test_release_tag_requires_main(
     version, root = version_repo
     version.run(root, "git", "checkout", "-q", *checkout)
     with pytest.raises(ValueError, match="Check out main"):
-        version.tag_version(root, "minor")
+        version.publish_version(root, "minor")
     assert not version.run(root, "git", "tag", "--list")
+
+
+def test_release_tag_requires_local_main_to_match_origin(
+    version_repo: tuple[Any, Path], version_remote: Path
+) -> None:
+    version, root = version_repo
+    run = version.run
+    run(root, "git", "commit", "--allow-empty", "-qm", "Local work")
+    with pytest.raises(ValueError, match="must match origin/main"):
+        version.publish_version(root, "minor")
+    assert not run(root, "git", "tag", "--list")
+    assert not run(version_remote, "git", "tag", "--list")
+
+
+def test_failed_release_push_keeps_only_a_local_tag(
+    version_repo: tuple[Any, Path], version_remote: Path
+) -> None:
+    version, root = version_repo
+    run = version.run
+    run(root, "git", "remote", "set-url", "--push", "origin", str(root / "missing"))
+    with pytest.raises(ValueError, match="Retry with: git push"):
+        version.publish_version(root, "tag", "0.2.0")
+    assert run(root, "git", "tag", "--list") == "v0.2.0"
+    assert not run(version_remote, "git", "tag", "--list")
 
 
 @pytest.mark.parametrize(
     ("bump", "expected"), [("patch", "v0.3.11"), ("minor", "v0.4.0"), ("major", "v1.0.0")]
 )
-def test_bump_tags_from_highest_stable_version_without_editing_the_checkout(
-    version_repo: tuple[Any, Path], bump: str, expected: str
+def test_bump_fetches_tags_and_pushes_only_the_new_release_tag(
+    version_repo: tuple[Any, Path], version_remote: Path, bump: str, expected: str
 ) -> None:
     version, root = version_repo
     run = version.run
-    for tag in ("v0.3.9", "v0.3.10", "v0.8.0b1", "nightly-" + "a" * 40):
-        run(root, "git", "tag", tag)
-    assert version.tag_version(root, bump) == expected
+    remote_tags = {"v0.3.9", "v0.3.10", "v0.8.0b1", "nightly-" + "a" * 40}
+    for tag in remote_tags:
+        run(version_remote, "git", "tag", tag)
+    run(root, "git", "config", "--local", "push.followTags", "true")
+    run(root, "git", "tag", "-a", "v0.1.0", "-m", "Unpublished old tag")
+    assert version.publish_version(root, bump) == expected
+    assert set(run(version_remote, "git", "tag", "--list").splitlines()) == remote_tags | {expected}
     assert not run(root, "git", "status", "--porcelain")
     assert version.project_version(root) == "0.1.0"
 
