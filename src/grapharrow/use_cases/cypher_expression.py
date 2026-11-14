@@ -13,6 +13,7 @@ import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from random import random
 from typing import Any
 
 from grapharrow.core.errors import QueryError
@@ -30,7 +31,15 @@ Row = dict[str, Any]
 Scope = dict[str, str]
 LIST_ACCESSORS = frozenset({"head", "last", "tail"})
 TYPED_SCALAR_FUNCTIONS = frozenset(
-    {"range", "properties", *LIST_ACCESSORS, *SCALAR_CONVERSIONS, *TEMPORAL_ARITIES}
+    {
+        "rand",
+        "range",
+        "reverse",
+        "properties",
+        *LIST_ACCESSORS,
+        *SCALAR_CONVERSIONS,
+        *TEMPORAL_ARITIES,
+    }
 )
 _MAX_RANGE_ITEMS = 1 << 20
 
@@ -101,7 +110,7 @@ class ExpressionCompiler:
             arguments = tuple(build(p) for p in node.oC_Expression())
             if function in TYPED_SCALAR_FUNCTIONS:
                 allowed_counts = TEMPORAL_ARITIES.get(
-                    function, (2, 3) if function == "range" else (1,)
+                    function, {"rand": (0,), "range": (2, 3)}.get(function, (1,))
                 )
                 if len(arguments) not in allowed_counts:
                     raise QueryError.syntax(
@@ -138,6 +147,10 @@ class ExpressionCompiler:
             if function in {"count", "sum", "avg", "min", "max", "collect"}:
                 if len(arguments) != 1 or any(has_aggregate(a) for a in arguments):
                     raise QueryError("Aggregates require one non-aggregate operand")
+                if _contains_rand(arguments[0]):
+                    raise QueryError.syntax(
+                        "Project rand() before aggregating its value.", "NonConstantExpression"
+                    )
                 return Expression("aggregate", (function, node.DISTINCT() is not None), arguments)
             arities = {
                 "abs": 1,
@@ -349,6 +362,12 @@ class ExpressionCompiler:
 
 def has_aggregate(expression: Expression) -> bool:
     return expression.kind == "aggregate" or any(has_aggregate(p) for p in expression.arguments)
+
+
+def _contains_rand(expression: Expression) -> bool:
+    return (expression.kind == "function" and expression.value == "rand") or any(
+        _contains_rand(child) for child in expression.arguments
+    )
 
 
 def validate_predicate(expression: Expression) -> None:
@@ -581,6 +600,8 @@ class ExpressionEvaluator:
                     return evaluate(then)
             return evaluate(args[-1])
         if kind == "function":
+            if value == "rand":
+                return random()
             if value in TEMPORAL_ARITIES:
                 if self._statement_time is None:
                     self._statement_time = time.time_ns()
@@ -613,6 +634,11 @@ class ExpressionEvaluator:
                 if value == "tail":
                     return list(operand[1:])
                 return operand[0 if value == "head" else -1] if operand else None
+            if value == "reverse":
+                if isinstance(operand, str):
+                    return operand[::-1]
+                if isinstance(operand, list | tuple):
+                    return list(reversed(operand))
             if value == "properties":
                 if isinstance(operand, NodeRecord | EdgeRecord):
                     return dict(operand.properties)

@@ -1065,32 +1065,36 @@ class ReadRuntime:
         )
 
     def project(self, stage: ProjectionStage, rows: list[Row], global_seed: Row) -> list[Row]:
-        grouping = tuple(
-            expression for _, expression in stage.items if not has_aggregate(expression)
-        )
-        aggregated = any(has_aggregate(expression) for _, expression in stage.items)
-        batches: Iterable[tuple[Row, list[Row] | None]]
+        aggregate_items = tuple(item for item in stage.items if has_aggregate(item[1]))
+        items = aggregate_items or stage.items
+        batches: Iterable[tuple[Row, list[Row] | None, Row]]
         upper_bound = len(rows)
-        if aggregated:
-            groups: dict[Any, list[Row]] = {}
+        if aggregate_items:
+            grouping = tuple(item for item in stage.items if item not in aggregate_items)
+            groups: dict[Any, tuple[Row, list[Row]]] = {}
             for row in rows:
-                key = tuple(freeze(self.evaluator.evaluate(e, row)) for e in grouping)
-                groups.setdefault(key, []).append(row)
+                values = {name: self.evaluator.evaluate(e, row) for name, e in grouping}
+                key = tuple(freeze(value) for value in values.values())
+                groups.setdefault(key, (values, []))[1].append(row)
             if not groups and not grouping:
-                groups[()] = []
-            batches = ((group[0] if group else global_seed, group) for group in groups.values())
+                groups[()] = ({}, [])
+            batches = (
+                (group[0] if group else global_seed, group, values)
+                for values, group in groups.values()
+            )
             upper_bound = len(groups)
         else:
-            batches = ((row, None) for row in rows)
+            batches = ((row, None, {}) for row in rows)
 
         def candidates() -> Iterator[tuple[Row, Row, list[Row] | None]]:
             seen = set()
-            for original, group in batches:
-                row = {
+            for original, group, values in batches:
+                # A grouping key, including rand(), is evaluated once per input row.
+                projected = values | {
                     name: self.evaluator.evaluate(expression, original, group)
-                    for name, expression in stage.items
+                    for name, expression in items
                 }
-                row = {name: original[name] for name in stage.globals} | row
+                row = {name: original[name] for name in stage.globals} | projected
                 if stage.distinct:
                     identity = freeze(row)
                     if identity in seen:

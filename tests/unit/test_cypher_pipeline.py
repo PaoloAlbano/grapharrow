@@ -8,6 +8,7 @@ import pytest
 from grapharrow import Database
 from grapharrow.core.errors import QueryError, TransactionError
 from grapharrow.interfaces.cypher_guard import query_requires_write
+from grapharrow.use_cases import cypher_expression
 from grapharrow.use_cases.cypher import CypherQueryUseCase
 from grapharrow.use_cases.graph import GraphTransactionUseCase
 
@@ -58,12 +59,82 @@ def database(tmp_path: Path) -> Database:
         ("coalesce(null, [x IN [1,2,3] WHERE x>1 | x*2])", [4, 6]),
         ("coalesce(null, all(x IN [] WHERE x>0))", True),
         ("coalesce(null, any(x IN [null,false] WHERE x))", None),
+        ("reverse([1, null, [2, 3]])", [[2, 3], None, 1]),
+        ("reverse('caffè')", "èffac"),
+        ("reverse(null)", None),
     ],
 )
 def test_composed_expression_semantics(database: Database, expression: str, expected: Any) -> None:
     with database.read_transaction() as session:
         result = session.query(f"RETURN {expression} AS value")
     assert result.rows == ({"value": expected},)
+
+
+def test_rand_returns_a_float_in_unit_interval(database: Database) -> None:
+    with database.read_transaction() as session:
+        rows = session.query("UNWIND [1,2,3] AS x RETURN RaNd() AS sample").rows
+    assert len(rows) == 3
+    assert all(type(row["sample"]) is float and 0 <= row["sample"] < 1 for row in rows)
+
+
+def test_rand_evaluates_each_call_and_reuses_projected_aliases(
+    database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    draws = iter((0.1, 0.2, 0.3, 0.4, 0.5, 0.6))
+    monkeypatch.setattr(cypher_expression, "random", lambda: next(draws))
+    with database.read_transaction() as session:
+        query = (
+            "UNWIND [1,2] AS i WITH i, rand() AS sample "
+            "RETURN i, sample, sample AS copy, rand() AS other ORDER BY i"
+        )
+        assert session.query(query).rows == (
+            {"i": 1, "sample": 0.1, "copy": 0.1, "other": 0.3},
+            {"i": 2, "sample": 0.2, "copy": 0.2, "other": 0.4},
+        )
+        assert session.query("RETURN rand() AS sample").rows == ({"sample": 0.5},)
+        assert session.query("RETURN rand() AS sample").rows == ({"sample": 0.6},)
+
+
+def test_rand_grouping_returns_the_values_used_to_form_groups(
+    database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    draws = iter((0.75, 0.25, 0.75))
+    monkeypatch.setattr(cypher_expression, "random", lambda: next(draws))
+    with database.read_transaction() as session:
+        result = session.query(
+            "UNWIND [1,2,3] AS i RETURN rand() AS sample, count(*) AS total ORDER BY sample"
+        )
+    assert result.rows == ({"sample": 0.25, "total": 1}, {"sample": 0.75, "total": 2})
+
+
+def test_rand_in_skip_is_evaluated_once_per_clause(
+    database: Database, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    draws = iter((0.75,))
+    monkeypatch.setattr(cypher_expression, "random", lambda: next(draws))
+    with database.read_transaction() as session:
+        result = session.query(
+            "UNWIND [1,2,3] AS i WITH i ORDER BY i SKIP toInteger(rand() * 3) RETURN i"
+        )
+    assert result.rows == ({"i": 3},)
+
+
+def test_rand_rejects_arguments_at_compile_time(database: Database) -> None:
+    with database.read_transaction() as session, pytest.raises(QueryError) as failure:
+        session.query("RETURN rand(1)")
+    assert failure.value.phase == "compile"
+    assert failure.value.detail == "InvalidNumberOfArguments"
+
+
+def test_rand_requires_projection_before_aggregation(database: Database) -> None:
+    with database.read_transaction() as session:
+        with pytest.raises(QueryError) as failure:
+            session.query("RETURN count(rand())")
+        assert failure.value.phase == "compile"
+        assert failure.value.detail == "NonConstantExpression"
+        assert session.query("WITH rand() AS sample RETURN count(sample) AS total").rows == (
+            {"total": 1},
+        )
 
 
 @pytest.mark.parametrize("disable_planner", [False, True])

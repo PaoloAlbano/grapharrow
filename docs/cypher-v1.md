@@ -116,6 +116,12 @@ an error. For boolean conversion, zero maps to false and any other integer
 maps to true. `sign()` returns `-1`, `0` or `1` for numeric inputs and
 returns null for null.
 
+`rand()` takes no arguments and returns a random float in `[0, 1)`. Each
+evaluation draws a new value. Use `WITH rand() AS sample` to reuse the same
+draw in later expressions for that row or to aggregate the sampled values.
+`reverse()` reverses the elements of a list or the characters of a string and
+propagates null.
+
 `toFloat()` also accepts the strings `"NaN"` and `"Infinity"`. Non-finite
 floats are represented as null in REST JSON results. Use `toString()` when
 the result needs to preserve their textual spelling over REST.
