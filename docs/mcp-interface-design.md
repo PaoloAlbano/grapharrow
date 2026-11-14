@@ -43,13 +43,13 @@ Both query tools return `columns`, `rows`, `row_count`, `returned_row_count`,
 from the rows returned by the interface.
 
 For `query`, `max_rows` defaults to 100 and accepts values from 1 to 1000.
-`max_hops` defaults to 5 and accepts values from 1 to 5. A detected write
-statement raises `TransactionError`; invalid limits or excessive inferred
-hops raise `QueryError`.
+`max_hops` defaults to 5 and accepts values from 1 to 5. It limits the
+maximum length of each parsed pattern chain, including the sum of its
+variable-length segments' upper bounds. A detected write statement raises
+`TransactionError`. Invalid limits or excessive hops raise `QueryError`.
 
-Row truncation happens after query execution. The hop check infers path length
-from the query text. These checks are interface guardrails, not a complete
-execution-cost estimator or a database resource quota.
+Row truncation happens after query execution. The hop check runs before
+execution. The number of candidate paths also depends on the graph topology.
 
 `write_cypher` does not apply the read tool's row/hop limits. It supports the
 same [Cypher subset](cypher-v1.md) as the underlying query use case.

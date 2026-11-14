@@ -39,7 +39,7 @@ def app(tmp_path: Path) -> Any:
         "RETURN coalesce(p.name,'?') AS name LIMIT 3",
         "RETURN coalesce(p.name,'?') AS name SKIP 300 LIMIT 3",
         "RETURN coalesce(p.name,'?') AS name SKIP 600 LIMIT 3",
-        "RETURN coalesce(p.name,'?') AS name SKIP 9223372036854775808 LIMIT 3",
+        "RETURN coalesce(p.name,'?') AS name SKIP 9223372036854775807 LIMIT 3",
         "RETURN coalesce(p.name,'?') AS name LIMIT 0",
         "RETURN coalesce(p.name,'?') AS name ORDER BY p.age DESC SKIP 3 LIMIT 5",
         "RETURN coalesce(p.name,'?') AS name ORDER BY p.bucket DESC,p.age ASC SKIP 3 LIMIT 5",

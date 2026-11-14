@@ -1,3 +1,4 @@
+# mypy: disable-error-code=no-untyped-call
 """Transport-agnostic Cypher-only MCP interface for GraphArrow."""
 
 from __future__ import annotations
@@ -13,11 +14,14 @@ from grapharrow.config import GraphArrowSettings
 from grapharrow.core.errors import QueryError, TransactionError
 from grapharrow.domain import DatasetFile
 from grapharrow.interfaces.cypher_guard import query_requires_write
+from grapharrow.use_cases.cypher import _compile_range_literal
+from grapharrow.use_cases.cypher_expression import rule
+from grapharrow.use_cases.cypher_pipeline import walk
 
 DEFAULT_MCP_QUERY_MAX_ROWS = 100
 DEFAULT_MCP_QUERY_MAX_HOPS = 5
 MAX_SUPPORTED_MCP_QUERY_ROWS = 1000
-_VARIABLE_LENGTH_RE = re.compile(r"\*\s*(\d+)(?:\s*\.\.\s*(\d+))?")
+_PATTERN_RE = re.compile(r"\bMATCH\b|--|<-|->|-\[|\]-", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,7 +87,7 @@ class GraphArrowMcpCypherInterface:
             raise TransactionError("The MCP query tool only supports read-only Cypher.")
         resolved_max_rows = _resolve_max_rows(max_rows)
         resolved_max_hops = _resolve_max_hops(max_hops)
-        _enforce_max_hops(query, resolved_max_hops)
+        self._enforce_max_hops(query, resolved_max_hops)
         result = self.grapharrow.use_cases.cypher.execute(query, dict(params or {}))
         return _query_result_payload(
             result.columns,
@@ -91,6 +95,31 @@ class GraphArrowMcpCypherInterface:
             max_rows=resolved_max_rows,
             tool_name="query",
         )
+
+    def _enforce_max_hops(self, query: str, max_hops: int) -> None:
+        if not _PATTERN_RE.search(query):
+            return
+        tree = self.grapharrow.use_cases.cypher._parse_cache.parse(query)
+        for node in walk(tree):
+            if rule(node) not in {"oC_PatternElement", "oC_RelationshipsPattern"}:
+                continue
+            longest = 0
+            for chain in node.oC_PatternElementChain():
+                detail = chain.oC_RelationshipPattern().oC_RelationshipDetail()
+                bounds = None if detail is None else detail.oC_RangeLiteral()
+                try:
+                    _, upper = _compile_range_literal(bounds, allow_ranged_bindings=True)
+                except QueryError as error:
+                    error.phase = "compile"
+                    raise
+                longest += upper
+            if longest > max_hops:
+                raise QueryError(
+                    f"The MCP query exceeds the configured hop limit of {max_hops}.",
+                    category="UnsupportedFeature",
+                    phase="compile",
+                    detail="HopLimit",
+                )
 
     def write_cypher(
         self,
@@ -375,30 +404,6 @@ def _resolve_max_hops(max_hops: int | None) -> int:
             f"The MCP max_hops argument must be between 1 and {DEFAULT_MCP_QUERY_MAX_HOPS}."
         )
     return resolved
-
-
-def _enforce_max_hops(query: str, max_hops: int) -> None:
-    """Reject read-only MCP queries that exceed the configured hop limit."""
-
-    longest_path_hops = _infer_longest_requested_hops(query)
-    if longest_path_hops > max_hops:
-        raise QueryError(f"The MCP query exceeds the configured hop limit of {max_hops}.")
-
-
-def _infer_longest_requested_hops(query: str) -> int:
-    """Infer the largest requested path length from the Cypher text."""
-
-    variable_length_hops = 0
-    for match in _VARIABLE_LENGTH_RE.finditer(query):
-        exact_hops = int(match.group(1))
-        upper_bound = int(match.group(2)) if match.group(2) is not None else exact_hops
-        variable_length_hops = max(variable_length_hops, upper_bound)
-
-    explicit_chain_hops = 0
-    for line in query.splitlines():
-        line_hops = line.count("->") + line.count("<-")
-        explicit_chain_hops = max(explicit_chain_hops, line_hops)
-    return max(variable_length_hops, explicit_chain_hops)
 
 
 def _classify_result_kind(returned_row_count: int) -> str:

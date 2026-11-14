@@ -33,7 +33,15 @@ class OpenCypherAdapter:
         parser.removeErrorListeners()
         parser.addErrorListener(_RaisingErrorListener())
 
-        return cast(CypherParser.OC_CypherContext, parser.oC_Cypher())  # type: ignore[no-untyped-call]
+        try:
+            return cast(CypherParser.OC_CypherContext, parser.oC_Cypher())  # type: ignore[no-untyped-call]
+        except RecursionError as error:
+            raise QueryError(
+                "Query nesting exceeds the supported parser limit.",
+                category="UnsupportedFeature",
+                phase="compile",
+                detail="NestingLimit",
+            ) from error
 
 
 def parse_cypher(query: str) -> CypherParser.OC_CypherContext:
@@ -80,4 +88,11 @@ class _RaisingErrorListener(ErrorListener):  # type: ignore[misc]
         e: Exception | None,
     ) -> None:
         _ = (recognizer, offendingSymbol, e)
-        raise QueryError(f"openCypher syntax error at {line}:{column}: {msg}")
+        raise QueryError(
+            f"openCypher syntax error at {line}:{column}: {msg}",
+            category="SyntaxError",
+            phase="compile",
+            detail="UnexpectedSyntax",
+            line=line,
+            column=column,
+        )

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
 from copy import deepcopy
@@ -19,6 +18,8 @@ from grapharrow.ana.handles import EntityPayload, EntityReference, HandleStore
 from grapharrow.ana.values import _int_arg, _primary_label
 from grapharrow.ana.values import equal as _property_equal
 from grapharrow.app import GraphArrowApplication
+from grapharrow.core import property_codec
+from grapharrow.core.temporal import Duration, Instant
 from grapharrow.use_cases import ana_patterns, ana_roles, ana_search
 from grapharrow.use_cases.ana_read_cache import AnaReadCache
 from grapharrow.use_cases.ana_resources import AnaLimits, AnaResourceBudget, AnaResources
@@ -258,7 +259,8 @@ class GraphArrowAgentBackend(AnaRuntime):
 
     def _node_payload(self, row: dict[str, Any]) -> EntityPayload:
         payload = EntityPayload(
-            labels=list(row["labels"]), properties=json.loads(row["properties_json"])
+            labels=list(row["labels"]),
+            properties=property_codec.loads(row["properties_json"], public=True),
         )
         payload.reference = EntityReference(self._owner, str(row["node_id"]))
         return payload
@@ -289,6 +291,8 @@ class GraphArrowAgentBackend(AnaRuntime):
             and "node_id" in table.column_names
             and pa.types.is_int64(table["node_id"].type)
             and not table.schema.field("node_id").metadata
+            and (table.schema.field(prop).metadata or {}).get(b"grapharrow.encoding")
+            in {None, b"native"}
         ):
             try:
                 selected = self._search_projected(label, table, prop, value)
@@ -331,7 +335,7 @@ class GraphArrowAgentBackend(AnaRuntime):
         table = self._nodes(label)
         mask = pa.array(
             [
-                _property_equal(json.loads(item.as_py()).get(prop), value)
+                _property_equal(property_codec.loads(item.as_py(), public=True).get(prop), value)
                 for item in table["properties_json"]
             ],
             type=pa.bool_(),
@@ -558,7 +562,7 @@ class GraphArrowAgentBackend(AnaRuntime):
     def _node_property_samples(self, label: str, prop: str, *, limit: int = 3) -> list[Any]:
         samples = []
         for item in self._nodes(label)["properties_json"]:
-            value = json.loads(item.as_py()).get(prop)
+            value = property_codec.loads(item.as_py(), public=True).get(prop)
             if value is not None and value not in samples:
                 samples.append(value)
             if len(samples) >= limit:
@@ -571,7 +575,7 @@ class GraphArrowAgentBackend(AnaRuntime):
         samples = []
         edges = self._state.edge_table
         for item in edges.filter(pc.equal(edges["rel_type"], rel_type))["properties_json"]:
-            value = json.loads(item.as_py()).get(prop)
+            value = property_codec.loads(item.as_py(), public=True).get(prop)
             if value is not None and value not in samples:
                 samples.append(value)
             if len(samples) >= limit:
@@ -595,7 +599,7 @@ class GraphArrowAgentBackend(AnaRuntime):
             labels_by_id[node_id] = labels
             if raw == "{}":
                 continue
-            for prop, value in json.loads(raw).items():
+            for prop, value in property_codec.loads(raw).items():
                 property_type = _property_type(value)
                 for label in labels:
                     node_props[label, prop].add(property_type)
@@ -611,7 +615,7 @@ class GraphArrowAgentBackend(AnaRuntime):
         ):
             relationship_counts[rel] += 1
             if raw != "{}":
-                for prop, value in json.loads(raw).items():
+                for prop, value in property_codec.loads(raw).items():
                     edge_props[rel, prop].add(_property_type(value))
                     if value is not None:
                         edge_values[rel, prop] += 1
@@ -647,6 +651,10 @@ class GraphArrowAgentBackend(AnaRuntime):
 
 
 def _property_type(value: Any) -> str:
+    if isinstance(value, Instant):
+        return value.type_name
+    if isinstance(value, Duration):
+        return "Duration"
     if isinstance(value, list):
         element = _property_type(next((item for item in value if item is not None), None))
         return f"List<{element}>"

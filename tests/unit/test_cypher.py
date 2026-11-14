@@ -1935,10 +1935,10 @@ def test_match_delete_removes_isolated_node(tmp_path: Path) -> None:
 
     with database.write_transaction() as session:
         session.query("CREATE (n:Person {name: 'Alice'}) RETURN n")
-        result = session.query("MATCH (n:Person) DELETE n RETURN n.name")
+        result = session.query("MATCH (n:Person) WITH n,n.name AS name DELETE n RETURN name")
 
-    assert result.columns == ("n.name",)
-    assert result.rows == ({"n.name": "Alice"},)
+    assert result.columns == ("name",)
+    assert result.rows == ({"name": "Alice"},)
 
     with database.read_transaction() as session:
         persisted = session.query("MATCH (n:Person) RETURN count(n) as count")
@@ -1953,8 +1953,10 @@ def test_match_delete_rejects_node_with_existing_relationships(tmp_path: Path) -
         session.query(
             "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'}) RETURN a"
         )
-        with pytest.raises(QueryError, match="Delete relationships first"):
-            session.query("MATCH (n:Person {name: 'Alice'}) DELETE n RETURN n.name")
+        with pytest.raises(QueryError, match="existing relationships") as error:
+            session.query("MATCH (n:Person {name: 'Alice'}) DELETE n")
+        assert error.value.detail == "DeleteConnectedNode"
+        assert error.value.phase == "runtime"
 
 
 def test_match_detach_delete_removes_node_and_incident_relationships(tmp_path: Path) -> None:
@@ -1964,10 +1966,12 @@ def test_match_detach_delete_removes_node_and_incident_relationships(tmp_path: P
         session.query(
             "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'}) RETURN a"
         )
-        result = session.query("MATCH (n:Person {name: 'Alice'}) DETACH DELETE n RETURN n.name")
+        result = session.query(
+            "MATCH (n:Person {name: 'Alice'}) WITH n,n.name AS name DETACH DELETE n RETURN name"
+        )
 
-    assert result.columns == ("n.name",)
-    assert result.rows == ({"n.name": "Alice"},)
+    assert result.columns == ("name",)
+    assert result.rows == ({"name": "Alice"},)
 
     with database.read_transaction() as session:
         node_count = session.query("MATCH (n:Person) RETURN count(n) as count")
@@ -1989,10 +1993,10 @@ def test_match_detach_delete_supports_multiple_node_targets(tmp_path: Path) -> N
         )
         result = session.query(
             "MATCH (n:Person) WHERE n.name IN ['Alice', 'Bob'] "
-            "DETACH DELETE n RETURN n.name ORDER BY n.name ASC"
+            "WITH n,n.name AS name DETACH DELETE n RETURN name ORDER BY name ASC"
         )
 
-    assert result.rows == ({"n.name": "Alice"}, {"n.name": "Bob"})
+    assert result.rows == ({"name": "Alice"}, {"name": "Bob"})
 
     with database.read_transaction() as session:
         names = session.query("MATCH (n:Person) RETURN n.name ORDER BY n.name ASC")
@@ -2013,10 +2017,11 @@ def test_match_detach_delete_can_mix_node_and_relationship_targets(tmp_path: Pat
         session.add_edge(src=bob["id"], rel_type="LIKES", dst=carol["id"], properties={})
         result = session.query(
             "MATCH (b:Person {name: 'Bob'})-[r:LIKES]->(c:Person) "
-            "DETACH DELETE b, r RETURN b.name, type(r)"
+            "WITH b,r,b.name AS name,type(r) AS relationship_type "
+            "DETACH DELETE b, r RETURN name,relationship_type"
         )
 
-    assert result.rows == ({"b.name": "Bob", "type(r)": "LIKES"},)
+    assert result.rows == ({"name": "Bob", "relationship_type": "LIKES"},)
 
     with database.read_transaction() as session:
         node_names = session.query("MATCH (n:Person) RETURN n.name ORDER BY n.name ASC")
@@ -2264,14 +2269,21 @@ def test_match_with_optional_match_pipeline_returns_bindings_when_present(tmp_pa
     assert result.rows == ({"n.name": "Alice", "type(r)": "KNOWS", "m.name": "Bob"},)
 
 
-def test_match_rejects_open_ended_variable_length_relationships(tmp_path: Path) -> None:
+def test_match_supports_an_omitted_lower_bound(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+    with database.write_transaction() as session:
+        session.query("CREATE (:A)-[:R]->(:B)-[:R]->(:C)")
+        rows = session.query("MATCH (:A)-[:R*..2]->(b) RETURN count(b) AS n").rows
+    assert rows == ({"n": 2},)
+
+
+@pytest.mark.parametrize("bounds", ["*", "*1.."])
+def test_match_rejects_ranges_without_an_upper_bound(tmp_path: Path, bounds: str) -> None:
     database = Database(tmp_path / "example-db")
 
     with database.read_transaction() as session:
         with pytest.raises(QueryError, match="Only exact or fully bounded variable-length"):
-            session.query("MATCH (a)-[:KNOWS*..3]->(b) RETURN a, b")
-        with pytest.raises(QueryError, match="Only exact or fully bounded variable-length"):
-            session.query("MATCH (a)-[:KNOWS*1..]->(b) RETURN a, b")
+            session.query(f"MATCH (a)-[:KNOWS{bounds}]->(b) RETURN a, b")
 
 
 def test_match_rejects_variable_length_relationships_above_five_hops(tmp_path: Path) -> None:
@@ -2717,15 +2729,13 @@ def test_match_supports_label_predicates_in_where(tmp_path: Path) -> None:
     with database.write_transaction() as session:
         session.query(
             "CREATE (:Character {name: 'Jon Snow'})-[:LOYAL_TO]->"
-            "(:Allegiance {name: 'Night Watch'}) RETURN *"
+            "(:Allegiance {name: 'Night Watch'})"
         )
         session.query(
-            "CREATE (:Character {name: 'Jon Snow'})-[:KILLED]->"
-            "(:Character {name: 'Orell'}) RETURN *"
+            "CREATE (:Character {name: 'Jon Snow'})-[:KILLED]->(:Character {name: 'Orell'})"
         )
         session.query(
-            "CREATE (:Location {name: 'Castle Black'})-[:HAS]->"
-            "(:Allegiance {name: 'Night Watch'}) RETURN *"
+            "CREATE (:Location {name: 'Castle Black'})-[:HAS]->(:Allegiance {name: 'Night Watch'})"
         )
 
     with database.read_transaction() as session:
@@ -3274,7 +3284,7 @@ def test_neo4j_recommendations_return_star_projects_visible_graph_bindings(
             "LIMIT 100"
         )
 
-    assert result.columns == ("u", "r", "m")
+    assert result.columns == ("m", "r", "u")
     assert result.rows[0]["u"]["properties"]["name"] == "Misty Williams"
     assert result.rows[0]["r"]["type"] == "RATED"
     assert result.rows[0]["r"]["properties"]["rating"] == 5
@@ -3308,7 +3318,7 @@ def test_neo4j_recommendations_return_star_keeps_with_scalar_bindings(
             "LIMIT 100"
         )
 
-    assert result.columns == ("u", "average", "r", "m")
+    assert result.columns == ("average", "m", "r", "u")
     assert result.rows == (
         {
             "u": result.rows[0]["u"],
@@ -3330,9 +3340,9 @@ def test_neo4j_recommendations_exists_pattern_filters_candidates(
     with database.write_transaction() as session:
         session.query(
             "CREATE (:User {name: 'Misty Williams'})-[:RATED {rating: 5}]->"
-            "(:Movie {title: 'The Matrix'}) RETURN *"
+            "(:Movie {title: 'The Matrix'})"
         )
-        session.query("CREATE (:Movie {title: 'Speed'}) RETURN *")
+        session.query("CREATE (:Movie {title: 'Speed'})")
 
     with database.read_transaction() as session:
         result = session.query(
@@ -3383,9 +3393,7 @@ def test_neo4j_recommendations_content_similarity_by_common_genres(
     database = Database(tmp_path / "example-db")
 
     with database.write_transaction() as session:
-        session.query(
-            "CREATE (:Movie {title: 'Inception'})-[:IN_GENRE]->(:Genre {name: 'Sci-Fi'}) RETURN *"
-        )
+        session.query("CREATE (:Movie {title: 'Inception'})-[:IN_GENRE]->(:Genre {name: 'Sci-Fi'})")
         session.query(
             "MATCH (m:Movie {title: 'Inception'}) "
             "CREATE (m)-[:IN_GENRE]->(g:Genre {name: 'Action'}) RETURN g"
@@ -3485,16 +3493,13 @@ def test_neo4j_recommendations_relationship_type_alternatives_match_content_edge
 
     with database.write_transaction() as session:
         session.query(
-            "CREATE (:Person {name: 'Keanu Reeves'})-[:ACTED_IN]->"
-            "(:Movie {title: 'The Matrix'}) RETURN *"
+            "CREATE (:Person {name: 'Keanu Reeves'})-[:ACTED_IN]->(:Movie {title: 'The Matrix'})"
         )
         session.query(
-            "CREATE (:Person {name: 'Lana Wachowski'})-[:DIRECTED]->"
-            "(:Movie {title: 'The Matrix'}) RETURN *"
+            "CREATE (:Person {name: 'Lana Wachowski'})-[:DIRECTED]->(:Movie {title: 'The Matrix'})"
         )
         session.query(
-            "CREATE (:Person {name: 'Someone Else'})-[:RATED]->"
-            "(:Movie {title: 'The Matrix'}) RETURN *"
+            "CREATE (:Person {name: 'Someone Else'})-[:RATED]->(:Movie {title: 'The Matrix'})"
         )
 
     with database.read_transaction() as session:
@@ -3517,13 +3522,12 @@ def test_neo4j_recommendations_relationship_type_alternatives_work_inside_not_ex
 
     with database.write_transaction() as session:
         session.query(
-            "CREATE (:User {name: 'Misty Williams'})-[:RATED]->"
-            "(:Movie {title: 'The Matrix'}) RETURN *"
+            "CREATE (:User {name: 'Misty Williams'})-[:RATED]->(:Movie {title: 'The Matrix'})"
         )
         session.query(
-            "CREATE (:User {name: 'Misty Williams'})-[:WATCHED]->(:Movie {title: 'Speed'}) RETURN *"
+            "CREATE (:User {name: 'Misty Williams'})-[:WATCHED]->(:Movie {title: 'Speed'})"
         )
-        session.query("CREATE (:Movie {title: 'John Wick'}) RETURN *")
+        session.query("CREATE (:Movie {title: 'John Wick'})")
         session.query(
             "MATCH (matrix:Movie {title: 'The Matrix'}), (john:Movie {title: 'John Wick'}) "
             "CREATE (john)-[:SIMILAR_TO]->(matrix) RETURN john"
@@ -3548,15 +3552,13 @@ def test_neo4j_recommendations_collect_groups_movie_genres(
 
     with database.write_transaction() as session:
         session.query(
-            "CREATE (:Movie {title: 'The Matrix'})-[:IN_GENRE]->(:Genre {name: 'Action'}) RETURN *"
+            "CREATE (:Movie {title: 'The Matrix'})-[:IN_GENRE]->(:Genre {name: 'Action'})"
         )
         session.query(
             "MATCH (m:Movie {title: 'The Matrix'}) "
             "CREATE (m)-[:IN_GENRE]->(genre:Genre {name: 'Sci-Fi'}) RETURN m"
         )
-        session.query(
-            "CREATE (:Movie {title: 'Speed'})-[:IN_GENRE]->(:Genre {name: 'Action'}) RETURN *"
-        )
+        session.query("CREATE (:Movie {title: 'Speed'})-[:IN_GENRE]->(:Genre {name: 'Action'})")
 
     with database.read_transaction() as session:
         result = session.query(
@@ -3577,7 +3579,7 @@ def test_neo4j_recommendations_collect_distinct_deduplicates_values(
 
     with database.write_transaction() as session:
         session.query(
-            "CREATE (:Movie {title: 'The Matrix'})-[:IN_GENRE]->(:Genre {name: 'Action'}) RETURN *"
+            "CREATE (:Movie {title: 'The Matrix'})-[:IN_GENRE]->(:Genre {name: 'Action'})"
         )
         session.query(
             "MATCH (m:Movie {title: 'The Matrix'}) "
@@ -3605,7 +3607,7 @@ def test_neo4j_recommendations_collect_result_can_be_unwound_after_with(
 
     with database.write_transaction() as session:
         session.query(
-            "CREATE (:Movie {title: 'The Matrix'})-[:IN_GENRE]->(:Genre {name: 'Action'}) RETURN *"
+            "CREATE (:Movie {title: 'The Matrix'})-[:IN_GENRE]->(:Genre {name: 'Action'})"
         )
         session.query(
             "MATCH (m:Movie {title: 'The Matrix'}) "
@@ -3631,7 +3633,7 @@ def test_neo4j_recommendations_size_of_collected_list_in_return(
 
     with database.write_transaction() as session:
         session.query(
-            "CREATE (:Movie {title: 'The Matrix'})-[:IN_GENRE]->(:Genre {name: 'Action'}) RETURN *"
+            "CREATE (:Movie {title: 'The Matrix'})-[:IN_GENRE]->(:Genre {name: 'Action'})"
         )
         session.query(
             "MATCH (m:Movie {title: 'The Matrix'}) "
@@ -3656,7 +3658,7 @@ def test_neo4j_recommendations_abs_arithmetic_filter_for_rating_similarity(
     with database.write_transaction() as session:
         session.query(
             "CREATE (:User {name: 'Misty Williams'})-[:RATED {rating: 5}]->"
-            "(:Movie {title: 'The Matrix'}) RETURN *"
+            "(:Movie {title: 'The Matrix'})"
         )
         session.query(
             "MATCH (m:Movie {title: 'The Matrix'}) "
@@ -3687,7 +3689,7 @@ def test_neo4j_recommendations_arithmetic_projection_returns_numeric_score(
     with database.write_transaction() as session:
         session.query(
             "CREATE (:User {name: 'Misty Williams'})-[:RATED {rating: 5}]->"
-            "(:Movie {title: 'The Matrix'}) RETURN *"
+            "(:Movie {title: 'The Matrix'})"
         )
 
     with database.read_transaction() as session:
@@ -4880,33 +4882,33 @@ def test_match_create_can_create_left_inline_node(tmp_path: Path) -> None:
     assert check.rows == ({"b.name": "vip", "a.name": "Alice"},)
 
 
-def test_match_create_rejects_unbound_variables(tmp_path: Path) -> None:
+def test_match_create_adds_an_unlabeled_endpoint(tmp_path: Path) -> None:
     database = Database(tmp_path / "example-db")
 
     with database.write_transaction() as session:
         session.query("CREATE (a:Person {name: 'Alice'}) RETURN a")
-        with pytest.raises(QueryError, match="requires unbound nodes"):
-            session.query("MATCH (a:Person) CREATE (a)-[:KNOWS]->(b) RETURN a")
+        result = session.query(
+            "MATCH (a:Person) CREATE (a)-[:KNOWS]->(b) RETURN labels(b) AS labels"
+        )
+        assert result.rows == ({"labels": []},)
 
 
-def test_match_create_rejects_relationship_variables_and_ranges(tmp_path: Path) -> None:
+def test_match_create_binds_relationship_variables_and_rejects_ranges(tmp_path: Path) -> None:
     database = Database(tmp_path / "example-db")
 
     with database.write_transaction() as session:
         session.query(
             "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'}) RETURN a, b"
         )
-        with pytest.raises(QueryError, match="Relationship variables are not supported yet."):
-            session.query(
-                "MATCH (a:Person)-[:KNOWS]->(b:Person) CREATE (a)-[r:LIKES]->(b) RETURN a"
-            )
-        with pytest.raises(
-            QueryError,
-            match="Variable-length relationships are not supported yet.",
-        ):
+        result = session.query(
+            "MATCH (a:Person)-[:KNOWS]->(b:Person) CREATE (a)-[r:LIKES]->(b) RETURN type(r) AS type"
+        )
+        assert result.rows == ({"type": "LIKES"},)
+        with pytest.raises(QueryError, match="Variable-length relationships") as error:
             session.query(
                 "MATCH (a:Person)-[:KNOWS]->(b:Person) CREATE (a)-[:LIKES*1..2]->(b) RETURN a"
             )
+        assert error.value.detail == "CreatingVarLength"
 
 
 def test_read_transaction_rejects_match_create_queries(tmp_path: Path) -> None:
@@ -4969,15 +4971,27 @@ def test_multiple_with_clauses_preserve_entity_bindings(tmp_path: Path) -> None:
     assert result.rows == ({"name": "Alice"},)
 
 
-def test_create_rejects_multi_hop_paths_for_now(tmp_path: Path) -> None:
+def test_create_multi_hop_preserves_direction_and_reuses_endpoint(tmp_path: Path) -> None:
     database = Database(tmp_path / "example-db")
-
     with database.write_transaction() as session:
-        with pytest.raises(QueryError, match="single relationship hop"):
-            session.query(
-                "CREATE (a:Person {name: 'Alice'})-[:KNOWS]->(b:Person {name: 'Bob'})"
-                "-[:KNOWS]->(c:Person {name: 'Carol'}) RETURN a, b, c"
-            )
+        assert session.query(
+            "CREATE (a:A)-[r:R]->(b:B)<-[s:S]-(a) RETURN type(r) AS r,type(s) AS s"
+        ).rows == ({"r": "R", "s": "S"},)
+    state = Database(tmp_path / "example-db")._app.use_cases.graph.load_state()
+    assert len(state.nodes) == 2
+    labels = {node.node_id: node.labels for node in state.nodes}
+    assert [(labels[e.src_id], e.rel_type, labels[e.dst_id]) for e in state.edges] == [
+        (("A",), "R", ("B",)),
+        (("A",), "S", ("B",)),
+    ]
+
+
+def test_create_multi_hop_without_relationship_variables(tmp_path: Path) -> None:
+    database = Database(tmp_path / "example-db")
+    with database.write_transaction() as session:
+        session.query("CREATE (:A)-[:R]->(:B)-[:S]->(:C)")
+        rows = session.query("MATCH (:A)-[:R]->(:B)-[:S]->(:C) RETURN count(*) AS n").rows
+    assert rows == ({"n": 1},)
 
 
 def test_create_rejects_redefining_an_existing_create_variable(tmp_path: Path) -> None:

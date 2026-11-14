@@ -118,12 +118,21 @@ def test_mcp_query_applies_row_guardrails_and_summary(tmp_path: Path) -> None:
     ]
 
 
-def test_mcp_query_enforces_hop_guardrail(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "query",
+    [
+        "MATCH (a)-[:KNOWS*1..5]->(b) RETURN a.name, b.name",
+        "MATCH p=()-[:R*..4]-() RETURN p",
+        "MATCH p=()-[:R*1..2]->()\n-[:S*0..2]->() RETURN p",
+        "MATCH p=()--()--()--()--() RETURN p",
+    ],
+)
+def test_mcp_query_enforces_hop_guardrail(tmp_path: Path, query: str) -> None:
     interface = create_mcp_interface(tmp_path / "example-db")
 
     with pytest.raises(QueryError, match="hop limit"):
         interface.query(
-            query="MATCH (a)-[:KNOWS*1..5]->(b) RETURN a.name, b.name",
+            query=query,
             max_hops=3,
         )
 

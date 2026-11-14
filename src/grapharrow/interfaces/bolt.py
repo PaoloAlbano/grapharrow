@@ -16,10 +16,13 @@ from typing import Any, cast
 from grapharrow.adapters import FileSystemAdapter
 from grapharrow.app import GraphArrowApplication, build_application
 from grapharrow.config import GraphArrowSettings
-from grapharrow.core.errors import GraphArrowError, WriteConflictError
+from grapharrow.core.errors import GraphArrowError, QueryError, WriteConflictError
+from grapharrow.core.temporal import DAY, NANOS, Duration, Instant, TemporalResult
 from grapharrow.interfaces.cypher_guard import query_requires_write
 from grapharrow.use_cases import CypherQueryUseCase, GraphTransactionUseCase
 from grapharrow.use_cases import cypher as cypher_module
+from grapharrow.use_cases.cypher_path import PathResult
+from grapharrow.use_cases.cypher_temporal import datetime_from_wire
 from grapharrow.use_cases.graph import GraphState
 
 BOLT_MAGIC = bytes.fromhex("6060B017")
@@ -86,6 +89,7 @@ class _ConnectionState:
     transaction: GraphTransactionUseCase | None = None
     transaction_cypher: CypherQueryUseCase | None = None
     next_query_id: int = 0
+    utc_datetimes: bool = False
 
 
 class _BoltPackstreamCodec:
@@ -379,12 +383,15 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
             return
 
         state.ready = True
+        patches = metadata.get("patch_bolt")
+        state.utc_datetimes = isinstance(patches, list) and "utc" in patches
         _send_success(
             self.request,
             self.codec,
             {
                 "server": server.bolt_app.server_agent,
                 "connection_id": f"grapharrow-bolt-{threading.get_ident()}",
+                **({"patch_bolt": ["utc"]} if state.utc_datetimes else {}),
             },
         )
 
@@ -408,7 +415,7 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
         transaction = GraphTransactionUseCase(server.bolt_app.grapharrow.use_cases.graph)
         state.transaction = transaction
         state.transaction_cypher = CypherQueryUseCase(
-            graph_service=cast(Any, transaction),
+            graph_service=transaction,
             tabular_adapter=server.bolt_app.grapharrow.adapters.tabular,
             index_service=server.bolt_app.grapharrow.use_cases.indexes,
             parse_cache=server.bolt_app.grapharrow.use_cases.cypher._parse_cache,
@@ -437,6 +444,7 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
 
         _bolt_query_log(server, query, parameters)
         try:
+            parameters = _decode_parameter(parameters, state.utc_datetimes)
             executor = state.transaction_cypher or server.bolt_app.grapharrow.use_cases.cypher
             statement_type = _statement_type_for_query(query)
             boundary = (
@@ -455,6 +463,15 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
         except GraphArrowError as exc:
             state.failed = True
             _bolt_log(server, f"query failed: {exc}")
+            if isinstance(exc, QueryError):
+                _send_failure(
+                    self.request,
+                    self.codec,
+                    code=exc.code,
+                    message=str(exc),
+                    details=exc.metadata(),
+                )
+                return
             _send_failure(
                 self.request,
                 self.codec,
@@ -603,7 +620,10 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
         batch = remaining[:limit]
         for row in batch:
             values = [
-                _packstream_result_value(column, row.get(column)) for column in pending.columns
+                _packstream_temporals(
+                    _packstream_result_value(column, row.get(column)), state.utc_datetimes
+                )
+                for column in pending.columns
             ]
             _send_message(self.request, self.codec, PackstreamStructure(RECORD, [values]))
 
@@ -898,14 +918,129 @@ def _send_success(
 
 def _packstream_result_value(column: str, value: Any) -> Any:
     """Convert schema procedure payloads into native Bolt graph structures."""
+    if isinstance(value, PathResult):
+        return _path_to_packstream(value)
     if column == "nodes" and isinstance(value, list):
-        return [_node_to_packstream(item) for item in value]
+        return [_packstream_nested_paths(_node_to_packstream(item)) for item in value]
     if column == "relationships" and isinstance(value, list):
-        return [_relationship_to_packstream(item) for item in value]
+        return [_packstream_nested_paths(_relationship_to_packstream(item)) for item in value]
     converted = _node_to_packstream(value)
     if converted is not value:
         return converted
-    return _relationship_to_packstream(value)
+    converted = _relationship_to_packstream(value)
+    if converted is not value:
+        return converted
+    return _packstream_nested_paths(value)
+
+
+def _packstream_temporals(value: Any, utc: bool) -> Any:
+    if isinstance(value, TemporalResult):
+        temporal = value.temporal
+        if isinstance(temporal, Duration):
+            seconds, nanos = divmod(temporal.nanos, NANOS)
+            return PackstreamStructure(ord("E"), [temporal.months, temporal.days, seconds, nanos])
+        if temporal.kind == "date":
+            return PackstreamStructure(ord("D"), [temporal.day])
+        if temporal.kind == "localtime":
+            return PackstreamStructure(ord("t"), [temporal.clock])
+        if temporal.kind == "time":
+            return PackstreamStructure(ord("T"), [temporal.clock, temporal.offset])
+        local_seconds = temporal.day * DAY + temporal.clock // NANOS
+        nanos = temporal.clock % NANOS
+        if temporal.kind == "localdatetime":
+            return PackstreamStructure(ord("d"), [local_seconds, nanos])
+        if utc:
+            signature, seconds = ("i" if temporal.zone else "I"), temporal.epoch_seconds
+        else:
+            signature, seconds = ("f" if temporal.zone else "F"), local_seconds
+        return PackstreamStructure(
+            ord(signature), [seconds, nanos, temporal.zone or temporal.offset]
+        )
+    if isinstance(value, PackstreamStructure):
+        return PackstreamStructure(
+            value.signature, [_packstream_temporals(v, utc) for v in value.fields]
+        )
+    if isinstance(value, list):
+        return [_packstream_temporals(v, utc) for v in value]
+    if isinstance(value, dict):
+        return {key: _packstream_temporals(v, utc) for key, v in value.items()}
+    return value
+
+
+def _decode_parameter(value: Any, utc: bool) -> Any:
+    if isinstance(value, list):
+        return [_decode_parameter(item, utc) for item in value]
+    if isinstance(value, dict):
+        return {key: _decode_parameter(item, utc) for key, item in value.items()}
+    if not isinstance(value, PackstreamStructure):
+        return value
+    signature = chr(value.signature)
+    fields = value.fields
+    try:
+        if signature == "D" and len(fields) == 1 and type(fields[0]) is int:
+            return Instant("date", fields[0])
+        if signature in {"t", "T"} and len(fields) == (1 if signature == "t" else 2):
+            if all(type(part) is int for part in fields):
+                return (
+                    Instant("localtime", clock=fields[0])
+                    if signature == "t"
+                    else (Instant("time", clock=fields[0], offset=fields[1]))
+                )
+        if signature == "E" and len(fields) == 4 and all(type(part) is int for part in fields):
+            months, days, seconds, nanos = fields
+            if -NANOS < nanos < NANOS:
+                return Duration(months, days, seconds * NANOS + nanos)
+        valid_datetimes = {"d", "i", "I"} if utc else {"d", "f", "F"}
+        if signature in valid_datetimes and len(fields) == (2 if signature == "d" else 3):
+            seconds, nanos, *zones = fields
+            zone = zones[0] if zones else None
+            expected_zone = {"i": str, "f": str, "I": int, "F": int, "d": type(None)}[signature]
+            if type(seconds) is int and type(nanos) is int and type(zone) is expected_zone:
+                return datetime_from_wire(seconds, nanos, cast(str | int | None, zone), utc=utc)
+    except (ValueError, OverflowError, KeyError) as error:
+        raise QueryError.invalid_type(
+            f"Invalid Bolt temporal parameter: {error}", phase="runtime"
+        ) from error
+    raise QueryError.invalid_type("Unsupported or malformed Bolt parameter.", phase="runtime")
+
+
+def _packstream_nested_paths(value: Any) -> Any:
+    if isinstance(value, PathResult):
+        return _path_to_packstream(value)
+    if isinstance(value, list):
+        return [_packstream_nested_paths(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _packstream_nested_paths(item) for key, item in value.items()}
+    return value
+
+
+def _path_to_packstream(path: PathResult) -> PackstreamStructure:
+    """Encode Bolt's unique node/relationship tables and signed traversal sequence."""
+    nodes = path["nodes"]
+    unique_nodes: dict[int, Any] = {}
+    node_indices: dict[int, int] = {}
+    for node in nodes:
+        node_id = node["id"]
+        if node_id not in node_indices:
+            node_indices[node_id] = len(unique_nodes)
+            unique_nodes[node_id] = _node_to_packstream(node)
+    unique_relationships: dict[int, PackstreamStructure] = {}
+    relationship_indices: dict[int, int] = {}
+    sequence: list[int] = []
+    for index, edge in enumerate(path["relationships"]):
+        edge_id = edge["id"]
+        if edge_id not in relationship_indices:
+            relationship_indices[edge_id] = len(unique_relationships) + 1
+            unique_relationships[edge_id] = PackstreamStructure(
+                ord("r"), [edge_id, edge["type"], edge["properties"]]
+            )
+        direction = 1 if nodes[index]["id"] == edge["source"] else -1
+        sequence.extend(
+            (direction * relationship_indices[edge_id], node_indices[nodes[index + 1]["id"]])
+        )
+    return PackstreamStructure(
+        ord("P"), [list(unique_nodes.values()), list(unique_relationships.values()), sequence]
+    )
 
 
 def _node_to_packstream(value: Any) -> Any:
@@ -960,14 +1095,18 @@ def _send_failure(
     *,
     code: str,
     message: str,
+    details: dict[str, str | int | None] | None = None,
 ) -> None:
     """Send a Bolt FAILURE response using the error envelope drivers expect."""
+    metadata: dict[str, object] = {"code": code, "message": message}
+    if details is not None:
+        metadata["grapharrow_error"] = details
     _send_message(
         sock,
         codec,
         PackstreamStructure(
             FAILURE,
-            [{"code": code, "message": message}],
+            [metadata],
         ),
     )
 

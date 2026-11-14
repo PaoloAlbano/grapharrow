@@ -97,7 +97,7 @@ def plan_branch(branch: ReadBranch) -> ScanPlan:
     if branch.initial_scope or not branch.stages or not isinstance(branch.stages[0], MatchStage):
         raise UnsupportedColumnar
     match = branch.stages[0]
-    if match.optional or len(match.patterns) != 1:
+    if match.optional or match.paths or len(match.patterns) != 1:
         raise UnsupportedColumnar
     pattern = match.patterns[0]
     if not isinstance(pattern, core.NodePattern) or len(pattern.labels) != 1:

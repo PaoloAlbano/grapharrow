@@ -24,6 +24,10 @@ def dataset_filter(schema: pa.Schema, predicates: Sequence[ScanPredicate]) -> An
         field = schema.field(column)
         expression = ds.field(column)
         operator, value = predicate.operator, predicate.value
+        encoding = (field.metadata or {}).get(b"grapharrow.encoding")
+        if encoding in {b"json", b"temporal"} and operator not in {"is_null", "is_not_null"}:
+            # Physical strings encode types as well as values.
+            continue
         if operator == "!=" and pa.types.is_floating(field.type):
             # Parquet min=max statistics can omit NaNs that the residual != must retain.
             continue

@@ -9,15 +9,30 @@ from __future__ import annotations
 
 import math
 import operator as operations
+import re
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from grapharrow.core.errors import QueryError
+from grapharrow.core.temporal import Duration, Instant, TemporalResult
 from grapharrow.repositories import EdgeRecord, NodeRecord
+from grapharrow.use_cases.cypher_conversion import SCALAR_CONVERSIONS
+from grapharrow.use_cases.cypher_path import PathResult, PathValue
+from grapharrow.use_cases.cypher_temporal import (
+    TEMPORAL_ARITIES,
+    evaluate_temporal,
+    temporal_arithmetic,
+)
 
 Row = dict[str, Any]
 Scope = dict[str, str]
+LIST_ACCESSORS = frozenset({"head", "last", "tail"})
+TYPED_SCALAR_FUNCTIONS = frozenset(
+    {"range", "properties", *LIST_ACCESSORS, *SCALAR_CONVERSIONS, *TEMPORAL_ARITIES}
+)
+_MAX_RANGE_ITEMS = 1 << 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,12 +73,12 @@ class ExpressionCompiler:
         if name == "oC_Variable":
             variable = identifier(node.getText())
             if variable not in scope:
-                raise QueryError(f"Unknown variable: {variable}")
+                raise QueryError.syntax(f"Unknown variable: {variable}", "UndefinedVariable")
             return Expression("variable", variable)
         if name == "oC_Parameter":
             parameter = identifier(node.getText()[1:])
             if parameter not in self.parameters:
-                raise QueryError(f"Missing parameter: ${parameter}")
+                raise QueryError.missing_parameter(parameter)
             return Expression("literal", self.parameters[parameter])
         if name == "oC_ListLiteral":
             return Expression("list", arguments=tuple(build(p) for p in node.oC_Expression()))
@@ -74,10 +89,52 @@ class ExpressionCompiler:
                 tuple(build(p) for p in node.oC_Expression()),
             )
         if name in {"oC_ExistentialSubquery", "oC_PatternPredicate"}:
+            if name == "oC_PatternPredicate":
+                parent = node.parentCtx
+                while parent is not None and rule(parent) not in {"oC_Where", "oC_ProjectionItem"}:
+                    parent = parent.parentCtx
+                if parent is None or rule(parent) != "oC_Where":
+                    raise QueryError("Pattern predicates are only supported in predicate contexts")
             return Expression("exists", self.exists(node, scope))
         if name == "oC_FunctionInvocation":
             function = node.oC_FunctionName().getText().lower()
             arguments = tuple(build(p) for p in node.oC_Expression())
+            if function in TYPED_SCALAR_FUNCTIONS:
+                allowed_counts = TEMPORAL_ARITIES.get(
+                    function, (2, 3) if function == "range" else (1,)
+                )
+                if len(arguments) not in allowed_counts:
+                    raise QueryError.syntax(
+                        f"{function}() accepts argument counts {allowed_counts}.",
+                        "InvalidNumberOfArguments",
+                    )
+                if node.DISTINCT() is not None:
+                    raise QueryError.syntax(
+                        "DISTINCT requires an aggregation function.", "InvalidArgumentPassingMode"
+                    )
+                if function in LIST_ACCESSORS or function == "properties":
+                    operand = arguments[0]
+                    invalid_kinds = (
+                        {"map"} if function in LIST_ACCESSORS else {"list", "comprehension"}
+                    )
+                    invalid_entities = (
+                        {"node", "relationship", "path"}
+                        if function in (LIST_ACCESSORS)
+                        else {"path"}
+                    )
+                    if (
+                        operand.kind in invalid_kinds
+                        or (operand.kind == "variable" and scope[operand.value] in invalid_entities)
+                        or (
+                            operand.kind == "literal"
+                            and operand.value is not None
+                            and not node.oC_Expression()[0].getText().lstrip("(").startswith("$")
+                        )
+                    ):
+                        raise QueryError.invalid_type(
+                            f"Invalid operand for {function}", phase="compile"
+                        )
+                return Expression("function", function, arguments)
             if function in {"count", "sum", "avg", "min", "max", "collect"}:
                 if len(arguments) != 1 or any(has_aggregate(a) for a in arguments):
                     raise QueryError("Aggregates require one non-aggregate operand")
@@ -91,14 +148,31 @@ class ExpressionCompiler:
                 "labels": 1,
                 "type": 1,
                 "keys": 1,
+                "length": 1,
+                "nodes": 1,
+                "relationships": 1,
             }
             if function == "coalesce":
                 if not arguments:
                     raise QueryError("coalesce requires at least one argument")
             elif function not in arities:
-                raise QueryError(f"Unsupported scalar function: {function}")
+                raise QueryError.unsupported(f"Unsupported scalar function: {function}")
             elif len(arguments) != arities[function]:
                 raise QueryError(f"{function} requires {arities[function]} argument")
+            entity_types = {
+                "id": {"node", "relationship"},
+                "labels": {"node"},
+                "type": {"relationship"},
+                "length": {"path"},
+                "nodes": {"path"},
+                "relationships": {"path"},
+            }
+            if function in entity_types and arguments[0].kind == "variable":
+                kind = scope[arguments[0].value]
+                if kind not in entity_types[function] | {"any", "null"}:
+                    raise QueryError.invalid_type(
+                        f"Invalid operand for {function}: {kind}", phase="compile"
+                    )
             return Expression("function", function, arguments)
         if name == "oC_Atom" and node.COUNT() is not None:
             return Expression("aggregate", ("count", False), ())
@@ -144,6 +218,8 @@ class ExpressionCompiler:
                     if projection is not None
                     else Expression("variable", variable)
                 )
+                if has_aggregate(predicate) or has_aggregate(value):
+                    raise QueryError("List expressions cannot contain aggregates")
                 return Expression("comprehension", variable, (collection, predicate, value))
             operation = next(c.getText().lower() for c in node.children if c.getText().strip())
             return Expression("quantifier", (operation, variable), (collection, predicate))
@@ -164,6 +240,7 @@ class ExpressionCompiler:
                     positions = part.oC_Expression()
                     if ".." in [c.getText() for c in part.children]:
                         lower, upper = Expression("literal", None), Expression("literal", None)
+                        explicit = [False, False]
                         separator = next(
                             i for i, c in enumerate(part.children) if c.getText() == ".."
                         )
@@ -171,9 +248,13 @@ class ExpressionCompiler:
                             if hasattr(c, "getRuleIndex"):
                                 if i < separator:
                                     lower = build(c)
+                                    explicit[0] = True
                                 else:
                                     upper = build(c)
-                        expression = Expression("slice", arguments=(expression, lower, upper))
+                                    explicit[1] = True
+                        expression = Expression(
+                            "slice", tuple(explicit), (expression, lower, upper)
+                        )
                     else:
                         expression = Expression(
                             "index", arguments=(expression, build(positions[0]))
@@ -188,9 +269,14 @@ class ExpressionCompiler:
                 "oC_AndExpression": "and",
             }[name]
             values = tuple(build(p) for p in parts)
+            if len(values) > 1:
+                for operand in values:
+                    validate_predicate(operand)
             return values[0] if len(values) == 1 else Expression(operation, arguments=values)
         if name == "oC_NotExpression":
             value = build(parts[0])
+            if node.NOT():
+                validate_predicate(value)
             return Expression("not", arguments=(value,)) if len(node.NOT()) % 2 else value
         if name == "oC_ComparisonExpression":
             left = build(parts[0])
@@ -210,7 +296,14 @@ class ExpressionCompiler:
                 if part_name == "oC_NullPredicateExpression":
                     result = Expression("is_null", part.NOT() is None, (result,))
                 elif part_name == "oC_ListPredicateExpression":
-                    result = Expression("in", arguments=(result, build(children(part)[0])))
+                    collection = build(children(part)[0])
+                    if collection.kind == "map" or (
+                        collection.kind == "literal"
+                        and collection.value is not None
+                        and not isinstance(collection.value, list | tuple)
+                    ):
+                        raise QueryError.invalid_type("IN requires a list", phase="compile")
+                    result = Expression("in", arguments=(result, collection))
                 else:
                     op = (
                         "starts"
@@ -236,6 +329,12 @@ class ExpressionCompiler:
                 result = Expression("binary", operator, (result, build(part)))
             return result
         if name == "oC_UnaryAddOrSubtractExpression":
+            if re.fullmatch(r"[+-]\d+", node.getText()):
+                from grapharrow.use_cases.cypher import _parse_value
+
+                return Expression(
+                    "literal", _parse_value(node.getText().lstrip("+"), dict(self.parameters))
+                )
             result = build(parts[0])
             prefix = node.children[0].getText()
             return Expression("unary", prefix, (result,)) if prefix in {"+", "-"} else result
@@ -254,19 +353,29 @@ def has_aggregate(expression: Expression) -> bool:
 
 def validate_predicate(expression: Expression) -> None:
     """Reject known non-boolean predicates even when the input has no rows."""
-    if expression.kind == "literal":
-        truth(expression.value)
-    elif expression.kind in {"list", "map"}:
-        raise QueryError("A predicate must evaluate to a boolean or null")
+    if expression.kind in {"list", "map"} or (
+        expression.kind == "literal"
+        and expression.value is not None
+        and type(expression.value) is not bool
+    ):
+        raise QueryError.invalid_type(
+            "A predicate must evaluate to a boolean or null", phase="compile"
+        )
 
 
 def truth(value: Any) -> bool | None:
     if value is None or type(value) is bool:
         return value
-    raise QueryError("A predicate must evaluate to a boolean or null")
+    raise QueryError.invalid_type("A predicate must evaluate to a boolean or null", phase="runtime")
 
 
 def freeze(value: Any) -> Any:
+    if isinstance(value, PathValue):
+        return (
+            "path",
+            tuple(node.node_id for node in value.nodes),
+            tuple(edge.edge_id for edge in value.relationships),
+        )
     if isinstance(value, NodeRecord):
         return ("node", value.node_id)
     if isinstance(value, EdgeRecord):
@@ -315,10 +424,68 @@ def property_value(value: Any, key: str) -> Any:
         return value.properties.get(key)
     if isinstance(value, Mapping):
         return value.get(key)
-    raise QueryError("Property access requires a node, relationship or map")
+    if isinstance(value, Instant | Duration):
+        try:
+            return value.component(key)
+        except KeyError as error:
+            raise QueryError(
+                f"Unknown temporal component: {key}",
+                category="ArgumentError",
+                phase="runtime",
+                detail="InvalidArgumentValue",
+            ) from error
+    raise QueryError.invalid_type(
+        "Property access requires a node, relationship or map", phase="runtime"
+    )
+
+
+def _range_values(arguments: list[Any]) -> list[int]:
+    step = arguments[2] if len(arguments) == 3 else 1
+    if type(step) is int and step == 0:
+        raise QueryError(
+            "range() requires a nonzero step.",
+            category="ArgumentError",
+            detail="NumberOutOfRange",
+            phase="runtime",
+        )
+    if any(argument is None for argument in arguments):
+        raise QueryError.invalid_type("range() requires non-null integers.", phase="runtime")
+    if any(type(argument) is not int for argument in arguments):
+        raise QueryError(
+            "range() requires integer arguments.",
+            category="ArgumentError",
+            detail="InvalidArgumentType",
+            phase="runtime",
+        )
+    start, end = arguments[:2]
+    if any(not -(2**63) <= argument < 2**63 for argument in arguments):
+        raise QueryError(
+            "range() requires signed 64-bit integers.",
+            category="ArgumentError",
+            detail="NumberOutOfRange",
+            phase="runtime",
+        )
+    # Compute cardinality without overflowing a machine-sized length or
+    # allocating the list. Python also permits the exclusive bound just
+    # beyond either signed 64-bit endpoint.
+    count = (end - start) // step + 1
+    if count > _MAX_RANGE_ITEMS:
+        raise QueryError(
+            f"range() produces more than {_MAX_RANGE_ITEMS} items.",
+            category="UnsupportedFeature",
+            detail="RangeTooLarge",
+            phase="runtime",
+        )
+    return list(range(start, end + (1 if step > 0 else -1), step))
 
 
 def public_value(value: Any) -> Any:
+    if isinstance(value, Instant | Duration):
+        return TemporalResult(value)
+    if isinstance(value, PathValue):
+        return PathResult(
+            nodes=public_value(value.nodes), relationships=public_value(value.relationships)
+        )
     if isinstance(value, NodeRecord):
         return {
             "id": value.node_id,
@@ -351,8 +518,19 @@ def sort_key(value: Any) -> Any:
         return (2, value.edge_id)
     if isinstance(value, list | tuple):
         return (3, tuple(sort_key(p) for p in value))
+    if isinstance(value, PathValue):
+        parts = [
+            (node.node_id, edge.edge_id)
+            for node, edge in zip(value.nodes[:-1], value.relationships, strict=True)
+        ]
+        return (4, (*parts, (value.nodes[-1].node_id,)))
+    if isinstance(value, Instant):
+        rank = ("datetime", "localdatetime", "date", "time", "localtime").index(value.kind)
+        return (5, rank, value.order_key())
+    if isinstance(value, Duration):
+        return (5, 5, value.order_key())
     if isinstance(value, str):
-        return (5, value)
+        return (5, 6, value)
     if type(value) is bool:
         return (6, value)
     if isinstance(value, int | float):
@@ -361,8 +539,17 @@ def sort_key(value: Any) -> Any:
 
 
 class ExpressionEvaluator:
-    def __init__(self, exists: Callable[[Any, Row], bool]) -> None:
+    def __init__(
+        self,
+        exists: Callable[[Any, Row], bool],
+        *,
+        resolve_entity: Callable[[Any], Any] | None = None,
+        transaction_time: int | None = None,
+    ) -> None:
         self.exists = exists
+        self.resolve_entity = resolve_entity
+        self._statement_time: int | None = None
+        self._transaction_time = transaction_time
 
     def evaluate(self, expression: Expression, row: Row, group: list[Row] | None = None) -> Any:
         kind, value, args = expression.kind, expression.value, expression.arguments
@@ -375,7 +562,10 @@ class ExpressionEvaluator:
         if kind == "variable":
             return row[value]
         if kind == "property":
-            return property_value(evaluate(args[0]), value)
+            operand = evaluate(args[0])
+            if self.resolve_entity is not None:
+                operand = self.resolve_entity(operand)
+            return property_value(operand, value)
         if kind == "list":
             return [evaluate(p) for p in args]
         if kind == "map":
@@ -391,6 +581,19 @@ class ExpressionEvaluator:
                     return evaluate(then)
             return evaluate(args[-1])
         if kind == "function":
+            if value in TEMPORAL_ARITIES:
+                if self._statement_time is None:
+                    self._statement_time = time.time_ns()
+                now = (
+                    time.time_ns()
+                    if value.endswith(".realtime")
+                    else self._transaction_time or self._statement_time
+                    if value.endswith(".transaction")
+                    else self._statement_time
+                )
+                return evaluate_temporal(value, [evaluate(arg) for arg in args], now)
+            if value == "range":
+                return _range_values([evaluate(arg) for arg in args])
             if value == "coalesce":
                 for child in args:
                     result = evaluate(child)
@@ -400,6 +603,21 @@ class ExpressionEvaluator:
             operand = evaluate(args[0])
             if operand is None:
                 return None
+            if value in SCALAR_CONVERSIONS:
+                if value == "tostring" and isinstance(operand, Instant | Duration):
+                    return str(operand)
+                return SCALAR_CONVERSIONS[value](operand)
+            if self.resolve_entity is not None and value in {"labels", "keys", "properties"}:
+                operand = self.resolve_entity(operand)
+            if value in LIST_ACCESSORS and isinstance(operand, list | tuple):
+                if value == "tail":
+                    return list(operand[1:])
+                return operand[0 if value == "head" else -1] if operand else None
+            if value == "properties":
+                if isinstance(operand, NodeRecord | EdgeRecord):
+                    return dict(operand.properties)
+                if isinstance(operand, Mapping):
+                    return dict(operand)
             if value == "abs" and type(operand) in {int, float}:
                 return abs(operand)
             if value == "size" and isinstance(operand, str | list | tuple):
@@ -414,7 +632,14 @@ class ExpressionEvaluator:
                 return operand.rel_type
             if value == "keys" and isinstance(operand, NodeRecord | EdgeRecord | dict):
                 return list(operand if isinstance(operand, dict) else operand.properties)
-            raise QueryError(f"Invalid operand for {value}")
+            if isinstance(operand, PathValue):
+                if value == "length":
+                    return len(operand.relationships)
+                if value == "nodes":
+                    return list(operand.nodes)
+                if value == "relationships":
+                    return list(operand.relationships)
+            raise QueryError.invalid_type(f"Invalid operand for {value}", phase="runtime")
         if kind == "aggregate":
             if group is None:
                 raise QueryError("Aggregate is not allowed in this expression context")
@@ -463,6 +688,8 @@ class ExpressionEvaluator:
             return (evaluate(args[0]) is None) == value
         if kind == "labels":
             operand = evaluate(args[0])
+            if self.resolve_entity is not None:
+                operand = self.resolve_entity(operand)
             if operand is None:
                 return None
             if not isinstance(operand, NodeRecord):
@@ -480,6 +707,14 @@ class ExpressionEvaluator:
                 elif left is None or right is None:
                     results.append(None)
                 else:
+                    if isinstance(left, Instant) and isinstance(right, Instant):
+                        if left.kind != right.kind:
+                            results.append(None)
+                            continue
+                        left, right = left.order_key(), right.order_key()
+                    if isinstance(left, Duration) or isinstance(right, Duration):
+                        results.append(None)
+                        continue
                     if type(left) is bool or type(right) is bool:
                         if type(left) is not type(right):
                             results.append(None)
@@ -508,7 +743,7 @@ class ExpressionEvaluator:
             if collection is None:
                 return None
             if not isinstance(collection, list | tuple):
-                raise QueryError("IN requires a list")
+                raise QueryError.invalid_type("IN requires a list", phase="runtime")
             results = [equal(needle, p) for p in collection]
             return True if True in results else None if None in results else False
         if kind == "string":
@@ -516,7 +751,7 @@ class ExpressionEvaluator:
             if left is None or right is None:
                 return None
             if not isinstance(left, str) or not isinstance(right, str):
-                raise QueryError("String predicates require strings")
+                raise QueryError.invalid_type("String predicates require strings", phase="runtime")
             return (
                 left.startswith(right)
                 if value == "starts"
@@ -540,8 +775,12 @@ class ExpressionEvaluator:
                     return left + str(right)
                 if isinstance(right, str) and type(left) in {int, float}:
                     return str(left) + right
+            if kind == "binary" and any(isinstance(p, Instant | Duration) for p in values):
+                return temporal_arithmetic(value, *values)
             if any(type(p) not in {int, float} for p in values):
-                raise QueryError("Arithmetic requires numeric operands")
+                raise QueryError.invalid_type(
+                    "Arithmetic requires numeric operands", phase="runtime"
+                )
             if kind == "unary":
                 return values[0] if value == "+" else -values[0]
             left, right = values
@@ -555,16 +794,25 @@ class ExpressionEvaluator:
                         )
                         return left - quotient * right
                     return math.fmod(left, right)
+                if value == "^":
+                    return math.pow(left, right)
                 return {
                     "+": lambda: left + right,
                     "-": lambda: left - right,
                     "*": lambda: left * right,
                     "/": lambda: left / right,
                     "%": lambda: left % right,
-                    "^": lambda: left**right,
                 }[value]()
-            except (ArithmeticError, ValueError, OverflowError) as error:
-                raise QueryError(f"Invalid arithmetic operation: {value}") from error
+            except ZeroDivisionError as error:
+                raise QueryError(
+                    "Division by zero", category="ArithmeticError", detail="DivisionByZero"
+                ) from error
+            except (ArithmeticError, ValueError) as error:
+                raise QueryError(
+                    f"Invalid arithmetic operation: {value}",
+                    category="ArithmeticError",
+                    detail="InvalidArithmeticOperation",
+                ) from error
         if kind in {"index", "slice"}:
             collection = evaluate(args[0])
             if collection is None:
@@ -579,6 +827,11 @@ class ExpressionEvaluator:
             if any(p is not None and type(p) is not int for p in positions):
                 raise QueryError("List indexes must be integers")
             if kind == "slice":
+                if any(
+                    explicit and position is None
+                    for explicit, position in zip(value, positions, strict=True)
+                ):
+                    return None
                 return collection[slice(*positions)]
             index = positions[0]
             return (

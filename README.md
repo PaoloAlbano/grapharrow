@@ -11,8 +11,7 @@ The project is experimental: query APIs and storage formats are evolving.
 It provides embedded Python, REST, Bolt and ANA agent interfaces. See the
 [supported Cypher subset](docs/cypher-v1.md) and
 [ANA HTTP interface](docs/ana-interface.md) before integrating it.
-Cypher support is incomplete and has [known correctness issues](docs/known-cypher-issues.md),
-including relationship creation, self-loop matching and write results.
+Cypher support is incomplete; see the [correctness status and remaining gaps](docs/known-cypher-issues.md).
 The [transaction and session guide](docs/transactions.md) explains write
 visibility, local writer coordination, conflict handling and object-storage limits.
 

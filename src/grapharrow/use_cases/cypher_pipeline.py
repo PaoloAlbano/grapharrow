@@ -15,11 +15,13 @@ from functools import cmp_to_key
 from heapq import nsmallest
 from typing import Any
 
+from grapharrow.core import property_codec
 from grapharrow.core.errors import QueryError
 from grapharrow.domain import SnapshotManifest
 from grapharrow.repositories import EdgeRecord, NodeRecord
 from grapharrow.use_cases import cypher as core
 from grapharrow.use_cases.cypher_expression import (
+    TYPED_SCALAR_FUNCTIONS,
     Expression,
     ExpressionCompiler,
     ExpressionEvaluator,
@@ -37,8 +39,40 @@ from grapharrow.use_cases.cypher_expression import (
     truth,
     validate_predicate,
 )
+from grapharrow.use_cases.cypher_path import PathValue
 from grapharrow.use_cases.cypher_window import limit_optimizations_enabled, window_value
-from grapharrow.use_cases.graph import GraphState, GraphStateUseCase, QueryResult
+from grapharrow.use_cases.graph import (
+    GraphState,
+    GraphStateUseCase,
+    GraphTransactionUseCase,
+    QueryResult,
+)
+
+
+@dataclass(frozen=True)
+class PathBinding:
+    name: str
+    nodes: tuple[str, ...]
+    relationships: tuple[str, ...]
+
+    def value(self, row: Row, nodes_by_id: Mapping[int, NodeRecord] | None = None) -> PathValue:
+        if nodes_by_id is None:
+            return PathValue(
+                tuple(row[name] for name in self.nodes),
+                tuple(row[name] for name in self.relationships),
+            )
+        # Edge records retain their canonical orientation. The start binding
+        # and ordered edges determine the traversal, including zero-hop segments.
+        nodes = [row[self.nodes[0]]]
+        relationships = []
+        for name in self.relationships:
+            value = row[name]
+            for edge in value if isinstance(value, list) else (value,):
+                current = nodes[-1].node_id
+                other = edge.dst_id if edge.src_id == current else edge.src_id
+                nodes.append(nodes_by_id[other])
+                relationships.append(edge)
+        return PathValue(tuple(nodes), tuple(relationships))
 
 
 @dataclass(frozen=True)
@@ -47,6 +81,7 @@ class MatchStage:
     bindings: Scope
     predicate: Expression | None
     optional: bool
+    paths: tuple[PathBinding, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -95,13 +130,68 @@ def walk(node: Any) -> Any:
         yield from walk(child)
 
 
-def needs_pipeline(tree: Any, source: str) -> bool:
+def needs_pipeline(tree: Any, source: str, parameters: Mapping[str, object] | None = None) -> bool:
+    if parameters and property_codec.contains_temporal(parameters):
+        return True
     if not any(
-        word in source.lower() for word in ("case", "coalesce", "with", "union", "call", "exists")
+        word in source.lower()
+        for word in (
+            "case",
+            "coalesce",
+            *TYPED_SCALAR_FUNCTIONS,
+            "with",
+            "union",
+            "call",
+            "exists",
+            "^",
+            "unwind",
+            "*",
+            "distinct",
+            "{",
+            "=",
+        )
     ):
         return False
-    for node in walk(tree):
+    nodes = tuple(walk(tree))
+    updating = any(rule(node) == "oC_UpdatingClause" for node in nodes)
+    for node in nodes:
         name = rule(node)
+        if name == "oC_PatternPart" and node.oC_Variable() is not None:
+            return True
+        if name == "oC_ProjectionItem" and any(
+            rule(part) == "oC_MapLiteral"
+            and any(rule(value) == "oC_Variable" for value in walk(part))
+            for part in walk(node)
+        ):
+            return True
+        if not updating:
+            if (
+                name == "oC_Return"
+                and node.oC_ProjectionBody().DISTINCT() is not None
+                and node.oC_ProjectionBody().oC_Order() is not None
+            ):
+                return True
+            if name == "oC_With":
+                return True
+            if name == "oC_PowerOfExpression" and len(children(node)) > 1:
+                return True
+            if (
+                name == "oC_RelationshipDetail"
+                and node.oC_Variable() is not None
+                and node.oC_RangeLiteral() is not None
+            ):
+                return True
+            if name == "oC_Unwind":
+                try:
+                    value = core._compile_value_expression(
+                        node.oC_Expression(), dict(parameters or {})
+                    )
+                except QueryError:
+                    continue
+                if isinstance(value, list | tuple):
+                    kinds = {type(v) for v in value if v is not None}
+                    if len(kinds) > 1 or any(isinstance(v, list | tuple | dict) for v in value):
+                        return True
         if name in {"oC_CaseExpression", "oC_SubqueryCall", "oC_Union"}:
             return True
         if name == "oC_ExistentialSubquery" and (
@@ -110,7 +200,7 @@ def needs_pipeline(tree: Any, source: str) -> bool:
             return True
         if (
             name == "oC_FunctionInvocation"
-            and node.oC_FunctionName().getText().lower() == "coalesce"
+            and node.oC_FunctionName().getText().lower() in TYPED_SCALAR_FUNCTIONS | {"coalesce"}
         ):
             return True
         if name == "oC_MultiPartQuery" and len(node.oC_With()) > 1:
@@ -126,15 +216,29 @@ def contains_updates(tree: Any) -> bool:
     return any(rule(node) == "oC_UpdatingClause" for node in walk(tree))
 
 
+def ordered_clauses(single: Any) -> list[Any]:
+    multi = single.oC_MultiPartQuery()
+    parts = children(multi) if multi is not None else [single.oC_SinglePartQuery()]
+    return [
+        clause
+        for part in parts
+        for clause in (children(part) if rule(part) == "oC_SinglePartQuery" else [part])
+    ]
+
+
 def expression_kind(expression: Expression, scope: Scope) -> str:
     if expression.kind == "variable":
         return scope[expression.value]
+    if expression.kind == "literal" and expression.value is None:
+        return "null"
     if expression.kind == "property":
         base = expression.arguments[0]
         if expression_kind(base, scope) in {"node", "relationship"}:
             return "scalar"
         if base.kind == "map" and expression.value in base.value:
             return expression_kind(base.arguments[base.value.index(expression.value)], scope)
+        return "any"
+    if expression.kind == "function" and expression.value in {"head", "last"}:
         return "any"
     if expression.kind == "function" and expression.value == "coalesce":
         kinds = {
@@ -156,16 +260,37 @@ def expression_kind(expression: Expression, scope: Scope) -> str:
 
 
 def pattern_bindings(patterns: tuple[core.CompiledPattern, ...]) -> Scope:
-    scope = {}
+    scope: Scope = {}
+
+    def bind(variable: str, kind: str) -> None:
+        if variable in scope and scope[variable] != kind:
+            raise QueryError.syntax(
+                f"Variable {variable} cannot be both {scope[variable]} and {kind}",
+                "VariableTypeConflict",
+            )
+        scope[variable] = kind
+
     for pattern in patterns:
-        scope[
-            pattern.variable if isinstance(pattern, core.NodePattern) else pattern.start.variable
-        ] = "node"
+        bind(
+            pattern.variable if isinstance(pattern, core.NodePattern) else pattern.start.variable,
+            "node",
+        )
         if isinstance(pattern, core.PathPattern):
             for step in pattern.steps:
-                scope[step.node.variable] = "node"
                 if step.variable is not None:
-                    scope[step.variable] = "relationship"
+                    if step.variable in scope and scope[step.variable] in {
+                        "relationship",
+                        "relationship_list",
+                    }:
+                        raise QueryError.syntax(
+                            "A relationship variable cannot be repeated in one MATCH pattern.",
+                            "RelationshipUniquenessViolation",
+                        )
+                    bind(
+                        step.variable,
+                        "relationship_list" if step.variable_length else "relationship",
+                    )
+                bind(step.node.variable, "node")
     return scope
 
 
@@ -185,6 +310,12 @@ def _grouping_valid(
     return all(_grouping_valid(child, grouping, aliases) for child in expression.arguments)
 
 
+def _expression_nodes(expression: Expression) -> Iterator[Expression]:
+    yield expression
+    for child in expression.arguments:
+        yield from _expression_nodes(child)
+
+
 class ReadCompiler:
     def __init__(self, parameters: Mapping[str, object]) -> None:
         self.parameters = dict(parameters)
@@ -199,7 +330,15 @@ class ReadCompiler:
         regular = tree.oC_Statement().oC_Query().oC_RegularQuery()
         if regular is None:
             raise QueryError("Expected a read query")
+        self.reserve_variables(regular)
         return self.regular(regular, {})
+
+    def reserve_variables(self, node: Any) -> None:
+        self.state.reserved_variables = frozenset(
+            identifier(variable.getText())
+            for variable in walk(node)
+            if rule(variable) == "oC_Variable"
+        )
 
     def regular(
         self,
@@ -212,24 +351,18 @@ class ReadCompiler:
         unions = node.oC_Union()
         modes = {u.ALL() is not None for u in unions}
         if len(modes) > 1:
-            raise QueryError("Cannot mix UNION and UNION ALL in one query")
+            raise QueryError.syntax(
+                "Cannot mix UNION and UNION ALL in one query", "InvalidClauseComposition"
+            )
         singles = [node.oC_SingleQuery(), *(u.oC_SingleQuery() for u in unions)]
         branches = []
         columns = None
         for single in singles:
-            multi = single.oC_MultiPartQuery()
-            parts = children(multi) if multi is not None else [single.oC_SinglePartQuery()]
-            ordered = []
-            for part in parts:
-                if rule(part) == "oC_SinglePartQuery":
-                    ordered.extend(children(part))
-                else:
-                    ordered.append(part)
             visible = dict(scope)
             initial = dict(scope)
             stages: list[Stage] = []
             returned = None
-            for part in ordered:
+            for part in ordered_clauses(single):
                 kind = rule(part)
                 if kind == "oC_With" and not stages and legacy_outer is not None:
                     imported = self._legacy_import(part, legacy_outer)
@@ -245,12 +378,16 @@ class ReadCompiler:
                     if kind == "oC_Return":
                         returned = tuple(name for name, _ in stage.items)
                 else:
-                    raise QueryError("Updating clauses are not supported in read pipelines")
+                    raise QueryError.unsupported(
+                        "Updating clauses are not supported in read subqueries"
+                    )
                 stages.append(stage)
             if returned is None:
                 raise QueryError("Read queries require a RETURN clause")
             if columns is not None and set(returned) != set(columns):
-                raise QueryError("UNION branches must return the same column names")
+                raise QueryError.syntax(
+                    "UNION branches must return the same column names", "DifferentColumnsInUnion"
+                )
             if columns is None:
                 columns = returned
             branches.append(ReadBranch(initial, tuple(stages), visible))
@@ -291,7 +428,9 @@ class ReadCompiler:
         if unwind is not None:
             variable = identifier(unwind.oC_Variable().getText())
             if variable in scope:
-                raise QueryError(f"Variable already declared: {variable}")
+                raise QueryError.syntax(
+                    f"Variable already declared: {variable}", "VariableAlreadyBound"
+                )
             expression = self.expressions.compile(unwind.oC_Expression(), scope)
             if has_aggregate(expression):
                 raise QueryError("UNWIND cannot contain an aggregate")
@@ -327,34 +466,126 @@ class ReadCompiler:
     def match(
         self, pattern: Any, where: Any, optional: bool, scope: Scope
     ) -> tuple[MatchStage, Scope]:
-        patterns = core._compile_match_patterns(pattern, self.parameters, self.state)
-        # Give property-bearing anonymous relationships an internal identity so
-        # deferred property expressions can be checked after matching as well.
-        patterns = tuple(
-            replace(
-                p,
-                steps=tuple(
-                    replace(s, variable=self.state.next_variable())
-                    if s.variable is None and s.properties
-                    else s
-                    for s in p.steps
-                ),
+        def compile_properties(node: Any) -> dict[str, object]:
+            if node is None or node.oC_MapLiteral() is None:
+                return core._compile_properties(node, self.parameters)
+            literal = node.oC_MapLiteral()
+            return {
+                identifier(key.getText()): (
+                    _PatternExpression(expression)
+                    if any(
+                        rule(part) == "oC_FunctionInvocation"
+                        and identifier(part.oC_FunctionName().getText()).lower()
+                        in TYPED_SCALAR_FUNCTIONS
+                        for part in walk(expression)
+                    )
+                    else core._compile_value_expression(expression, self.parameters)
+                )
+                for key, expression in zip(
+                    literal.oC_PropertyKeyName(), literal.oC_Expression(), strict=True
+                )
+            }
+
+        patterns_list: list[core.CompiledPattern] = []
+        paths = []
+        for part in pattern.oC_PatternPart():
+            alias = part.oC_Variable()
+            compiled = core._compile_pattern_element(
+                part.oC_AnonymousPatternPart().oC_PatternElement(),
+                self.parameters,
+                self.state,
+                allow_relationship_variables=True,
+                allow_ranged_bindings=True,
+                compile_properties=compile_properties,
             )
-            if isinstance(p, core.PathPattern)
-            else p
-            for p in patterns
-        )
+
+            if isinstance(compiled, core.NodePattern):
+                compiled = replace(compiled, variable=identifier(compiled.variable))
+            else:
+                capture = any(
+                    step.variable_length
+                    and ((step.min_hops, step.max_hops) != (1, 1))
+                    and (
+                        alias is not None
+                        or step.variable is not None
+                        or step.properties
+                        or step.direction != "outgoing"
+                        or step.min_hops == 0
+                    )
+                    for step in compiled.steps
+                )
+                compiled = replace(
+                    compiled,
+                    start=replace(compiled.start, variable=identifier(compiled.start.variable)),
+                    capture_relationships=capture,
+                    steps=tuple(
+                        replace(
+                            step,
+                            node=replace(step.node, variable=identifier(step.node.variable)),
+                            variable=(
+                                identifier(step.variable)
+                                if step.variable is not None
+                                else self.state.next_variable()
+                                if alias is not None or step.properties or capture
+                                else None
+                            ),
+                        )
+                        for step in compiled.steps
+                    ),
+                )
+            if alias is not None:
+                name = identifier(alias.getText())
+                if isinstance(compiled, core.NodePattern):
+                    paths.append(PathBinding(name, (compiled.variable,), ()))
+                else:
+                    paths.append(
+                        PathBinding(
+                            name,
+                            (
+                                compiled.start.variable,
+                                *(step.node.variable for step in compiled.steps),
+                            ),
+                            tuple(
+                                step.variable
+                                for step in compiled.steps
+                                if step.variable is not None
+                            ),
+                        )
+                    )
+            patterns_list.append(compiled)
+        patterns = tuple(patterns_list)
         bindings = pattern_bindings(patterns)
         for name, kind in bindings.items():
-            if name in scope and scope[name] not in {kind, "any"}:
+            if name in scope and scope[name] not in {kind, "any", "null"}:
+                if scope[name] == "scalar":
+                    raise QueryError(
+                        f"MATCH after WITH cannot reuse scalar binding '{name}' as a graph entity."
+                    )
                 raise QueryError(f"MATCH variable {name} must be a {kind}")
         visible = scope | {
-            name: kind for name, kind in bindings.items() if not name.startswith("_anon_")
+            name: kind
+            for name, kind in bindings.items()
+            if not name.startswith("_anon_") or name in self.state.reserved_variables
         }
 
+        for path in paths:
+            if path.name in visible:
+                detail = (
+                    "VariableTypeConflict"
+                    if path.name not in scope
+                    and path.name in bindings
+                    and path.name not in (*path.nodes, *path.relationships)
+                    else "VariableAlreadyBound"
+                )
+                raise QueryError.syntax(f"Cannot bind path variable {path.name}.", detail)
+            visible[path.name] = "path"
+
         def check(value: Any) -> None:
-            if isinstance(value, core.PropertyReferenceValue) and value.variable not in visible:
-                raise QueryError(f"Unknown variable: {value.variable}")
+            if (
+                isinstance(value, core.PropertyReferenceValue)
+                and identifier(value.variable) not in visible
+            ):
+                raise QueryError.syntax(f"Unknown variable: {value.variable}", "UndefinedVariable")
             if isinstance(value, dict):
                 for child in value.values():
                     check(child)
@@ -362,15 +593,27 @@ class ReadCompiler:
                 for child in value:
                     check(child)
 
+        def prepare(properties: dict[str, object]) -> None:
+            for key, value in properties.items():
+                if isinstance(value, _PatternExpression):
+                    expression = self.expressions.compile(value.node, visible)
+                    if has_aggregate(expression):
+                        raise QueryError.syntax(
+                            "Pattern properties cannot contain an aggregate.", "InvalidAggregation"
+                        )
+                    properties[key] = expression
+                else:
+                    check(value)
+
         for p in patterns:
             nodes = (
                 [p] if isinstance(p, core.NodePattern) else [p.start, *(s.node for s in p.steps)]
             )
             for n in nodes:
-                check(n.properties)
+                prepare(n.properties)
             if isinstance(p, core.PathPattern):
                 for s in p.steps:
-                    check(s.properties)
+                    prepare(s.properties)
         predicate = (
             None if where is None else self.expressions.compile(where.oC_Expression(), visible)
         )
@@ -378,7 +621,7 @@ class ReadCompiler:
             raise QueryError("MATCH WHERE cannot contain an aggregate")
         if predicate is not None:
             validate_predicate(predicate)
-        return MatchStage(patterns, bindings, predicate, optional), visible
+        return MatchStage(patterns, bindings, predicate, optional, tuple(paths)), visible
 
     def projection(
         self, node: Any, scope: Scope, globals: Scope, *, terminal: bool
@@ -388,7 +631,9 @@ class ReadCompiler:
         items: list[tuple[str, Expression]] = []
         if projection.getText().startswith("*"):
             if not scope:
-                raise QueryError("A star projection requires visible bindings")
+                raise QueryError.syntax(
+                    "A star projection requires visible bindings", "NoVariablesInScope"
+                )
             items.extend((name, Expression("variable", name)) for name in sorted(scope))
         for item in projection.oC_ProjectionItem():
             expression = self.expressions.compile(item.oC_Expression(), scope)
@@ -400,18 +645,26 @@ class ReadCompiler:
             elif terminal:
                 name = item.oC_Expression().getText()
             else:
-                raise QueryError("WITH expressions require an explicit alias")
+                raise QueryError.syntax(
+                    "WITH expressions require an explicit alias", "NoExpressionAlias"
+                )
             if name in globals and expression != Expression("variable", name):
                 raise QueryError(f"Cannot shadow imported variable: {name}")
             items.append((name, expression))
         names = [name for name, _ in items]
         if len(names) != len(set(names)):
-            raise QueryError("Projection defines the same output name more than once")
+            raise QueryError.syntax(
+                "Projection defines the same output name more than once", "ColumnNameConflict"
+            )
         grouping = tuple(expression for _, expression in items if not has_aggregate(expression))
         aggregated = any(has_aggregate(expression) for _, expression in items)
         if aggregated:
             for _, expression in items:
-                if not _grouping_valid(expression, grouping, set()):
+                if has_aggregate(expression) and not _grouping_valid(
+                    expression,
+                    tuple(g for g in grouping if g.kind in {"variable", "property", "literal"}),
+                    set(),
+                ):
                     raise QueryError(
                         "Aggregation references an expression outside the grouping keys"
                     )
@@ -420,10 +673,13 @@ class ReadCompiler:
         predicate = None
         where = node.oC_Where() if not terminal else None
         if where is not None:
-            predicate_scope = (
-                output if aggregated or body.DISTINCT() is not None else scope | output
-            )
-            predicate = self.expressions.compile(where.oC_Expression(), predicate_scope)
+            predicate = self.expressions.compile(where.oC_Expression(), scope | output)
+            if (aggregated or body.DISTINCT() is not None) and not _grouping_valid(
+                predicate, tuple(e for _, e in items), set(output)
+            ):
+                raise QueryError(
+                    "WITH WHERE references a non-projected value after aggregation or DISTINCT"
+                )
             if has_aggregate(predicate):
                 raise QueryError("WITH WHERE must reference projected aggregates by alias")
             validate_predicate(predicate)
@@ -432,8 +688,22 @@ class ReadCompiler:
         if order is not None:
             for part in order.oC_SortItem():
                 expression = self.expressions.compile(part.oC_Expression(), scope | output)
+                projected_aggregates = [
+                    e for _, item in items for e in _expression_nodes(item) if e.kind == "aggregate"
+                ]
+                if any(
+                    e.kind == "aggregate" and e not in projected_aggregates
+                    for e in _expression_nodes(expression)
+                ):
+                    raise QueryError("ORDER BY cannot introduce a non-projected aggregate")
                 if (aggregated or body.DISTINCT() is not None) and not _grouping_valid(
-                    expression, tuple(e for _, e in items), set(projected)
+                    expression,
+                    tuple(
+                        e
+                        for _, e in items
+                        if e.kind in {"variable", "property", "literal", "aggregate"}
+                    ),
+                    set(projected),
                 ):
                     raise QueryError(
                         "ORDER BY references a non-projected value after aggregation or DISTINCT"
@@ -464,7 +734,7 @@ class ReadCompiler:
         regular = node.oC_RegularQuery() if rule(node) == "oC_ExistentialSubquery" else None
         if regular is not None:
             if contains_updates(regular):
-                raise QueryError("EXISTS subqueries cannot write")
+                raise QueryError.unsupported("EXISTS subqueries cannot write")
             return self.regular(regular, scope, globals=scope)
         body = node.oC_ExistentialBody() if rule(node) == "oC_ExistentialSubquery" else None
         stages: list[Stage] = []
@@ -493,13 +763,20 @@ class ReadCompiler:
                 .oC_Match()
             )
             stage, visible = self.match(match.oC_Pattern(), None, False, scope)
+            if any(name not in scope and not name.startswith("_anon_") for name in stage.bindings):
+                raise QueryError("Pattern predicates cannot introduce named variables")
             stages.append(stage)
         return ReadQuery((ReadBranch(dict(scope), tuple(stages), visible),), False, None)
 
 
+@dataclass(frozen=True, slots=True)
+class _PatternExpression:
+    node: Any
+
+
 def _deferred(value: Any) -> bool:
     return (
-        isinstance(value, core.PropertyReferenceValue)
+        isinstance(value, core.PropertyReferenceValue | Expression)
         or isinstance(value, dict)
         and any(_deferred(v) for v in value.values())
         or isinstance(value, list | tuple)
@@ -507,13 +784,15 @@ def _deferred(value: Any) -> bool:
     )
 
 
-def _resolve(value: Any, row: Row) -> Any:
+def _resolve(value: Any, row: Row, evaluator: ExpressionEvaluator) -> Any:
+    if isinstance(value, Expression):
+        return evaluator.evaluate(value, row)
     if isinstance(value, core.PropertyReferenceValue):
-        return property_value(row[value.variable], value.field)
+        return property_value(row[identifier(value.variable)], value.field)
     if isinstance(value, list | tuple):
-        return [_resolve(v, row) for v in value]
+        return [_resolve(v, row, evaluator) for v in value]
     if isinstance(value, dict):
-        return {k: _resolve(v, row) for k, v in value.items()}
+        return {k: _resolve(v, row, evaluator) for k, v in value.items()}
     return value
 
 
@@ -545,7 +824,13 @@ class ReadRuntime:
         self._nodes: dict[int, NodeRecord] = {}
         self._edges: dict[int, EdgeRecord] = {}
         self._match_indexes: dict[tuple[int, tuple[str, ...]], dict[Any, list[Row]]] = {}
-        self.evaluator = ExpressionEvaluator(lambda query, row: bool(self.rows(query, [row])))
+        graph = executor._graph_service
+        self.evaluator = ExpressionEvaluator(
+            lambda query, row: bool(self.rows(query, [row])),
+            transaction_time=graph.transaction_time_ns
+            if isinstance(graph, GraphTransactionUseCase)
+            else None,
+        )
 
     @property
     def state(self) -> GraphState:
@@ -577,30 +862,7 @@ class ReadRuntime:
         for branch in query.branches:
             rows = [{name: row[name] for name in branch.initial_scope} for row in input_rows]
             for stage in branch.stages:
-                if isinstance(stage, MatchStage):
-                    rows = self.match(stage, rows)
-                elif isinstance(stage, UnwindStage):
-                    unwound: list[Row] = []
-                    for row in rows:
-                        value = self.evaluator.evaluate(stage.expression, row)
-                        if value is None:
-                            continue
-                        values = value if isinstance(value, list | tuple) else [value]
-                        unwound.extend(row | {stage.variable: p} for p in values)
-                    rows = unwound
-                elif isinstance(stage, ProjectionStage):
-                    rows = self.project(stage, rows, input_rows[0] if input_rows else {})
-                else:
-                    called: list[Row] = []
-                    for row in rows:
-                        nested = self.rows(stage.query, [row])
-                        called.extend(
-                            row | {name: entry[name] for name in stage.query.columns or ()}
-                            for entry in nested
-                        )
-                        if not nested and stage.optional:
-                            called.append(row | dict.fromkeys(stage.query.columns or ()))
-                    rows = called
+                rows = self.apply_stage(stage, rows, input_rows[0] if input_rows else {})
             if query.columns is not None:
                 rows = [{name: row[name] for name in query.columns} for row in rows]
             result.extend(rows)
@@ -611,6 +873,30 @@ class ReadRuntime:
             result = list(unique.values())
         return result
 
+    def apply_stage(self, stage: Stage, rows: list[Row], seed: Row) -> list[Row]:
+        if isinstance(stage, MatchStage):
+            return self.match(stage, rows)
+        if isinstance(stage, ProjectionStage):
+            return self.project(stage, rows, seed)
+        if isinstance(stage, UnwindStage):
+            unwound: list[Row] = []
+            for row in rows:
+                value = self.evaluator.evaluate(stage.expression, row)
+                if value is None:
+                    continue
+                values = value if isinstance(value, list | tuple) else [value]
+                unwound.extend(row | {stage.variable: p} for p in values)
+            return unwound
+        called: list[Row] = []
+        for row in rows:
+            nested = self.rows(stage.query, [row])
+            called.extend(
+                row | {name: entry[name] for name in stage.query.columns or ()} for entry in nested
+            )
+            if not nested and stage.optional:
+                called.append(row | dict.fromkeys(stage.query.columns or ()))
+        return called
+
     def match(self, stage: MatchStage, rows: list[Row]) -> list[Row]:
         if not rows:
             return []
@@ -618,7 +904,13 @@ class ReadRuntime:
             for variable, kind in stage.bindings.items():
                 if variable not in row or row[variable] is None:
                     continue
-                expected_type = NodeRecord if kind == "node" else EdgeRecord
+                expected_type = (
+                    NodeRecord
+                    if kind == "node"
+                    else list
+                    if kind == "relationship_list"
+                    else EdgeRecord
+                )
                 if not isinstance(row[variable], expected_type):
                     raise QueryError(f"MATCH variable {variable} must be a {kind}")
         shared = tuple(name for name in stage.bindings if name in rows[0])
@@ -639,6 +931,12 @@ class ReadRuntime:
                 )
                 for node in nodes:
                     required_fields[node.variable].update(node.properties)
+            recorded_steps = {
+                step.variable: core._path_edge_id_columns(step)
+                for pattern in patterns
+                if isinstance(pattern, core.PathPattern) and pattern.capture_relationships
+                for step in pattern.steps
+            }
             table = core._match_patterns_table(
                 state.node_table,
                 state.edge_table,
@@ -649,16 +947,28 @@ class ReadRuntime:
             )
             index = {}
             for entry in table.to_pylist():
-                binding = {}
+                binding: Row = {}
                 for variable, kind in stage.bindings.items():
+                    if variable in recorded_steps:
+                        edges = [
+                            self._edges[entry[column]]
+                            for column in recorded_steps[variable]
+                            if entry[column] is not None
+                        ]
+                        binding[variable] = edges if kind == "relationship_list" else edges[0]
+                        continue
                     identity = entry.get(
                         f"{variable}.__id" if kind == "node" else f"{variable}.__entity_id"
                     )
-                    if identity is None and kind == "relationship":
+                    if identity is None and kind in {"relationship", "relationship_list"}:
                         identity = entry.get(f"{variable}.id")
                     binding[variable] = (self._nodes if kind == "node" else self._edges).get(
                         identity
                     )
+                    if kind == "relationship_list" and binding[variable] is not None:
+                        binding[variable] = [binding[variable]]
+                for path in stage.paths:
+                    binding[path.name] = path.value(binding, self._nodes)
                 key = tuple(freeze(binding[name]) for name in shared)
                 index.setdefault(key, []).append(binding)
             self._match_indexes[cache_key] = index
@@ -679,7 +989,9 @@ class ReadRuntime:
                 output.append(joined)
                 found = True
             if stage.optional and not found:
-                output.append(dict.fromkeys(stage.bindings) | row)
+                output.append(
+                    dict.fromkeys((*stage.bindings, *(path.name for path in stage.paths))) | row
+                )
         return output
 
     def _properties(self, patterns: tuple[core.CompiledPattern, ...], row: Row) -> bool:
@@ -696,9 +1008,10 @@ class ReadRuntime:
                     (s.variable, s.properties) for s in pattern.steps if s.variable is not None
                 )
         return all(
-            equal(property_value(row[name], key), _resolve(value, row)) is True
+            equal(property_value(entity, key), _resolve(value, row, self.evaluator)) is True
             for name, props in checks
             for key, value in props.items()
+            for entity in (row[name] if isinstance(row[name], list) else [row[name]])
         )
 
     def project(self, stage: ProjectionStage, rows: list[Row], global_seed: Row) -> list[Row]:

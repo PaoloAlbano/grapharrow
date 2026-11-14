@@ -22,6 +22,7 @@ from grapharrow.core.errors import (
     TransactionError,
     WriteConflictError,
 )
+from grapharrow.use_cases.cypher_expression import public_value
 
 
 class QueryRequest(BaseModel):
@@ -357,7 +358,11 @@ def _register_error_handlers(app: FastAPI) -> None:
         typed_exc = cast(QueryError | TransactionError, exc)
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
-            content=_error(type(typed_exc).__name__.upper(), str(typed_exc)),
+            content=_error(
+                type(typed_exc).__name__.upper(),
+                str(typed_exc),
+                details=typed_exc.metadata() if isinstance(typed_exc, QueryError) else None,
+            ),
         )
 
     app.add_exception_handler(QueryError, query_error_handler)
@@ -395,15 +400,14 @@ def _ok(*, data: dict[str, Any], meta: dict[str, Any] | None = None) -> dict[str
     }
 
 
-def _error(code: str, message: str) -> dict[str, object]:
+def _error(
+    code: str, message: str, *, details: dict[str, str | int | None] | None = None
+) -> dict[str, object]:
     """Wrap REST failures in the common GraphArrow API error envelope."""
-    return {
-        "ok": False,
-        "error": {
-            "code": code,
-            "message": message,
-        },
-    }
+    error: dict[str, object] = {"code": code, "message": message}
+    if details is not None:
+        error["details"] = details
+    return {"ok": False, "error": error}
 
 
 def _create_edge_from_request(
@@ -467,7 +471,7 @@ def _node_payload(node: Any) -> dict[str, object]:
     return {
         "id": node.node_id,
         "labels": list(node.labels),
-        "properties": dict(node.properties),
+        "properties": public_value(node.properties),
     }
 
 
@@ -478,7 +482,7 @@ def _edge_payload(edge: Any) -> dict[str, object]:
         "type": edge.rel_type,
         "source": edge.src_id,
         "target": edge.dst_id,
-        "properties": dict(edge.properties),
+        "properties": public_value(edge.properties),
     }
 
 

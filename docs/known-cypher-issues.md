@@ -1,52 +1,42 @@
-# Known Cypher Issues
+# Cypher Correctness Status
 
 GraphArrow implements an experimental Cypher subset. Accepted syntax does not
-guarantee correct execution. The issues below were reproduced through the
-embedded Python API on 2026-11-08 and remain unresolved in this checkout.
-REST and Bolt use the same Cypher engine. ANA tools have separate execution
-paths; these reproductions do not establish the behavior of individual ANA tools.
+guarantee correct execution. This page distinguishes corrected defects from
+remaining gaps; it is not a claim of complete openCypher compatibility.
 
-See [Cypher V1](cypher-v1.md) for the implemented query families and
+See [Cypher V1](cypher-v1.md) for implemented query families and
 [Transactions and Sessions](transactions.md) for publication and transaction limits.
 
-## Incoming relationship creation
+## Corrections after 0.1.0
+
+The following defects were reproduced through the embedded Python API on
+2026-11-08/09 and corrected in the source tree after the 0.1.0 release. Existing
+0.1.0 artifacts do not contain these corrections.
+
+### Relationship creation direction
 
 ```cypher
 CREATE (:A)<-[:R]-(:B)
 ```
 
-This should create a relationship from B to A. The observed stored relationship
-instead points from A to B. Consequently, the following query returns no rows
-instead of one:
+This now stores a relationship from B to A. Supported `MATCH ... CREATE` and
+row-driven creation paths preserve the same direction. Undirected `CREATE`
+patterns are rejected before graph publication. Related relationship `MERGE`
+paths preserve incoming direction and reuse a reversed existing relationship
+when the merge pattern is undirected.
 
-```cypher
-MATCH (a:A)<-[:R]-(b:B)
-RETURN a, b
-```
-
-An undirected creation pattern, such as `CREATE (a)-[:R]-(b)`, is also accepted
-although openCypher requires an explicit direction for creation.
-
-## Duplicate self-loop matches
+### Self-loop match multiplicity
 
 ```cypher
 CREATE (n:A)-[:LOOP]->(n)
 ```
 
-On this graph, the following undirected match emits the same binding twice
-instead of once:
+An undirected match emits this self-loop once per input binding, including in
+counts. Non-loop relationships still have two orientations in an undirected
+match. Parallel relationships and duplicate input rows keep their multiplicity;
+the correction does not apply a global `DISTINCT`.
 
-```cypher
-MATCH (a)-[r]-(b)
-RETURN a, r, b
-```
-
-This affects row multiplicity and can change aggregate results. Separate parallel
-relationships and other legitimate duplicate rows must retain their multiplicity.
-
-## Null-valued entity properties
-
-Given a node created with `CREATE (:A {property1: 42})`:
+### Null-valued entity properties
 
 ```cypher
 MATCH (n:A)
@@ -54,16 +44,16 @@ SET n.property1 = null
 RETURN n
 ```
 
-Cypher requires the property to be removed. The observed canonical record keeps
-`{"property1": null}`, while the returned node omits the property. Result
-presentation therefore does not establish that persisted property removal is
-correct. The conformance audit also found property side-effect differences in
-CREATE, MERGE and map-update cases involving nulls.
+The property is removed from the canonical record and remains absent after
+reopening the database. Cypher creation omits top-level null properties, and
+supported map updates and `MERGE` actions remove them. A null identity property
+in a `MERGE` pattern is rejected rather than silently omitted.
 
-Null values remain valid scalar values in expressions, lists and maps; this
-issue concerns their interpretation as entity properties during Cypher writes.
+Null values in expressions, lists and nested maps retain their meaning. Native
+property APIs keep their existing ability to store null values; this correction
+applies to Cypher writes.
 
-## Result windows after writes
+### Result windows after writes
 
 ```cypher
 CREATE (n:N {num: 42})
@@ -71,24 +61,90 @@ RETURN n
 LIMIT 0
 ```
 
-The node should be created and the result should contain zero rows. The observed
-result contains one row. The corresponding standalone CREATE case with `SKIP 1`
-also returns the row instead of an empty result. Read-query window optimizations
-do not establish correct write-result windowing.
+The node is created and the result contains zero rows. Standalone `CREATE` and
+node `MERGE` use the shared result finalizer for projection, `DISTINCT`,
+`ORDER BY`, `SKIP` and `LIMIT`, after performing the write. Upstream `WITH`
+windows continue to control which rows reach a subsequent write.
 
-## Incomplete semantic validation and standard coverage
+### Binding validation and client errors
+
+The compiler rejects undefined variables in reads and write values, conflicts
+between node and relationship bindings, repeated relationship variables in one
+match pattern, and known incompatible function or boolean operands. These
+checks also apply to empty matches and unselected boolean operands.
+`RETURN *` requires a visible named binding and orders columns alphabetically.
+
+Explicit property and label reads on deleted entities raise `QueryError` before
+the failing statement publishes a deletion. Capture a needed property with
+`WITH` before `DELETE`. Identity and relationship type metadata remain available.
+Excessive query nesting produces a query-limit error rather than exposing a
+Python recursion exception. This is an implementation limit, not full support
+for arbitrarily nested standard expressions.
+
+### Aggregations, WITH and expression values
+
+- `collect(n)` and `collect(r)` retain complete entities, including alongside
+  `count` on the same variable. Grouped collections omit nulls. Numeric `min`
+  and `max` preserve the selected value's type when inputs mix integers and floats.
+- A `WITH` filter can use incoming bindings without exposing them to later
+  clauses. After grouping or `DISTINCT`, it can also reference an expression
+  that is itself a projected grouping key. Ordering cannot introduce hidden
+  values or new aggregates after such a projection.
+- String literals decode Cypher escapes and Unicode, including in stored nested
+  maps. Negated predicates preserve null values until the final filter.
+- Exponentiation follows the grammar's precedence and returns floating-point
+  values. Explicit null slice bounds produce null; omitted bounds remain open.
+  An exact variable-length binding such as `r*1..1` returns a one-element list.
+- Encoded heterogeneous properties are interpreted as values when comparing or
+  aggregating them; physical JSON strings are not compared as user strings.
+
+### Fixed-length paths and multi-hop writes
+
+Directed `CREATE` supports multiple relationships in one pattern. Fixed-length
+paths can be bound by `MATCH`, `OPTIONAL MATCH`, `CREATE` and `MERGE`.
+The complete path is returned in traversal order, including native Bolt
+hydration. Multi-hop `MERGE` checks the complete pattern before creating
+entities, and conflicts roll back the statement.
+
+Named reads can also return bounded variable-length paths, including
+all intermediate nodes and relationships. The bound applies per segment.
+An explicit zero-length segment can match a single node.
+
+### Regression checks
+
+[Write correctness tests](../tests/unit/test_cypher_write_correctness.py) cover
+stored records, reopening, multiplicity, result windows and transaction behavior.
+[Semantic correctness tests](../tests/unit/test_cypher_semantic_correctness.py)
+cover binding errors, aggregation values, projection scope, escapes, nulls and
+deleted-entity access, including failure without publication.
+[Statement pipeline tests](../tests/unit/test_cypher_statement_pipeline.py)
+cover error classification, successive mutations and rollback after a
+later clause fails.
+[Path tests](../tests/unit/test_cypher_paths.py) and
+[multi-hop MERGE tests](../tests/unit/test_cypher_multihop_merge.py) cover
+ordered paths, null bindings, partial matches and transaction behavior.
+[Interface comparisons](../tests/integration/test_interface_comparison.py)
+exercise the shared engine through embedded, REST and Bolt entry points,
+including Bolt commit/rollback and visibility through MCP and ANA reads.
+[Neo4j reference tests](../tests/integration/test_cypher_reference.py) compare
+representative writes and their persisted effects against a disposable Neo4j
+instance. ANA tools have separate execution paths: read visibility does not
+establish identical write semantics for every ANA tool.
+
+## Remaining semantic validation and standard coverage gaps
 
 The engine is not certified as conformant with the
 [openCypher M23 TCK](https://github.com/opencypher/openCypher/tree/1.0.0-M23/tck).
-Observed gaps include:
+Remaining gaps include:
 
-- some invalid variable bindings or relationship directions are accepted;
-- some queries expose Python or Arrow exceptions instead of a query error;
-- generic errors do not provide a verified openCypher error type, phase and detail;
-- temporal expressions, general procedures, named paths and unrestricted write
-  pipelines are outside the verified executable subset;
-- multiple updating clauses and other initialization shapes can prevent TCK
-  scenarios from reaching the query under test.
+- some errors still have an unclassified detail or differ from the
+  expected openCypher M23 classification;
+- general procedures, unbounded traversal and updates inside subqueries or
+  `UNION` remain outside the supported subset;
+- named time zones are limited to years 1 through 9999, and temporal queries
+  are subject to the same disconnected-pattern restrictions as other queries;
+- unsupported initialization queries can block a TCK scenario during setup;
+- nesting and bounded traversal limits restrict some valid standard queries.
 
 The local unit suite and selected differential tests cover narrower workloads.
 Their passing counts must not be presented as complete openCypher coverage.

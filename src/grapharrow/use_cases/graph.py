@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
+import time
 from collections.abc import Generator, Mapping
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
@@ -15,6 +15,7 @@ import pyarrow as pa  # type: ignore[import-untyped]
 from grapharrow.adapters.adjacency import AdjacencyIndexStore, GraphAdjacency
 from grapharrow.adapters.property_index import PropertyIndexStore
 from grapharrow.adapters.writer import writer_locked
+from grapharrow.core import property_codec
 from grapharrow.core.errors import NotFoundError, QueryError, SchemaError, WriteConflictError
 from grapharrow.domain import (
     CatalogVersion,
@@ -620,6 +621,7 @@ class GraphStateUseCase:
         *,
         node_updates: tuple[tuple[int, str, object], ...],
         edge_updates: tuple[tuple[int, str, object], ...],
+        remove_nulls: bool = False,
     ) -> GraphState:
         """Apply node and edge property updates and publish a new snapshot."""
 
@@ -637,7 +639,10 @@ class GraphStateUseCase:
             if index is None:
                 raise NotFoundError(f"Node does not exist: {node_id}")
             properties = dict(nodes[index].properties)
-            properties[property_name] = value
+            if remove_nulls and value is None:
+                properties.pop(property_name, None)
+            else:
+                properties[property_name] = value
             nodes[index] = NodeRecord(
                 node_id=nodes[index].node_id,
                 labels=nodes[index].labels,
@@ -649,7 +654,10 @@ class GraphStateUseCase:
             if index is None:
                 raise NotFoundError(f"Relationship does not exist: {edge_id}")
             properties = dict(edges[index].properties)
-            properties[property_name] = value
+            if remove_nulls and value is None:
+                properties.pop(property_name, None)
+            else:
+                properties[property_name] = value
             edges[index] = EdgeRecord(
                 edge_id=edges[index].edge_id,
                 rel_type=edges[index].rel_type,
@@ -978,6 +986,8 @@ class GraphStateUseCase:
         new_nodes: tuple[NodeRecord, ...],
     ) -> None:
         """Validate incoming nodes incrementally so uniqueness checks see earlier inserts too."""
+        if not catalog.constraints and all(prop.nullable for prop in catalog.properties):
+            return
         candidate_nodes = list(existing_nodes)
         for node in new_nodes:
             self._validate_node(catalog=catalog, nodes=tuple(candidate_nodes), node=node)
@@ -1137,13 +1147,15 @@ class GraphStateUseCase:
         edges: tuple[EdgeRecord, ...],
     ) -> None:
         """Re-run graph-wide validation after updates or deletes that may affect many records."""
-        for node in nodes:
-            other_nodes = tuple(
-                candidate for candidate in nodes if candidate.node_id != node.node_id
-            )
-            self._validate_node(catalog=catalog, nodes=other_nodes, node=node)
+        if catalog.constraints or any(not prop.nullable for prop in catalog.properties):
+            for node in nodes:
+                other_nodes = tuple(
+                    candidate for candidate in nodes if candidate.node_id != node.node_id
+                )
+                self._validate_node(catalog=catalog, nodes=other_nodes, node=node)
+        nodes_by_id = _nodes_by_id(nodes)
         for edge in edges:
-            self._validate_edge(catalog=catalog, nodes=nodes, edge=edge)
+            self._validate_edge(catalog=catalog, nodes=nodes, nodes_by_id=nodes_by_id, edge=edge)
 
     def _materialize_new_edges(
         self,
@@ -1182,10 +1194,24 @@ class GraphTransactionUseCase:
         self._graph_service = graph_service
         with graph_service.writer_lock():
             self._base_state = graph_service.load_state()
+        self.transaction_time_ns = time.time_ns()
         self._state = self._base_state
         self._closed = False
         self._adjacency_table: pa.Table | None = None
         self._adjacency_index: GraphAdjacency | None = None
+
+    @contextmanager
+    def statement(self) -> Generator[None, None, None]:
+        """Keep earlier transaction changes if an updating statement fails."""
+        self._ensure_open()
+        before = self._state
+        try:
+            yield
+        except BaseException:
+            self._state = before
+            self._adjacency_table = None
+            self._adjacency_index = None
+            raise
 
     def adjacency_for_state(self, state: GraphState | GraphTabularState) -> GraphAdjacency | None:
         """Share published positions only for the exact base table; isolate overlays."""
@@ -1218,6 +1244,26 @@ class GraphTransactionUseCase:
             node_table=self._state.node_table,
             edge_table=self._state.edge_table if include_edges else EDGE_SCHEMA.empty_table(),
         )
+
+    def replace_records(
+        self, nodes: tuple[NodeRecord, ...], edges: tuple[EdgeRecord, ...]
+    ) -> GraphState:
+        """Validate and stage the records produced by one updating clause."""
+        self._ensure_open()
+        if (
+            len(nodes) == len(self._state.nodes)
+            and len(edges) == len(self._state.edges)
+            and all(new is old for new, old in zip(nodes, self._state.nodes, strict=True))
+            and all(new is old for new, old in zip(edges, self._state.edges, strict=True))
+        ):
+            return self._state
+        catalog = self._graph_service._ensure_catalog(
+            self._state.catalog,
+            labels=tuple(label for node in nodes for label in node.labels),
+            rel_types=tuple(edge.rel_type for edge in edges),
+        )
+        self._graph_service._validate_full_graph(catalog=catalog, nodes=nodes, edges=edges)
+        return self._replace_state(catalog=catalog, nodes=list(nodes), edges=list(edges))
 
     def publish_records(
         self,
@@ -1309,6 +1355,7 @@ class GraphTransactionUseCase:
         *,
         node_updates: tuple[tuple[int, str, object], ...],
         edge_updates: tuple[tuple[int, str, object], ...],
+        remove_nulls: bool = False,
     ) -> GraphState:
         """Apply property updates inside the transaction-local state."""
 
@@ -1326,7 +1373,10 @@ class GraphTransactionUseCase:
             if index is None:
                 raise NotFoundError(f"Node does not exist: {node_id}")
             properties = dict(nodes[index].properties)
-            properties[property_name] = value
+            if remove_nulls and value is None:
+                properties.pop(property_name, None)
+            else:
+                properties[property_name] = value
             nodes[index] = NodeRecord(
                 node_id=nodes[index].node_id,
                 labels=nodes[index].labels,
@@ -1338,7 +1388,10 @@ class GraphTransactionUseCase:
             if index is None:
                 raise NotFoundError(f"Relationship does not exist: {edge_id}")
             properties = dict(edges[index].properties)
-            properties[property_name] = value
+            if remove_nulls and value is None:
+                properties.pop(property_name, None)
+            else:
+                properties[property_name] = value
             edges[index] = EdgeRecord(
                 edge_id=edges[index].edge_id,
                 rel_type=edges[index].rel_type,
@@ -1480,8 +1533,10 @@ class GraphTransactionUseCase:
         for node_id in node_id_set:
             if any(edge.src_id == node_id or edge.dst_id == node_id for edge in remaining_edges):
                 raise QueryError(
-                    "DELETE on nodes with existing relationships is not supported yet. "
-                    "Delete relationships first."
+                    "DELETE cannot remove a node with existing relationships.",
+                    category="ConstraintVerificationFailed",
+                    phase="runtime",
+                    detail="DeleteConnectedNode",
                 )
 
         remaining_nodes = [node for node in self._state.nodes if node.node_id not in node_id_set]
@@ -1540,7 +1595,7 @@ class GraphTransactionUseCase:
                     type=pa.list_(pa.string()),
                 ),
                 "properties_json": pa.array(
-                    [json.dumps(node.properties, sort_keys=True) for node in nodes],
+                    [property_codec.dumps(node.properties) for node in nodes],
                     type=pa.string(),
                 ),
             },
@@ -1553,7 +1608,7 @@ class GraphTransactionUseCase:
                 "src_id": pa.array([edge.src_id for edge in edges], type=pa.int64()),
                 "dst_id": pa.array([edge.dst_id for edge in edges], type=pa.int64()),
                 "properties_json": pa.array(
-                    [json.dumps(edge.properties, sort_keys=True) for edge in edges],
+                    [property_codec.dumps(edge.properties) for edge in edges],
                     type=pa.string(),
                 ),
             },

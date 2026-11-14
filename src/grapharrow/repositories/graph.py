@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,7 +11,7 @@ from typing import cast
 import pyarrow as pa  # type: ignore[import-untyped]
 
 from grapharrow.adapters import FileSystemAdapter, ParquetAdapter, PyArrowTabularAdapter
-from grapharrow.core import DatabaseLayout, Location
+from grapharrow.core import DatabaseLayout, Location, property_codec
 from grapharrow.domain import DatasetFile, SnapshotId, SnapshotManifest
 from grapharrow.domain.scan import ScanPredicate
 from grapharrow.domain.snapshot import DatasetKind
@@ -236,7 +235,7 @@ class GraphRepository:
                 NodeRecord(
                     node_id=int(node_id),
                     labels=tuple(labels or []),
-                    properties=json.loads(properties_json),
+                    properties=property_codec.loads(properties_json),
                 )
             )
         return records
@@ -264,7 +263,7 @@ class GraphRepository:
                     rel_type=str(rel_type),
                     src_id=int(src_id),
                     dst_id=int(dst_id),
-                    properties=json.loads(properties_json),
+                    properties=property_codec.loads(properties_json),
                 )
             )
         return records
@@ -777,7 +776,7 @@ def _nodes_table(records: list[NodeRecord]) -> pa.Table:
                 type=pa.list_(pa.string()),
             ),
             "properties_json": pa.array(
-                [json.dumps(record.properties, sort_keys=True) for record in records],
+                [property_codec.dumps(record.properties) for record in records],
                 type=pa.string(),
             ),
         },
@@ -794,7 +793,7 @@ def _edges_table(records: list[EdgeRecord]) -> pa.Table:
             "src_id": pa.array([record.src_id for record in records], type=pa.int64()),
             "dst_id": pa.array([record.dst_id for record in records], type=pa.int64()),
             "properties_json": pa.array(
-                [json.dumps(record.properties, sort_keys=True) for record in records],
+                [property_codec.dumps(record.properties) for record in records],
                 type=pa.string(),
             ),
         },
@@ -808,32 +807,28 @@ def _node_property_table(records: list[NodeRecord]) -> pa.Table:
     columns: dict[str, pa.Array] = {
         "node_id": pa.array([record.node_id for record in records], type=pa.int64()),
     }
-    for property_name in property_names:
-        columns[property_name] = _property_column_array(
-            [record.properties.get(property_name) for record in records]
+    fields = [
+        pa.field(
+            "node_id",
+            pa.int64(),
+            metadata={"grapharrow.encoding": "reserved-collision"}
+            if "node_id" in property_names
+            else None,
         )
-    fields = []
-    for name in columns:
-        if name == "node_id":
-            fields.append(
-                pa.field(
-                    name,
-                    columns[name].type,
-                    metadata={"grapharrow.encoding": "reserved-collision"}
-                    if name in property_names
-                    else None,
-                )
-            )
+    ]
+    for property_name in property_names:
+        if property_name == "node_id":
             continue
-        values = [record.properties.get(name) for record in records]
+        values = [record.properties.get(property_name) for record in records]
+        array = _property_column_array(values)
+        columns[property_name] = array
         types = {type(value) for value in values if value is not None}
         encoding = "native" if len(types) <= 1 and types <= {str, bool, int, float} else "json"
         if types and types <= {int, float} and len(types) > 1:
             encoding = "lossy"
         fields.append(
-            pa.field(name, columns[name].type, metadata={"grapharrow.encoding": encoding})
+            pa.field(property_name, array.type, metadata={"grapharrow.encoding": encoding})
         )
-    # Older projections without encoding metadata remain readable through the canonical fallback.
     return pa.Table.from_arrays(list(columns.values()), schema=pa.schema(fields))
 
 
@@ -845,11 +840,17 @@ def _edge_property_table(records: list[EdgeRecord]) -> pa.Table:
         "src_id": pa.array([record.src_id for record in records], type=pa.int64()),
         "dst_id": pa.array([record.dst_id for record in records], type=pa.int64()),
     }
+    metadata = {}
     for property_name in property_names:
-        columns[property_name] = _property_column_array(
-            [record.properties.get(property_name) for record in records]
-        )
-    return pa.table(columns)
+        values = [record.properties.get(property_name) for record in records]
+        array = _property_column_array(values)
+        columns[property_name] = array
+        if any(property_codec.contains_temporal(value) for value in values):
+            metadata[property_name] = {"grapharrow.encoding": "temporal"}
+    fields = [
+        pa.field(name, array.type, metadata=metadata.get(name)) for name, array in columns.items()
+    ]
+    return pa.Table.from_arrays(list(columns.values()), schema=pa.schema(fields))
 
 
 def _property_column_array(values: list[object]) -> pa.Array:
@@ -869,7 +870,7 @@ def _property_column_array(values: list[object]) -> pa.Array:
     if all(isinstance(value, str) for value in non_null):
         return pa.array(values, type=pa.string())
     return pa.array(
-        [json.dumps(value, sort_keys=True) if value is not None else None for value in values],
+        [property_codec.dumps(value) if value is not None else None for value in values],
         type=pa.string(),
     )
 

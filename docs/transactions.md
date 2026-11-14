@@ -12,6 +12,21 @@ embedded helper methods do not imply identical semantics to Bolt transactions.
 | MCP Cypher `query` / `write_cypher` | Current published state per call | `query` rejects writes; successful `write_cypher` calls publish |
 | Bolt autocommit | Current published state for the statement | Successful write statements publish |
 | Bolt explicit transaction | Transaction-local state, including its own writes | Changes are held in memory until `COMMIT`; `ROLLBACK` discards them |
+
+## Cypher Statement Atomicity
+
+An updating graph statement stages its changes in memory, including the
+catalog entries for new labels and relationship types. Later clauses in
+the same statement can read those changes. Errors during compilation,
+execution, constraint validation or result evaluation leave the graph
+and catalog as they were before the statement. A successful autocommit
+statement publishes at most one snapshot.
+
+Within an explicit Bolt transaction, a failed statement discards its own
+changes. The connection enters Bolt's failed state and the client can
+roll back or reset the transaction. See
+[Writer Coordination and Storage Limits](#writer-coordination-and-storage-limits)
+for publication failures and storage durability.
 | ANA workflow | Snapshot captured when the workflow is created | All current tools are read-only; create a new workflow to see later commits |
 
 ## Embedded Context Managers

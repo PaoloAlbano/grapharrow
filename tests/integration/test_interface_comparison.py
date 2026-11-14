@@ -11,8 +11,10 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 from neo4j import GraphDatabase
+from neo4j.exceptions import Neo4jError
 
 from grapharrow.config import GraphArrowSettings
+from grapharrow.core.errors import QueryError
 from grapharrow.database import Database
 from grapharrow.interfaces.bolt import run_bolt_server
 from grapharrow.interfaces.mcp_cypher import create_mcp_cypher_interface
@@ -479,3 +481,309 @@ def test_writes_are_visible_across_interfaces_with_ana_snapshot_isolation(
     report["new_session"] = interfaces.fetch(fresh, after["handle"])["rows"]
     assert report["new_session"] == [{"count": 6}]
     report["passed"] = True
+
+
+@pytest.mark.parametrize("writer", ["embedded", "rest", "bolt"])
+def test_write_correctness_is_visible_through_every_interface(
+    interfaces: Interfaces, writer: str
+) -> None:
+    interfaces.write(writer, 'CREATE (:FixA {name:"a"})<-[:FIXED]-(:FixB {name:"b"})', {})
+    expected = {"columns": ["a", "b"], "rows": [{"a": "a", "b": "b"}]}
+    results = interfaces.read_cypher(
+        "MATCH (a:FixA)<-[:FIXED]-(b:FixB) RETURN a.name AS a,b.name AS b", {}
+    )
+    assert all(result == expected for result in results.values()), results
+    headers = interfaces.session()
+    try:
+        response = interfaces.call(
+            headers,
+            "pattern_query",
+            {
+                "start_label": "FixA",
+                "start_as": "a",
+                "hops": [
+                    {
+                        "relationship_type": "FIXED",
+                        "direction": "in",
+                        "target_label": "FixB",
+                        "as": "b",
+                    }
+                ],
+                "select": [
+                    {"var": "a", "property": "name", "alias": "a"},
+                    {"var": "b", "property": "name", "alias": "b"},
+                ],
+            },
+        )
+        assert interfaces.fetch(headers, response["handle"]) == expected
+    finally:
+        assert interfaces.rest.delete("/sessions/current", headers=headers).status_code == 204
+
+    interfaces.write(writer, "CREATE (n:FixLoop)-[:FIXLOOP]->(n)", {})
+    results = interfaces.read_cypher(
+        "MATCH (n:FixLoop)-[r:FIXLOOP]-(n) RETURN count(r) AS total", {}
+    )
+    assert all(result["rows"] == [{"total": 1}] for result in results.values()), results
+
+    interfaces.write(writer, 'CREATE (:FixNull {name:"keep",p:42})', {})
+    interfaces.write(writer, "MATCH (n:FixNull) SET n.p=null", {})
+    results = interfaces.read_cypher("MATCH (n:FixNull) RETURN keys(n) AS props", {})
+    assert all(result["rows"] == [{"props": ["name"]}] for result in results.values()), results
+
+    query = "CREATE (n:FixWindow) RETURN n LIMIT 0"
+    if writer == "embedded":
+        with interfaces.embedded.write_transaction() as session:
+            result = session.query(query)
+            assert result.columns == ("n",) and result.rows == ()
+    elif writer == "rest":
+        assert interfaces.rest_query(query, {}) == {"columns": ["n"], "rows": []}
+    else:
+        with interfaces.bolt.session() as session:
+            result = session.run(query)
+            assert list(result.keys()) == ["n"] and result.data() == []
+    results = interfaces.read_cypher("MATCH (n:FixWindow) RETURN count(n) AS total", {})
+    assert all(result["rows"] == [{"total": 1}] for result in results.values()), results
+
+
+def test_bolt_null_property_removal_commit_and_rollback(interfaces: Interfaces) -> None:
+    interfaces.write("embedded", "CREATE (:TxNull {p:42})", {})
+    with interfaces.bolt.session() as session:
+        tx = session.begin_transaction()
+        assert tx.run("MATCH (n:TxNull) SET n.p=null RETURN n.p AS p").data() == [{"p": None}]
+        assert interfaces.rest_query("MATCH (n:TxNull) RETURN n.p AS p", {})["rows"] == [{"p": 42}]
+        tx.rollback()
+        assert interfaces.rest_query("MATCH (n:TxNull) RETURN n.p AS p", {})["rows"] == [{"p": 42}]
+        tx = session.begin_transaction()
+        tx.run("MATCH (n:TxNull) SET n.p=null").consume()
+        tx.commit()
+    results = interfaces.read_cypher("MATCH (n:TxNull) RETURN keys(n) AS props", {})
+    assert all(result["rows"] == [{"props": []}] for result in results.values()), results
+
+
+@pytest.mark.parametrize(
+    "query,expected",
+    [
+        (
+            "MATCH (p:Person) WITH p.name AS name WHERE p.name='Alice' RETURN name",
+            [{"name": "Alice"}],
+        ),
+        ("RETURN [1,2,3][null..] AS value", [{"value": None}]),
+        (r"RETURN '\u01FF' AS value", [{"value": "ǿ"}]),
+        ("RETURN 4^3*2^3 AS value", [{"value": 512.0}]),
+        ("UNWIND [1,2.0,5,null] AS x RETURN max(x) AS value", [{"value": 5}]),
+        ("RETURN range(3,-1,-2) AS xs", [{"xs": [3, 1, -1]}]),
+        (
+            "MATCH (p:Person {name:'Alice'}) "
+            "RETURN properties(head([p])).name AS name, last([1,2]) AS last, tail([1,2]) AS tail",
+            [{"name": "Alice", "last": 2, "tail": [2]}],
+        ),
+        (
+            "RETURN toInteger('-42.9') AS i, toFloat('1.2e2') AS f, "
+            "toBoolean(' TRUE ') AS b, toString(false) AS s, sign(-3) AS sign",
+            [{"i": -42, "f": 120.0, "b": True, "s": "false", "sign": -1}],
+        ),
+        (
+            "RETURN toString(toFloat('NaN')) AS nan, toString(toFloat('-Infinity')) AS inf",
+            [{"nan": "NaN", "inf": "-Infinity"}],
+        ),
+        (
+            "MATCH (p:Person) OPTIONAL MATCH (p)-[:MISSING]->(x) "
+            "RETURN p.name AS name,collect(x) AS nodes ORDER BY name",
+            [{"name": name, "nodes": []} for name in ["Alex", "Alice", "Bob", "Carol"]],
+        ),
+    ],
+)
+def test_semantic_results_match_across_query_interfaces(
+    interfaces: Interfaces, query: str, expected: list[dict[str, Any]]
+) -> None:
+    results = interfaces.read_cypher(query, {})
+    assert all(result["rows"] == expected for result in results.values()), results
+
+
+def test_persisted_temporal_values_across_interfaces(interfaces: Interfaces) -> None:
+    from neo4j.time import Date, Duration
+
+    with interfaces.bolt.session() as session:
+        session.run(
+            "CREATE (:Event {day:$day})-[:LASTS {elapsed:$elapsed}]->(:End)",
+            day=Date(2024, 2, 29),
+            elapsed=Duration(seconds=1, nanoseconds=2),
+        ).consume()
+
+    query = "MATCH (e:Event)-[r:LASTS]->() RETURN e.day AS day, r.elapsed AS elapsed"
+    results = interfaces.read_cypher(query, {})
+    for name in ("embedded", "rest", "mcp"):
+        assert results[name]["rows"] == [{"day": "2024-02-29", "elapsed": "PT1.000000002S"}]
+    assert results["bolt"]["rows"] == [
+        {"day": Date(2024, 2, 29), "elapsed": Duration(seconds=1, nanoseconds=2)}
+    ]
+
+    headers = interfaces.session()
+    try:
+        result = interfaces.call(
+            headers,
+            "pattern_query",
+            {
+                "start_label": "Event",
+                "start_as": "e",
+                "hops": [
+                    {
+                        "relationship_type": "LASTS",
+                        "direction": "out",
+                        "target_label": "End",
+                        "as": "end",
+                    }
+                ],
+                "select": [{"var": "e", "property": "day", "alias": "day"}],
+            },
+        )
+        assert interfaces.fetch(headers, result["handle"])["rows"] == [{"day": "2024-02-29"}]
+        result = interfaces.call(
+            headers, "node_search", {"label": "Event", "property": "day", "value": "2024-02-29"}
+        )
+        assert result["matched_count"] == 1
+    finally:
+        assert interfaces.rest.delete("/sessions/current", headers=headers).status_code == 204
+
+
+@pytest.mark.parametrize(
+    ("query", "category", "phase", "detail"),
+    [
+        ("RETURN )", "SyntaxError", "compile", "UnexpectedSyntax"),
+        ("MATCH (r)-[r]->() RETURN r", "SyntaxError", "compile", "VariableTypeConflict"),
+        ("MATCH (n) RETURN missing.p", "SyntaxError", "compile", "UndefinedVariable"),
+        ("RETURN false AND 123 AS value", "SyntaxError", "compile", "InvalidArgumentType"),
+        ("RETURN $missing", "ParameterMissing", "compile", "MissingParameter"),
+        ("RETURN 1/0", "ArithmeticError", "runtime", "DivisionByZero"),
+        ("RETURN range(1,3,0)", "ArgumentError", "runtime", "NumberOutOfRange"),
+        ("RETURN toFloat(true)", "TypeError", "runtime", "InvalidArgumentValue"),
+    ],
+)
+def test_query_error_metadata_matches_across_interfaces(
+    interfaces: Interfaces, query: str, category: str, phase: str, detail: str
+) -> None:
+    with interfaces.embedded.read_transaction() as session, pytest.raises(QueryError) as embedded:
+        session.query(query)
+    expected = embedded.value.metadata()
+    assert (expected["category"], expected["phase"], expected["detail"]) == (
+        category,
+        phase,
+        detail,
+    )
+    response = interfaces.rest.post(
+        "/v1/query", headers={"Authorization": "Bearer rest-secret"}, json={"query": query}
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"] == {
+        "code": "QUERYERROR",
+        "message": str(embedded.value),
+        "details": expected,
+    }
+    with interfaces.bolt.session() as session, pytest.raises(Neo4jError) as bolt:
+        session.run(query).consume()
+    assert bolt.value.code == expected["code"]
+    assert bolt.value._metadata["grapharrow_error"] == expected
+    with pytest.raises(QueryError) as mcp:
+        interfaces.mcp.call_tool("query", {"query": query})
+    assert mcp.value.metadata() == expected
+
+
+@pytest.mark.parametrize("interface", ["embedded", "rest", "bolt", "mcp"])
+def test_write_pipeline_is_atomic_across_interfaces(interfaces: Interfaces, interface: str) -> None:
+    graph = interfaces.embedded._app.use_cases.graph
+    before = graph.load_state()
+    query = "CREATE (:Scratch) WITH 0 AS x CREATE (:Other {p:1/x})"
+    if interface == "rest":
+        response = interfaces.rest.post(
+            "/v1/query", headers={"Authorization": "Bearer rest-secret"}, json={"query": query}
+        )
+        assert response.status_code == 400
+        assert response.json()["error"]["details"]["detail"] == "DivisionByZero"
+    elif interface == "bolt":
+        with pytest.raises(Neo4jError) as caught:
+            interfaces.write(interface, query, {})
+        assert caught.value._metadata["grapharrow_error"]["detail"] == "DivisionByZero"
+    else:
+        with pytest.raises(QueryError) as error:
+            interfaces.write(interface, query, {})
+        assert error.value.detail == "DivisionByZero"
+    assert graph.load_state() == before
+
+    interfaces.write(
+        interface,
+        "UNWIND [1,2,3] AS x CREATE (n:Pipeline {x:x}) WITH n SET n.value=n.x*2 REMOVE n.x",
+        {},
+    )
+    assert graph.load_state().snapshot.snapshot_id.value == before.snapshot.snapshot_id.value + 1
+    results = interfaces.read_cypher(
+        "MATCH (n:Pipeline) RETURN n.value AS value ORDER BY value", {}
+    )
+    assert all(
+        result["rows"] == [{"value": 2}, {"value": 4}, {"value": 6}] for result in results.values()
+    )
+
+
+def test_bolt_explicit_pipeline_visibility_and_commit(interfaces: Interfaces) -> None:
+    graph = interfaces.embedded._app.use_cases.graph
+    before = graph.load_state().snapshot.snapshot_id.value
+    verify = "MATCH (n:PrivatePipeline) RETURN count(n) AS n"
+    with interfaces.bolt.session() as session:
+        tx = session.begin_transaction()
+        assert tx.run(
+            "UNWIND [1,2] AS x CREATE (n:PrivatePipeline {x:x}) "
+            "WITH n SET n.x=n.x*10 RETURN sum(n.x) AS total"
+        ).data() == [{"total": 30}]
+        assert tx.run(verify).data() == [{"n": 2}]
+        assert interfaces.rest_query(verify, {})["rows"] == [{"n": 0}]
+        tx.commit()
+    assert interfaces.rest_query(verify, {})["rows"] == [{"n": 2}]
+    assert graph.load_state().snapshot.snapshot_id.value == before + 1
+
+
+def test_named_path_round_trips_through_public_interfaces(interfaces: Interfaces) -> None:
+    from neo4j.graph import Path as BoltPath
+
+    query = (
+        "CREATE p = (a:PathA)-[:FIRST]->(:PathB)<-[:SECOND]-(:PathC) SET a.ready = true RETURN p"
+    )
+    with interfaces.bolt.session() as session:
+        written = session.run(query).single()["p"]
+        assert isinstance(written, BoltPath)
+        assert dict(written.nodes[0]) == {"ready": True}
+        read = "MATCH p = (:PathA)-[:FIRST]->(:PathB)<-[:SECOND]-(:PathC) RETURN p, [p] AS nested"
+        bolt = session.run(read).single()
+        assert isinstance(bolt["p"], BoltPath)
+        assert bolt["p"] == bolt["nested"][0]
+        assert bolt["p"].relationships[1].start_node == bolt["p"].nodes[2]
+        assert bolt["p"].relationships[1].end_node == bolt["p"].nodes[1]
+    with interfaces.embedded.read_transaction() as session:
+        embedded = list(session.query(read).rows)
+    assert interfaces.rest_query(read, {})["rows"] == embedded
+    assert interfaces.mcp.call_tool("query", {"query": read})["rows"] == embedded
+    assert [node["labels"] for node in embedded[0]["p"]["nodes"]] == [
+        ["PathA"],
+        ["PathB"],
+        ["PathC"],
+    ]
+
+
+def test_variable_length_paths_round_trip_through_public_interfaces(interfaces: Interfaces) -> None:
+    from neo4j.graph import Path as BoltPath
+
+    interfaces.write("embedded", "CREATE (:PathA)<-[:STEP]-(:PathB)<-[:STEP]-(:PathC)", {})
+    query = "MATCH p=(:PathA)<-[:STEP*0..2]-() RETURN p,length(p) AS n ORDER BY n"
+    with interfaces.embedded.read_transaction() as session:
+        expected = list(session.query(query).rows)
+    assert [row["n"] for row in expected] == [0, 1, 2]
+    assert interfaces.rest_query(query, {})["rows"] == expected
+    assert interfaces.mcp.call_tool("query", {"query": query})["rows"] == expected
+    with interfaces.bolt.session() as session:
+        rows = list(session.run(query))
+        assert [row["n"] for row in rows] == [0, 1, 2]
+        for row, comparison in zip(rows, expected, strict=True):
+            path = row["p"]
+            assert isinstance(path, BoltPath)
+            assert [sorted(node.labels) for node in path.nodes] == [
+                node["labels"] for node in comparison["p"]["nodes"]
+            ]
+            assert list(edge.start_node for edge in path.relationships) == list(path.nodes[1:])

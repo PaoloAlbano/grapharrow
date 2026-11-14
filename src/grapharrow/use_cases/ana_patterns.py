@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import sys
 from collections import defaultdict
@@ -32,6 +31,7 @@ from grapharrow.ana.values import (
     _validate_membership_operand,
     equal,
 )
+from grapharrow.core import property_codec
 from grapharrow.use_cases.ana_seed import select_node_ids
 
 _BATCH_SOURCE_THRESHOLD = 8
@@ -256,7 +256,9 @@ def iter_extend_rows(
                             "type": rel_type,
                             "start": str(edge["src_id"]),
                             "end": str(edge["dst_id"]),
-                            "properties": json.loads(edge["properties_json"]),
+                            "properties": property_codec.loads(
+                                edge["properties_json"], public=True
+                            ),
                         },
                         "__rel_ids": [*row.get("__rel_ids", []), edge_id],
                     }

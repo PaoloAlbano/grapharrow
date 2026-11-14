@@ -17,6 +17,7 @@ from grapharrow.ana.values import (
     _int_arg,
     _token_variants,
 )
+from grapharrow.core import property_codec
 
 
 def entity_resolve(backend: Any, args: dict[str, Any]) -> dict[str, Any]:
@@ -519,11 +520,11 @@ def _search_rows(
                 if any(value is None for value in row.values()):
                     # Projections conflate absent properties and explicit nulls.
                     raw = backend._state.node_table["properties_json"][backend._positions[node_id]]
-                    yield node_id, json.loads(raw.as_py())
+                    yield node_id, property_codec.loads(raw.as_py(), public=True)
                 else:
                     try:
                         for prop in encoded:
-                            row[prop] = json.loads(row[prop])
+                            row[prop] = property_codec.loads(row[prop], public=True)
                     except (ValueError, TypeError):
                         if not require_all_properties:
                             raise
@@ -533,7 +534,7 @@ def _search_rows(
                         raw = backend._state.node_table["properties_json"][
                             backend._positions[node_id]
                         ]
-                        yield node_id, json.loads(raw.as_py())
+                        yield node_id, property_codec.loads(raw.as_py(), public=True)
                     else:
                         yield node_id, row
             return
@@ -542,7 +543,7 @@ def _search_rows(
     for row in (
         backend._state.node_table.select(["node_id", "properties_json"]).take(positions).to_pylist()
     ):
-        yield row["node_id"], json.loads(row["properties_json"])
+        yield row["node_id"], property_codec.loads(row["properties_json"], public=True)
 
 
 def _string_value_candidates(

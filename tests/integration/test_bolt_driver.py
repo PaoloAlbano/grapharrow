@@ -4,6 +4,7 @@ import pytest
 from neo4j import GraphDatabase, basic_auth
 from neo4j.exceptions import AuthError, Neo4jError
 from neo4j.graph import Node, Relationship
+from neo4j.time import Date, DateTime, Duration, Time
 
 from grapharrow.config import GraphArrowSettings
 from grapharrow.interfaces.bolt import build_bolt_application, run_bolt_server
@@ -19,6 +20,56 @@ def test_bolt_application_uses_configured_server_agent(tmp_path: Path) -> None:
     app = build_bolt_application(database_path, settings=settings)
 
     assert app.server_agent == "Neo4j/5.26.0"
+
+
+@pytest.mark.integration
+def test_bolt_temporal_parameters_and_results_round_trip(tmp_path: Path) -> None:
+    path = tmp_path / "db"
+    settings = GraphArrowSettings(database_path=path, bolt_host="127.0.0.1", bolt_port=0)
+    with (
+        run_bolt_server(path, settings=settings) as handle,
+        GraphDatabase.driver(f"bolt://127.0.0.1:{handle.port}", auth=None) as driver,
+        driver.session() as session,
+    ):
+        record = session.run(
+            "RETURN date('2024-02-29') AS d, localtime('02:30:00.000000001') AS lt, "
+            "time('02:30:00.000000002+01:00') AS t, "
+            "localdatetime('2023-10-29T02:30:00.000000003') AS ldt, "
+            "datetime('2023-10-29T02:30:00.000000004+01:00[Europe/Rome]') AS dt, "
+            "datetime('1969-12-31T23:59:59.999999999+01:00') AS offset, "
+            "duration('PT-0.000000001S') AS span"
+        ).single(strict=True)
+        assert isinstance(record["d"], Date)
+        assert isinstance(record["lt"], Time)
+        assert isinstance(record["t"], Time)
+        assert isinstance(record["ldt"], DateTime)
+        assert isinstance(record["dt"], DateTime)
+        assert isinstance(record["offset"], DateTime)
+        assert isinstance(record["span"], Duration)
+        assert record["dt"].utcoffset().total_seconds() == 3600
+        assert record["dt"].nanosecond == 4
+        with pytest.raises(Neo4jError, match="Unknown temporal"):
+            session.run(
+                "CREATE (n:Event {d:$values.d, dt:$values.dt}) RETURN n.dt.nanoSecond",
+                values=record.data(),
+            ).consume()
+        result = session.run(
+            "CREATE (n:Event {d:$values.d, dt:$values.dt}) RETURN n, $values AS echoed",
+            values=record.data(),
+        ).single(strict=True)
+        assert result["echoed"] == record.data()
+        assert result["n"]["dt"] == record["dt"]
+        assert result["n"]["d"] == record["d"]
+        assert (
+            session.run(
+                "MATCH (n:Event) WHERE n.d=$date RETURN count(n) AS found", date=record["d"]
+            ).single(strict=True)["found"]
+            == 1
+        )
+        with session.begin_transaction() as tx:
+            first = tx.run("RETURN datetime.transaction() AS now").single(strict=True)["now"]
+            second = tx.run("RETURN datetime.transaction() AS now").single(strict=True)["now"]
+            assert first == second
 
 
 @pytest.mark.integration
@@ -341,9 +392,7 @@ def test_bolt_server_allows_rollback_after_failed_transaction_query(tmp_path: Pa
                         "RETURN a, b"
                     ).consume()
                     with pytest.raises(Neo4jError):
-                        transaction.run(
-                            "MATCH (n:Person {name: 'Alice'}) DELETE n RETURN n.name"
-                        ).consume()
+                        transaction.run("MATCH (n:Person {name: 'Alice'}) DELETE n").consume()
                     transaction.rollback()
                 finally:
                     transaction.close()

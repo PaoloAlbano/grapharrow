@@ -353,8 +353,9 @@ def test_nested_writes_are_classified_and_rejected_before_execution(
     with database.read_transaction() as session, pytest.raises(TransactionError):
         session.query(query)
     with database.write_transaction() as session:
-        with pytest.raises(QueryError, match="read queries only|cannot write"):
+        with pytest.raises(QueryError) as error:
             session.query(query)
+        assert (error.value.category, error.value.phase) == ("UnsupportedFeature", "compile")
         assert session.query("MATCH (p:Unexpected) RETURN count(*) AS n").rows == ({"n": 0},)
 
 

@@ -99,6 +99,11 @@ def _encode_nested_join_columns(table: pa.Table) -> pa.Table:
     """Encode nested non-key values so Arrow joins can carry them safely."""
     updated = table
     for index, field in enumerate(table.schema):
+        if pa.types.is_null(field.type):
+            updated = updated.set_column(
+                index, field.name, pa.nulls(table.num_rows, type=pa.string())
+            )
+            continue
         if not _requires_join_encoding(field.type):
             continue
         encoded = pa.array(

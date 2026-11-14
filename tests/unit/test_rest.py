@@ -754,7 +754,9 @@ def test_rest_query_supports_detach_delete(tmp_path: Path) -> None:
     delete_response = client.post(
         "/v1/query",
         json={
-            "query": "MATCH (n:Person {name: 'Alice'}) DETACH DELETE n RETURN n.name",
+            "query": (
+                "MATCH (n:Person {name: 'Alice'}) WITH n,n.name AS name DETACH DELETE n RETURN name"
+            ),
             "params": {},
         },
     )
@@ -767,7 +769,7 @@ def test_rest_query_supports_detach_delete(tmp_path: Path) -> None:
     )
 
     assert delete_response.status_code == 200
-    assert delete_response.json()["data"]["rows"] == [{"n.name": "Alice"}]
+    assert delete_response.json()["data"]["rows"] == [{"name": "Alice"}]
     assert count_response.status_code == 200
     assert count_response.json()["data"]["rows"] == [{"total": 0}]
 
