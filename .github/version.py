@@ -1,4 +1,4 @@
-"""Show the checkout version or publish a GraphArrow release tag."""
+"""Show the checkout version or preview and publish a GraphArrow release tag."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def require_clean_metadata(root: Path) -> None:
         raise ValueError("Commit or restore changes to pyproject.toml and uv.lock first.")
 
 
-def publish_version(root: Path, action: str, version: str = "") -> str:
+def publish_version(root: Path, action: str, version: str = "", *, dry_run: bool = False) -> str:
     if run(root, "git", "branch", "--show-current") != "main":
         raise ValueError("Check out main before creating a release tag.")
     require_clean_metadata(root)
@@ -50,6 +50,10 @@ def publish_version(root: Path, action: str, version: str = "") -> str:
         raise ValueError("Specify a stable release as BUMP=tag VERSION=X.Y.Z.")
     if run(root, "git", "tag", "--list", tag):
         raise ValueError(f"Tag {tag} already exists locally.")
+    if dry_run:
+        commit = run(root, "git", "log", "-1", "--format=%h %s", revision)
+        print(f"Dry run: would create annotated tag {tag} on {commit} and push it to origin.")
+        return tag
     run(root, "git", "tag", "-a", tag, "-m", f"GraphArrow {version}", revision)
     ref = f"refs/tags/{tag}"
     try:
@@ -70,13 +74,15 @@ def main() -> None:
         choices=("show", *BUMP_COMPONENTS, "tag"),
     )
     parser.add_argument("--version", default="", help="Explicit X.Y.Z for the tag action.")
+    parser.add_argument("--dry-run", action="store_true", help="Preview the tag and target commit.")
     args = parser.parse_args()
     try:
         if args.action == "show":
             print(project_version())
         else:
-            tag = publish_version(ROOT, args.action, args.version)
-            print(f"Pushed {tag} to origin. GitHub Actions will run the release workflow.")
+            tag = publish_version(ROOT, args.action, args.version, dry_run=args.dry_run)
+            if not args.dry_run:
+                print(f"Pushed {tag} to origin. GitHub Actions will run the release workflow.")
     except (ValueError, subprocess.CalledProcessError, OSError) as error:
         parser.exit(1, f"version: {error}\n")
 

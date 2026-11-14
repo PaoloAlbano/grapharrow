@@ -6,6 +6,8 @@ import json
 import os
 import re
 import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,25 @@ def run(*args: str, capture: bool = False, **kwargs: Any) -> str:
     """Fail closed on unexpected GitHub or registry errors."""
     result = subprocess.run(args, check=True, text=True, capture_output=capture, **kwargs)
     return result.stdout.strip() if capture else ""
+
+
+def push_image(target: str) -> None:
+    """Retry a registry blob error while publishing the same tested image."""
+    for attempt in range(1, 4):
+        try:
+            print(run("docker", "push", target, capture=True), flush=True)
+            return
+        except subprocess.CalledProcessError as error:
+            if error.stderr:
+                print(error.stderr.strip(), file=sys.stderr, flush=True)
+            output = f"{error.stdout or ''}\n{error.stderr or ''}".lower()
+            if attempt == 3 or "unknown blob" not in output:
+                if error.stdout:
+                    print(error.stdout.strip(), file=sys.stderr, flush=True)
+                raise
+            delay = 2**attempt
+            print(f"Retrying push of {target} in {delay} seconds.", flush=True)
+            time.sleep(delay)
 
 
 def require_unused_image(image: str) -> None:
@@ -185,7 +206,7 @@ def main() -> None:
         for arch in ("amd64", "arm64"):
             target = f"{image}:{version}-{arch}"
             run("docker", "tag", f"grapharrow:check-{arch}", target)
-            run("docker", "push", target)
+            push_image(target)
         run(
             "docker",
             "buildx",

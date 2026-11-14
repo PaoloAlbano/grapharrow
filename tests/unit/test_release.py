@@ -163,6 +163,25 @@ def test_bump_fetches_tags_and_pushes_only_the_new_release_tag(
     assert version.project_version(root) == "0.1.0"
 
 
+@pytest.mark.parametrize(("action", "explicit"), [("minor", ""), ("tag", "0.3.0")])
+def test_release_dry_run_previews_tag_without_creating_it(
+    version_repo: tuple[Any, Path],
+    version_remote: Path,
+    capsys: pytest.CaptureFixture[str],
+    action: str,
+    explicit: str,
+) -> None:
+    version, root = version_repo
+    run = version.run
+    run(version_remote, "git", "tag", "v0.2.0")
+    assert version.publish_version(root, action, explicit, dry_run=True) == "v0.3.0"
+    commit = run(root, "git", "log", "-1", "--format=%h %s")
+    assert f"would create annotated tag v0.3.0 on {commit}" in capsys.readouterr().out
+    assert run(root, "git", "tag", "--list") == "v0.2.0"
+    assert run(version_remote, "git", "tag", "--list") == "v0.2.0"
+    assert not run(root, "git", "status", "--porcelain")
+
+
 @pytest.mark.parametrize("version", ["0.2.0", "0.2.1.dev42"])
 @pytest.mark.parametrize("mismatch", [None, "pyproject.toml", "uv.lock"])
 def test_apply_build_version_checks_both_files(
@@ -434,6 +453,36 @@ def test_push_failure_keeps_the_release_unpublished(
     assert any(c[:3] == ("gh", "release", "create") for c in calls)
     assert not any(c[:3] == ("gh", "release", "edit") for c in calls)
     assert calls[-1] == ("docker", "logout", "ghcr.io")
+
+
+@pytest.mark.parametrize("failures", [1, 3])
+def test_blob_error_retries_the_same_tested_image(
+    publication: Any, monkeypatch: pytest.MonkeyPatch, failures: int
+) -> None:
+    publisher, calls = publication
+    original = publisher.run
+    amd64 = ("docker", "push", "ghcr.io/owner/grapharrow:0.1.0-amd64")
+    delays: list[int] = []
+
+    def run(*args: str, **kwargs: Any) -> str:
+        if args == amd64 and calls.count(amd64) < failures:
+            calls.append(args)
+            raise subprocess.CalledProcessError(1, args, stderr="unknown blob")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(publisher, "run", run)
+    monkeypatch.setattr(publisher.time, "sleep", delays.append)
+    if failures == 3:
+        with pytest.raises(subprocess.CalledProcessError):
+            publisher.main()
+        assert calls.count(amd64) == 3
+        assert delays == [2, 4]
+        assert not any(call[:3] == ("gh", "release", "edit") for call in calls)
+    else:
+        publisher.main()
+        assert calls.count(amd64) == 2
+        assert delays == [2]
+        assert calls[-2][:3] == ("gh", "release", "edit")
 
 
 @pytest.mark.parametrize("covered_during_build", [False, True])

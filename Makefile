@@ -48,11 +48,12 @@ help:
 	@printf "  make version                     Show the checkout version\n"
 	@printf "  make version BUMP=major|minor|patch  Create and push the next stable tag\n"
 	@printf "  make version BUMP=tag VERSION=X.Y.Z  Create and push a specific stable tag\n"
+	@printf "  make version BUMP=minor DRY_RUN=1  Preview the release tag and commit\n"
 	@printf "  make clean        Remove local tool caches\n"
 
 version:
 	$(if $(strip $(BETA)),$(error Use a final version bump. Nightly builds run once a week))
-	@"$(PYTHON)" .github/version.py "$(or $(BUMP),show)" --version "$(VERSION)"
+	@"$(PYTHON)" .github/version.py "$(or $(BUMP),show)" --version "$(VERSION)" $(if $(strip $(DRY_RUN)),--dry-run)
 
 sync:
 	$(UV) sync --no-dev

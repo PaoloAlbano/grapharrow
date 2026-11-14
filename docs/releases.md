@@ -56,9 +56,14 @@ The release commands fetch `main` and tags from `origin` and require local
 version from the highest reachable stable tag. Each command creates an
 annotated tag and pushes it to `origin`, starting the release workflow.
 
+Add `DRY_RUN=1` to any release command to run the same checks and preview the
+tag and commit. The preview fetches from `origin` and stops before creating
+or pushing a tag.
+
 ```sh
 git switch main
 git pull --ff-only origin main
+make version BUMP=minor DRY_RUN=1
 make version BUMP=minor
 ```
 
@@ -144,7 +149,9 @@ Publishing uses the workflow's `GITHUB_TOKEN`, with write permissions restricted
 to the publication job. No personal access token or PyPI credential is required.
 
 Release workflows are serialized to keep publication and the `latest` alias
-consistent across tags. Versioned release assets and image tags are not
+consistent across tags. If the registry reports `unknown blob` during an
+image push, the job retries the same tested image up to twice. Versioned
+release assets and image tags are not
 automatically replaced. A
 failure after creating the release leaves a GitHub draft; it is only published
 after both architecture tags and their combined image are available. GitHub and
