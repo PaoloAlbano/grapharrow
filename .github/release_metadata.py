@@ -14,25 +14,26 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 FINAL_VERSION = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+STABLE_TAG = re.compile(rf"v({FINAL_VERSION})")
 DEVELOPMENT_VERSION = re.compile(rf"{FINAL_VERSION}\.dev[1-9][0-9]*")
 NIGHTLY_TAG = re.compile(r"nightly-([a-f0-9]{40})")
 
 
-def project_version(root: Path = ROOT) -> str:
+def project_version(root: Path = ROOT, *, allow_development: bool = False) -> str:
     """Read the committed or runner-local package version."""
     version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
-    if not isinstance(version, str) or not re.fullmatch(FINAL_VERSION, version):
+    pattern = rf"{FINAL_VERSION}(?:\.dev[1-9][0-9]*)?" if allow_development else FINAL_VERSION
+    if not isinstance(version, str) or not re.fullmatch(pattern, version):
         raise ValueError("Expected canonical X.Y.Z")
     return version
 
 
-def release_metadata(tag: str, repository: str, root: Path = ROOT) -> dict[str, str]:
-    """Reject mismatched tags and stale project entries in the lockfile."""
-    version = project_version(root)
-    if tag != f"v{version}":
-        raise ValueError(f"Tag {tag!r} must match project version v{version}")
-    require_locked_version(version, root)
-    return publication_metadata(version, repository, prerelease=False)
+def release_metadata(tag: str, repository: str) -> dict[str, str]:
+    """Read the stable build version from its release tag."""
+    match = STABLE_TAG.fullmatch(tag)
+    if match is None:
+        raise ValueError(f"Expected a canonical release tag vX.Y.Z, got {tag!r}")
+    return publication_metadata(match[1], repository, prerelease=False)
 
 
 def publication_metadata(version: str, repository: str, *, prerelease: bool) -> dict[str, str]:
@@ -58,10 +59,7 @@ def release_covers_commit(releases: list[dict[str, Any]], revision: str, root: P
         and not release.get("draft")
         and (
             NIGHTLY_TAG.fullmatch(release["tag_name"])
-            or (
-                not release.get("prerelease")
-                and re.fullmatch(rf"v{FINAL_VERSION}", release["tag_name"])
-            )
+            or (not release.get("prerelease") and STABLE_TAG.fullmatch(release["tag_name"]))
         )
         for release in releases
     )
@@ -85,7 +83,7 @@ def nightly_metadata(
         return {}
     highest = (0, 0, 0)
     for release in published:
-        stable = re.fullmatch(rf"v({FINAL_VERSION})", release["tag_name"])
+        stable = STABLE_TAG.fullmatch(release["tag_name"])
         if stable and not release.get("prerelease") and not release.get("draft"):
             highest = max(highest, tuple(map(int, stable[1].split("."))))
     if tuple(map(int, version.split("."))) <= highest:
@@ -102,7 +100,17 @@ def require_locked_version(version: str, root: Path = ROOT) -> None:
     lock = tomllib.loads((root / "uv.lock").read_text())
     packages = [p for p in lock["package"] if p["name"] == "grapharrow"]
     if len(packages) != 1 or packages[0]["version"] != version:
-        raise ValueError("Update the GraphArrow version in uv.lock before tagging")
+        raise ValueError(f"uv.lock must record GraphArrow {version}")
+
+
+def apply_build_version(version: str, root: Path = ROOT) -> None:
+    """Set the package version in the release build checkout."""
+    if not re.fullmatch(FINAL_VERSION, version) and not DEVELOPMENT_VERSION.fullmatch(version):
+        raise ValueError("Expected a build version in the form X.Y.Z or X.Y.Z.devN")
+    subprocess.run(["uv", "version", "--no-sync", version], cwd=root, check=True)
+    if project_version(root, allow_development=True) != version:
+        raise ValueError(f"pyproject.toml must record GraphArrow {version}")
+    require_locked_version(version, root)
 
 
 def artifact_files(directory: Path) -> list[Path]:
@@ -154,15 +162,12 @@ def main() -> None:
     parser.add_argument("--version", action="store_true")
     parser.add_argument("--tag")
     parser.add_argument("--nightly", action="store_true")
-    parser.add_argument("--build-nightly", metavar="VERSION")
+    parser.add_argument("--build-version", metavar="VERSION")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--checksums", type=Path)
     args = parser.parse_args()
-    if args.build_nightly:
-        if not DEVELOPMENT_VERSION.fullmatch(args.build_nightly):
-            parser.error("Expected a nightly version in the form X.Y.Z.devN")
-        subprocess.run(["uv", "version", "--no-sync", args.build_nightly], cwd=ROOT, check=True)
-        require_locked_version(args.build_nightly)
+    if args.build_version:
+        apply_build_version(args.build_version)
     elif args.checksums:
         write_checksums(args.checksums)
     elif args.tag or args.nightly:

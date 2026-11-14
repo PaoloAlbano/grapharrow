@@ -1,4 +1,4 @@
-"""Prepare a GraphArrow release or tag the committed version locally."""
+"""Show the checkout version or create a local GraphArrow release tag."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import argparse
 import subprocess
 from pathlib import Path
 
-from release_metadata import ROOT, project_version, require_locked_version
+from release_metadata import ROOT, STABLE_TAG, project_version
 
 METADATA_FILES = ("pyproject.toml", "uv.lock")
 BUMP_COMPONENTS = ("major", "minor", "patch")
@@ -22,40 +22,30 @@ def require_clean_metadata(root: Path) -> None:
         raise ValueError("Commit or restore changes to pyproject.toml and uv.lock first.")
 
 
-def require_unused_tag(root: Path, tag: str) -> None:
-    if run(root, "git", "tag", "--list", tag):
-        raise ValueError(f"Tag {tag} already exists locally.")
-
-
-def bump_version(root: Path, uv: str, bump: str) -> str:
-    require_clean_metadata(root)
-    current = project_version(root)
-    require_locked_version(current, root)
-    version = run(root, uv, "version", "--dry-run", "--short", "--bump", bump)
-    require_unused_tag(root, f"v{version}")
-
-    original = {root / name: (root / name).read_bytes() for name in METADATA_FILES}
-    try:
-        run(root, uv, "version", "--no-sync", version)
-        if project_version(root) != version:
-            raise ValueError(f"Expected uv to write version {version}.")
-        require_locked_version(version, root)
-    except (Exception, KeyboardInterrupt):
-        for path, contents in original.items():
-            if not path.exists() or path.read_bytes() != contents:
-                path.write_bytes(contents)
-        raise
-    return version
-
-
-def tag_version(root: Path) -> str:
+def tag_version(root: Path, action: str, version: str = "") -> str:
     if run(root, "git", "branch", "--show-current") != "main":
         raise ValueError("Check out main before creating a release tag.")
     require_clean_metadata(root)
-    version = project_version(root)
-    require_locked_version(version, root)
+    if action in BUMP_COMPONENTS:
+        if version:
+            raise ValueError("Use BUMP=tag to specify VERSION explicitly.")
+        tags = run(root, "git", "tag", "--merged", "HEAD", "--list", "v*").splitlines()
+        latest = max(
+            (
+                tuple(map(int, match[1].split(".")))
+                for tag in tags
+                if (match := STABLE_TAG.fullmatch(tag))
+            ),
+            default=(0, 0, 0),
+        )
+        index = BUMP_COMPONENTS.index(action)
+        parts = (*latest[:index], latest[index] + 1, *((0,) * (2 - index)))
+        version = ".".join(map(str, parts))
     tag = f"v{version}"
-    require_unused_tag(root, tag)
+    if STABLE_TAG.fullmatch(tag) is None:
+        raise ValueError("Specify a stable release as BUMP=tag VERSION=X.Y.Z.")
+    if run(root, "git", "tag", "--list", tag):
+        raise ValueError(f"Tag {tag} already exists locally.")
     run(root, "git", "tag", "-a", tag, "-m", f"GraphArrow {version}")
     return tag
 
@@ -68,19 +58,14 @@ def main() -> None:
         default="show",
         choices=("show", *BUMP_COMPONENTS, "tag"),
     )
-    parser.add_argument("--uv", default="uv", help="Path to the uv executable.")
+    parser.add_argument("--version", default="", help="Explicit X.Y.Z for the tag action.")
     args = parser.parse_args()
     try:
         if args.action == "show":
             print(project_version())
-        elif args.action == "tag":
-            tag = tag_version(ROOT)
-            print(f"Created local tag {tag}. Publish explicitly with: git push origin {tag}")
         else:
-            version = bump_version(ROOT, args.uv, args.action)
-            print(
-                f"Prepared {version} in pyproject.toml and uv.lock. Review and commit the changes."
-            )
+            tag = tag_version(ROOT, args.action, args.version)
+            print(f"Created local tag {tag}. Publish explicitly with: git push origin {tag}")
     except (ValueError, subprocess.CalledProcessError, OSError) as error:
         parser.exit(1, f"version: {error}\n")
 

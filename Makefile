@@ -45,14 +45,14 @@ help:
 	@printf "  make benchmark-tabular-json      Compare json vs orjson tabular serialization\n"
 	@printf "  make benchmark-ana-sessions      Measure ANA session latency and memory\n"
 	@printf "  make test-interface-comparison   Compare public graph interfaces and save results\n"
-	@printf "  make version                     Show the project version\n"
-	@printf "  make version BUMP=major|minor|patch  Prepare a release version\n"
-	@printf "  make version BUMP=tag            Tag the committed version locally\n"
+	@printf "  make version                     Show the checkout version\n"
+	@printf "  make version BUMP=major|minor|patch  Create the next stable tag locally\n"
+	@printf "  make version BUMP=tag VERSION=X.Y.Z  Create a specific stable tag locally\n"
 	@printf "  make clean        Remove local tool caches\n"
 
 version:
 	$(if $(strip $(BETA)),$(error Use a final version bump. Nightly builds run once a week))
-	@"$(PYTHON)" .github/version.py "$(or $(BUMP),show)" --uv "$(UV)"
+	@"$(PYTHON)" .github/version.py "$(or $(BUMP),show)" --version "$(VERSION)"
 
 sync:
 	$(UV) sync --no-dev

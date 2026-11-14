@@ -82,14 +82,13 @@ def main() -> None:
         metadata = release_metadata(tag, repository)
     version, image = metadata["version"], metadata["image"]
     verify_checksums(Path("dist"))
-    if nightly:
-        package_names = {p.name for p in artifact_files(Path("dist"))}
-        if package_names != {
-            f"grapharrow-{version}-py3-none-any.whl",
-            f"grapharrow-{version}.tar.gz",
-            "runtime-requirements.txt",
-        }:
-            raise ValueError("Nightly distributions have an unexpected version")
+    files = artifact_files(Path("dist"))
+    if {path.name for path in files} != {
+        f"grapharrow-{version}-py3-none-any.whl",
+        f"grapharrow-{version}.tar.gz",
+        "runtime-requirements.txt",
+    }:
+        raise ValueError("Release distributions have an unexpected version")
     if nightly:
         run("git", "merge-base", "--is-ancestor", revision, "origin/main")
     else:
@@ -177,7 +176,7 @@ def main() -> None:
             "--generate-notes",
             "--title",
             f"GraphArrow {version} (Nightly)" if nightly else tag,
-            *[str(p) for p in artifact_files(Path("dist"))],
+            *[str(p) for p in files],
             "dist/SHA256SUMS",
         ]
         if metadata["prerelease"] == "true":

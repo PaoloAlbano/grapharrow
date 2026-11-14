@@ -291,6 +291,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
     parser.add_argument("--archives-only", action="store_true")
+    parser.add_argument("--expected-version")
     args = parser.parse_args()
     directory = args.directory.resolve()
     wheels = list(directory.glob("grapharrow-*.whl"))
@@ -304,6 +305,10 @@ def main() -> None:
         metadata = archive.read(metadata_name).decode()
         expected_version = Parser().parsestr(metadata)["Version"]
         assert expected_version
+        if args.expected_version is not None and expected_version != args.expected_version:
+            raise ValueError(
+                f"Wheel version {expected_version!r} must match {args.expected_version!r}"
+            )
         assert "License-Expression: Apache-2.0" in metadata
         assert any(name.endswith("/licenses/LICENSE") for name in names)
         assert any(name.endswith("/licenses/THIRD_PARTY_NOTICES.md") for name in names)

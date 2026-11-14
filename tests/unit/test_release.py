@@ -27,23 +27,19 @@ def metadata() -> Any:
     return load("release_test_metadata", "release_metadata.py")
 
 
-@pytest.mark.parametrize("version", ["0.1.0", "1.2.3"])
-def test_release_tag_matches_single_project_version(
-    metadata: Any, tmp_path: Path, version: str
-) -> None:
-    (tmp_path / "pyproject.toml").write_text(f'[project]\nversion = "{version}"\n')
-    (tmp_path / "uv.lock").write_text(f'[[package]]\nname="grapharrow"\nversion="{version}"\n')
-    result = metadata.release_metadata("v" + version, "Owner/GraphArrow", tmp_path)
+def test_release_version_comes_from_the_tag(metadata: Any) -> None:
+    result = metadata.release_metadata("v0.2.0", "Owner/GraphArrow")
     assert result == {
-        "version": version,
+        "version": "0.2.0",
         "prerelease": "false",
         "image": "ghcr.io/owner/grapharrow",
     }
-    with pytest.raises(ValueError, match="must match"):
-        metadata.release_metadata("v9.9.9", "Owner/GraphArrow", tmp_path)
-    (tmp_path / "uv.lock").write_text('[[package]]\nname="grapharrow"\nversion="0.0.0"\n')
-    with pytest.raises(ValueError, match="uv.lock"):
-        metadata.release_metadata("v" + version, "Owner/GraphArrow", tmp_path)
+
+
+@pytest.mark.parametrize("tag", ["0.2.0", "v0.02.0", "v0.2.0.dev1", "v0.2.0b1"])
+def test_stable_release_rejects_invalid_tags(metadata: Any, tag: str) -> None:
+    with pytest.raises(ValueError, match="canonical release tag"):
+        metadata.release_metadata(tag, "Owner/GraphArrow")
 
 
 @pytest.mark.parametrize(
@@ -85,17 +81,17 @@ def test_version_tag_requires_committed_metadata_and_refuses_duplicates(
     original = path.read_text()
     path.write_text(original.replace("0.1.0", "0.2.0"))
     with pytest.raises(ValueError, match="Commit or restore"):
-        version.tag_version(root)
+        version.tag_version(root, "tag", "0.2.0")
     assert not version.run(root, "git", "tag", "--list")
     path.write_text(original)
-    tag = version.tag_version(root)
-    assert tag == "v0.1.0"
+    tag = version.tag_version(root, "tag", "0.2.0")
+    assert tag == "v0.2.0"
     assert version.run(root, "git", "cat-file", "-t", tag) == "tag"
     assert version.run(root, "git", "rev-parse", f"{tag}^{{commit}}") == version.run(
         root, "git", "rev-parse", "HEAD"
     )
     with pytest.raises(ValueError, match="already exists"):
-        version.tag_version(root)
+        version.tag_version(root, "tag", "0.2.0")
 
 
 @pytest.mark.parametrize("checkout", [("-b", "feature"), ("--detach", "HEAD")])
@@ -105,35 +101,48 @@ def test_release_tag_requires_main(
     version, root = version_repo
     version.run(root, "git", "checkout", "-q", *checkout)
     with pytest.raises(ValueError, match="Check out main"):
-        version.tag_version(root)
+        version.tag_version(root, "minor")
     assert not version.run(root, "git", "tag", "--list")
 
 
-@pytest.mark.parametrize("failure", ["uv", "mismatched lock"])
-def test_failed_bump_restores_both_files(
-    version_repo: tuple[Any, Path], monkeypatch: pytest.MonkeyPatch, failure: str
+@pytest.mark.parametrize(
+    ("bump", "expected"), [("patch", "v0.3.11"), ("minor", "v0.4.0"), ("major", "v1.0.0")]
+)
+def test_bump_tags_from_highest_stable_version_without_editing_the_checkout(
+    version_repo: tuple[Any, Path], bump: str, expected: str
 ) -> None:
     version, root = version_repo
     run = version.run
-
-    def run_with_failed_update(path: Path, *command: str) -> str:
-        if command[0] == "git":
-            return run(path, *command)
-        if "--dry-run" in command:
-            assert command[-2:] == ("--bump", "minor")
-            return "0.2.0"
-        assert command == ("uv", "version", "--no-sync", "0.2.0")
-        (path / "pyproject.toml").write_text('[project]\nversion = "0.2.0"\n')
-        if failure == "uv":
-            (path / "uv.lock").write_text("partial write")
-            raise subprocess.CalledProcessError(1, command)
-        return ""
-
-    monkeypatch.setattr(version, "run", run_with_failed_update)
-    with pytest.raises((ValueError, subprocess.CalledProcessError)):
-        version.bump_version(root, "uv", "minor")
+    for tag in ("v0.3.9", "v0.3.10", "v0.8.0b1", "nightly-" + "a" * 40):
+        run(root, "git", "tag", tag)
+    assert version.tag_version(root, bump) == expected
     assert not run(root, "git", "status", "--porcelain")
-    assert not run(root, "git", "tag", "--list")
+    assert version.project_version(root) == "0.1.0"
+
+
+@pytest.mark.parametrize("version", ["0.2.0", "0.2.1.dev42"])
+@pytest.mark.parametrize("mismatch", [None, "pyproject.toml", "uv.lock"])
+def test_apply_build_version_checks_both_files(
+    metadata: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version: str,
+    mismatch: str | None,
+) -> None:
+    def update(command: list[str], *, cwd: Path, check: bool) -> None:
+        assert command == ["uv", "version", "--no-sync", version]
+        assert cwd == tmp_path and check
+        project_version = "0.1.0" if mismatch == "pyproject.toml" else version
+        lock_version = "0.1.0" if mismatch == "uv.lock" else version
+        (cwd / "pyproject.toml").write_text(f'[project]\nversion = "{project_version}"\n')
+        (cwd / "uv.lock").write_text(f'[[package]]\nname="grapharrow"\nversion="{lock_version}"\n')
+
+    monkeypatch.setattr(metadata.subprocess, "run", update)
+    if mismatch:
+        with pytest.raises(ValueError, match=mismatch):
+            metadata.apply_build_version(version, tmp_path)
+    else:
+        assert metadata.apply_build_version(version, tmp_path) is None
 
 
 @pytest.mark.parametrize(
@@ -329,6 +338,16 @@ def test_changed_assets_prevent_all_external_calls(publication: Any) -> None:
     publisher, calls = publication
     Path("dist/runtime-requirements.txt").write_text("unverified bytes")
     with pytest.raises(ValueError, match="checksums"):
+        publisher.main()
+    assert not calls
+
+
+def test_stable_release_rejects_assets_from_another_version(
+    publication: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publisher, calls = publication
+    monkeypatch.setenv("RELEASE_TAG", "v0.2.0")
+    with pytest.raises(ValueError, match="unexpected version"):
         publisher.main()
     assert not calls
 

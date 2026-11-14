@@ -1,9 +1,10 @@
 # CI and Releases
 
-GraphArrow uses the version in `pyproject.toml` as the application version.
-Use `grapharrow.__version__` in Python to read the installed version. REST
-reports the same value in OpenAPI. ANA protocol and on-disk catalog/snapshot
-versions are separate contracts.
+Stable releases derive their version from the Git tag. Builds directly from a
+development checkout use the version in `pyproject.toml`. Use
+`grapharrow.__version__` in Python to read the installed version. REST reports
+the same value in OpenAPI. ANA protocol and on-disk catalog/snapshot versions
+are separate contracts.
 
 ## Continuous integration
 
@@ -40,28 +41,26 @@ container restart. The runtime interpreter is Python 3.12 for both architectures
 
 ## Preparing a release
 
-Run `make version` to show the current project version. The release tooling
-requires Python 3.11 or newer and a version of uv with the `uv version` command.
-Prepare the bump on the branch you will merge into `main`.
+Run `make version` to show the checkout version. After CI passes on the commit
+you want to release, update your local `main` and fetch the tags.
 
 | Command | Example result |
 | --- | --- |
 | `make version BUMP=major` | `0.1.0` → `1.0.0` |
 | `make version BUMP=minor` | `0.1.0` → `0.2.0` |
 | `make version BUMP=patch` | `0.1.0` → `0.1.1` |
+| `make version BUMP=tag VERSION=0.2.0` | Explicit tag `v0.2.0` |
 
-The bump updates `pyproject.toml` and `uv.lock` together. Review and commit those files, then
-merge the commit into `main`. After CI passes on the release commit, check out
-`main` and bring it up to date before creating the annotated tag.
+The bump commands calculate the next version from the highest stable tag
+reachable from local `main`. Each command creates an annotated local tag on
+`HEAD` and prints the push command. For example:
 
 ```sh
 git switch main
-git pull --ff-only
-make version BUMP=tag
+git pull --ff-only --tags origin main
+make version BUMP=minor
+git push origin v0.2.0
 ```
-
-The command checks that both metadata files are clean and agree on the
-version. It prints the explicit push command for the tag it created.
 
 **The repository owner starts a release by pushing the `v*` tag.** The
 repository's GitHub tag ruleset restricts creation of those tags to the
@@ -69,9 +68,10 @@ owner. The release workflow also checks the owner's GitHub identity before
 validating the release. A normal push to `main` or a pull request runs CI
 without publishing artifacts.
 
-The release workflow requires the tagged commit to belong to `main`, and the
-tag must exactly match the project and lockfile versions. Manual releases
-use `X.Y.Z`, with a leading `v` in Git tags.
+The release workflow requires the tagged commit to belong to `main` and the
+tag to use the form `vX.Y.Z`. It applies that version to `pyproject.toml` and
+`uv.lock` in the build checkout. The wheel, source archive and container
+use that version. The release requires no version-bump commit.
 
 ## Nightly builds
 
@@ -82,7 +82,7 @@ Otherwise it runs the full release checks and publishes the tested artifacts
 as a GitHub prerelease.
 
 A Nightly build uses a tag such as `nightly-<full-commit-sha>` and a
-development version such as `0.1.1.dev42`. The version uses the pending
+development version such as `0.1.1.dev42`. The version uses the checkout
 version in `pyproject.toml` if it is ahead of the latest published stable
 version, or the next patch of the latest stable version. The suffix is the
 release workflow run number. The build checkout updates the package metadata
