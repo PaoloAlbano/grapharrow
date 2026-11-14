@@ -148,3 +148,18 @@ Remaining gaps include:
 
 The local unit suite and selected differential tests cover narrower workloads.
 Their passing counts must not be presented as complete openCypher coverage.
+
+## openCypher M23 audit
+
+The [openCypher M23 workflow](https://github.com/PaoloAlbano/grapharrow/actions/workflows/opencypher.yml)
+runs exclusively on `main`, after pushes or on manual dispatch. It
+checks an exact revision of the upstream M23 corpus through GraphArrow's
+embedded query API. Each run includes the upstream and GraphArrow commit SHAs,
+an outcome for each scenario, and a summary.
+
+The README badge shows the percentage and count of passing scenarios over all
+cases selected by M23, excluding cases tagged `@ignore` upstream. Unsupported
+procedure fixtures, blocked setups and unverified errors stay in the
+denominator. A red badge indicates an audit failure, an unexpected result
+or a regression against the previous successful run. The badge and baseline
+are updated on the `badges` branch.

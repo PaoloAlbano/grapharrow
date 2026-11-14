@@ -1,8 +1,14 @@
 <div align="center">
 
-  <img src="images/grapharrow_1.jpg" alt="GraphArrow" width="128" />
+  <img src="images/grapharrow_1.jpg" alt="GraphArrow" width="320" />
 
 # GraphArrow
+
+[![CI](https://github.com/PaoloAlbano/grapharrow/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/PaoloAlbano/grapharrow/actions/workflows/ci.yml)
+[![openCypher M23](https://raw.githubusercontent.com/PaoloAlbano/grapharrow/badges/opencypher.svg)](https://github.com/PaoloAlbano/grapharrow/actions/workflows/opencypher.yml)
+[![Release](https://img.shields.io/github/v/release/PaoloAlbano/grapharrow)](https://github.com/PaoloAlbano/grapharrow/releases/latest)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
 </div>
 
 GraphArrow is an embedded property graph database built in Python on top of PyArrow and Parquet.

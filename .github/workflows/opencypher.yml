@@ -1,0 +1,104 @@
+name: openCypher M23
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opencypher-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Audit openCypher M23
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: opencypher/openCypher
+          ref: 007895aff5f33097d67b2e48a0a2babd6bd18590 # 1.0.0-M23
+          path: upstream-opencypher
+          persist-credentials: false
+          sparse-checkout: tck/features
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+      - name: Run the pinned scenarios
+        run: |
+          report="$RUNNER_TEMP/opencypher-report"
+          mkdir -p "$report"
+          printf 'grapharrow=%s\nopencypher=%s\n' "$GITHUB_SHA" \
+            "$(git -C upstream-opencypher rev-parse HEAD)" > "$report/revisions.txt"
+          uv run --locked --with gherkin-official==29.0.0 python .github/audit_opencypher.py \
+            --features upstream-opencypher/tck/features --output "$report/cases.jsonl"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: opencypher-m23-${{ github.sha }}
+          path: ${{ runner.temp }}/opencypher-report
+          retention-days: 30
+
+  badge:
+    name: Publish openCypher badge
+    needs: audit
+    if: >-
+      ${{ !cancelled() && github.ref == 'refs/heads/main' &&
+          !github.event.repository.fork }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.audit.result == 'success'
+        with:
+          name: opencypher-m23-${{ github.sha }}
+          path: ${{ runner.temp }}/opencypher-report
+      - name: Update the badge and compare scenario IDs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          remote="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          badge_dir="$RUNNER_TEMP/opencypher-badges"
+          git init --quiet --initial-branch=badges "$badge_dir"
+          git -C "$badge_dir" config credential.helper '!gh auth git-credential'
+          git -C "$badge_dir" remote add origin "$remote"
+          badges_ref="$(git ls-remote --heads "$remote" refs/heads/badges)"
+          if [ -n "$badges_ref" ]; then
+            git -C "$badge_dir" fetch --depth=1 origin refs/heads/badges
+            git -C "$badge_dir" switch --detach FETCH_HEAD
+          fi
+          result=0
+          python3 .github/opencypher_badge.py --report "$RUNNER_TEMP/opencypher-report" \
+            --output "$badge_dir" || result=$?
+          # An old run may still be rerun after main has advanced.
+          main_ref="$(git ls-remote "$remote" refs/heads/main)"
+          if [ "${main_ref%%[[:space:]]*}" != "$GITHUB_SHA" ]; then
+            exit "$result"
+          fi
+          git -C "$badge_dir" add -- opencypher.svg
+          if [ -f "$badge_dir/opencypher-baseline.json" ]; then
+            git -C "$badge_dir" add -- opencypher-baseline.json
+          fi
+          if ! git -C "$badge_dir" diff --cached --quiet; then
+            git -C "$badge_dir" -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit --quiet -m "Update openCypher badge for $GITHUB_SHA"
+            git -C "$badge_dir" push origin HEAD:refs/heads/badges
+          fi
+          exit "$result"
