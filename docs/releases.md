@@ -1,9 +1,9 @@
 # CI and Releases
 
 GraphArrow uses the version in `pyproject.toml` as the application version.
-The initial version is `0.1.0`; the REST/OpenAPI version is read from installed
-package metadata. ANA protocol and on-disk catalog/snapshot versions are
-separate contracts.
+Use `grapharrow.__version__` in Python to read the installed version. REST
+reports the same value in OpenAPI. ANA protocol and on-disk catalog/snapshot
+versions are separate contracts.
 
 ## Continuous integration
 
@@ -38,26 +38,60 @@ container restart. The runtime interpreter is Python 3.12 for both architectures
 
 ## Preparing a release
 
-1. Update `project.version` in `pyproject.toml` when preparing a new version.
-   The first release already uses `0.1.0`.
-2. Run `uv lock`, review the changes, and merge the release commit into `main`.
-3. Check that CI succeeds for that commit.
-4. Create and push the matching tag. For the first release:
+Run `make version` to show the current project version. The release tooling
+requires Python 3.11 or newer and a version of uv with the `uv version` command.
+Prepare the bump on the branch you will merge into `main`.
 
-   ```sh
-   git tag -a v0.1.0 -m "GraphArrow 0.1.0"
-   git push origin v0.1.0
-   ```
+| Command | Example result |
+| --- | --- |
+| `make version BUMP=major` | `0.1.0` → `1.0.0` |
+| `make version BUMP=minor` | `0.1.0` → `0.2.0` |
+| `make version BUMP=patch` | `0.1.0` → `0.1.1` |
 
-**Pushing a `v*` tag starts publication** after all release checks pass. A normal
-push to `main` or a pull request does not publish anything. Only create a tag
-when the commit is intended for release.
+The bump updates `pyproject.toml` and `uv.lock` together. Review and commit those files, then
+merge the commit into `main`. After CI passes on the release commit, check out
+`main` and bring it up to date before creating the annotated tag.
+
+```sh
+git switch main
+git pull --ff-only
+make version BUMP=tag
+```
+
+The command checks that both metadata files are clean and agree on the
+version. It prints the explicit push command for the tag it created.
+
+**The repository owner starts a release by pushing the `v*` tag.** The
+repository's GitHub tag ruleset restricts creation of those tags to the
+owner. The release workflow also checks the owner's GitHub identity before
+validating the release. A normal push to `main` or a pull request runs CI
+without publishing artifacts.
 
 The release workflow requires the tagged commit to belong to `main`, and the
-tag must exactly match the project and lockfile versions. Supported version
-forms are `X.Y.Z`, `X.Y.ZaN`, `X.Y.ZbN` and `X.Y.ZrcN`, with a leading `v` only
-in Git tags. Prereleases are marked as prereleases on GitHub and do not update
-the Docker `latest` alias.
+tag must exactly match the project and lockfile versions. Manual releases
+use `X.Y.Z`, with a leading `v` in Git tags.
+
+## Nightly builds
+
+The Nightly is scheduled once a week, on Mondays at 23:55 in `Europe/Rome`.
+The release workflow checks the selected commit on `main` and skips
+the build if a published stable or Nightly release already contains it.
+Otherwise it runs the full release checks and publishes the tested artifacts
+as a GitHub prerelease.
+
+A Nightly build uses a tag such as `nightly-<full-commit-sha>` and a
+development version such as `0.1.1.dev42`. The version uses the pending
+version in `pyproject.toml` if it is ahead of the latest published stable
+version, or the next patch of the latest stable version. The suffix is the
+release workflow run number. The build checkout updates the package metadata
+and lockfile for the wheel and source archive. The commit on `main` retains
+its original version. GHCR publishes the versioned development image and its
+architecture tags. The stable release and Docker `latest` alias are unaffected.
+
+The workflow creates a Nightly tag only after validation succeeds. If
+publication fails after creating the tag, inspect the tag, any draft and
+the versioned GHCR images before retrying. A partial publication is never
+silently replaced.
 
 ## Published artifacts
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from importlib.metadata import version
 from pathlib import Path
 from typing import Any, cast
 
@@ -10,6 +9,7 @@ from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request,
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from grapharrow import __version__
 from grapharrow.adapters import FileSystemAdapter
 from grapharrow.app import build_application
 from grapharrow.config import GraphArrowSettings
@@ -116,7 +116,7 @@ def create_rest_app(
     container = build_application(path, settings=settings, filesystem=filesystem)
     container.use_cases.admin.initialize()
 
-    app = FastAPI(title="GraphArrow", version=version("grapharrow"))
+    app = FastAPI(title="GraphArrow", version=__version__)
     app.state.grapharrow = container
     public_router = APIRouter(prefix=container.settings.rest_prefix)
     protected_router = APIRouter(

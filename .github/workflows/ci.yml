@@ -8,15 +8,19 @@ on:
   workflow_call:
     inputs:
       release-build:
-        description: Preserve tested container images for the tag release workflow.
+        description: Preserve tested container images for the release workflow.
         type: boolean
         default: false
+      build-version:
+        description: Override the package version in the nightly build checkout.
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ inputs.release-build && 'release' || 'check' }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ !inputs.release-build }}
 
 env:
@@ -100,8 +104,13 @@ jobs:
         with:
           enable-cache: true
       - name: Build once from the source distribution
+        env:
+          BUILD_VERSION: ${{ inputs.build-version }}
         run: |
           uv lock --check
+          if [ -n "$BUILD_VERSION" ]; then
+            python .github/release_metadata.py --build-nightly "$BUILD_VERSION"
+          fi
           uv build --no-sources --out-dir dist
           uv export --locked --no-dev --no-emit-project --output-file dist/runtime-requirements.txt
           python .github/check_distribution.py dist --archives-only
@@ -167,8 +176,9 @@ jobs:
       - name: Build the runtime from the verified wheel
         env:
           ARCH: ${{ matrix.arch }}
+          BUILD_VERSION: ${{ inputs.build-version }}
         run: |
-          version="$(python .github/release_metadata.py --version)"
+          version="${BUILD_VERSION:-$(python .github/release_metadata.py --version)}"
           docker buildx build --load --platform "linux/$ARCH" \
             --build-arg DISTRIBUTION_SOURCE=prebuilt \
             --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
@@ -180,7 +190,11 @@ jobs:
       - name: Check auth, sessions, persistence and Bolt in the container
         env:
           ARCH: ${{ matrix.arch }}
-        run: uv run --frozen python .github/smoke_docker.py "grapharrow:check-$ARCH"
+          BUILD_VERSION: ${{ inputs.build-version }}
+        run: |
+          version="${BUILD_VERSION:-$(python .github/release_metadata.py --version)}"
+          uv run --frozen python .github/smoke_docker.py "grapharrow:check-$ARCH" \
+            --expected-version "$version"
       - name: Preserve the tested image for publication
         if: inputs.release-build
         env:

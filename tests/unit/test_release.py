@@ -27,18 +27,16 @@ def metadata() -> Any:
     return load("release_test_metadata", "release_metadata.py")
 
 
-@pytest.mark.parametrize(
-    "version,prerelease", [("0.1.0", "false"), ("0.1.0b1", "true"), ("1.2.3rc0", "true")]
-)
+@pytest.mark.parametrize("version", ["0.1.0", "1.2.3"])
 def test_release_tag_matches_single_project_version(
-    metadata: Any, tmp_path: Path, version: str, prerelease: str
+    metadata: Any, tmp_path: Path, version: str
 ) -> None:
     (tmp_path / "pyproject.toml").write_text(f'[project]\nversion = "{version}"\n')
     (tmp_path / "uv.lock").write_text(f'[[package]]\nname="grapharrow"\nversion="{version}"\n')
     result = metadata.release_metadata("v" + version, "Owner/GraphArrow", tmp_path)
     assert result == {
         "version": version,
-        "prerelease": prerelease,
+        "prerelease": "false",
         "image": "ghcr.io/owner/grapharrow",
     }
     with pytest.raises(ValueError, match="must match"):
@@ -48,11 +46,141 @@ def test_release_tag_matches_single_project_version(
         metadata.release_metadata("v" + version, "Owner/GraphArrow", tmp_path)
 
 
-@pytest.mark.parametrize("version", ["01.2.3", "0.1", "0.1.0; echo unsafe", "0.1.0\nimage=bad"])
+@pytest.mark.parametrize(
+    "version", ["01.2.3", "0.1", "0.1.0b1", "0.1.0.dev1", "0.1.0; echo unsafe", "0.1.0\nimage=bad"]
+)
 def test_release_rejects_noncanonical_versions(metadata: Any, tmp_path: Path, version: str) -> None:
     (tmp_path / "pyproject.toml").write_text("[project]\nversion = " + json.dumps(version) + "\n")
     with pytest.raises(ValueError, match="canonical"):
         metadata.project_version(tmp_path)
+
+
+@pytest.fixture
+def version_repo(
+    metadata: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Any, Path]:
+    monkeypatch.setitem(sys.modules, "release_metadata", metadata)
+    version = load("release_version", "version.py")
+    version.run(tmp_path, "git", "init", "-q", "-b", "main")
+    (tmp_path / "pyproject.toml").write_text('[project]\nversion = "0.1.0"\n')
+    (tmp_path / "uv.lock").write_text('[[package]]\nname = "grapharrow"\nversion = "0.1.0"\n')
+    for key, value in {
+        "user.name": "GraphArrow Tests",
+        "user.email": "grapharrow@example.test",
+        "commit.gpgsign": "false",
+        "tag.gpgsign": "false",
+        "core.hooksPath": str(tmp_path / "no-hooks"),
+    }.items():
+        version.run(tmp_path, "git", "config", "--local", key, value)
+    version.run(tmp_path, "git", "add", "pyproject.toml", "uv.lock")
+    version.run(tmp_path, "git", "commit", "-qm", "Release metadata")
+    return version, tmp_path
+
+
+def test_version_tag_requires_committed_metadata_and_refuses_duplicates(
+    version_repo: tuple[Any, Path],
+) -> None:
+    version, root = version_repo
+    path = root / "uv.lock"
+    original = path.read_text()
+    path.write_text(original.replace("0.1.0", "0.2.0"))
+    with pytest.raises(ValueError, match="Commit or restore"):
+        version.tag_version(root)
+    assert not version.run(root, "git", "tag", "--list")
+    path.write_text(original)
+    tag = version.tag_version(root)
+    assert tag == "v0.1.0"
+    assert version.run(root, "git", "cat-file", "-t", tag) == "tag"
+    assert version.run(root, "git", "rev-parse", f"{tag}^{{commit}}") == version.run(
+        root, "git", "rev-parse", "HEAD"
+    )
+    with pytest.raises(ValueError, match="already exists"):
+        version.tag_version(root)
+
+
+@pytest.mark.parametrize("checkout", [("-b", "feature"), ("--detach", "HEAD")])
+def test_release_tag_requires_main(
+    version_repo: tuple[Any, Path], checkout: tuple[str, str]
+) -> None:
+    version, root = version_repo
+    version.run(root, "git", "checkout", "-q", *checkout)
+    with pytest.raises(ValueError, match="Check out main"):
+        version.tag_version(root)
+    assert not version.run(root, "git", "tag", "--list")
+
+
+@pytest.mark.parametrize("failure", ["uv", "mismatched lock"])
+def test_failed_bump_restores_both_files(
+    version_repo: tuple[Any, Path], monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    version, root = version_repo
+    run = version.run
+
+    def run_with_failed_update(path: Path, *command: str) -> str:
+        if command[0] == "git":
+            return run(path, *command)
+        if "--dry-run" in command:
+            assert command[-2:] == ("--bump", "minor")
+            return "0.2.0"
+        assert command == ("uv", "version", "--no-sync", "0.2.0")
+        (path / "pyproject.toml").write_text('[project]\nversion = "0.2.0"\n')
+        if failure == "uv":
+            (path / "uv.lock").write_text("partial write")
+            raise subprocess.CalledProcessError(1, command)
+        return ""
+
+    monkeypatch.setattr(version, "run", run_with_failed_update)
+    with pytest.raises((ValueError, subprocess.CalledProcessError)):
+        version.bump_version(root, "uv", "minor")
+    assert not run(root, "git", "status", "--porcelain")
+    assert not run(root, "git", "tag", "--list")
+
+
+@pytest.mark.parametrize(
+    ("kind", "draft", "covers"),
+    [
+        ("stable", False, True),
+        ("nightly", False, True),
+        ("nightly", True, False),
+        ("untagged", False, False),
+        ("older", False, False),
+    ],
+)
+def test_nightly_skips_only_commits_covered_by_a_published_release(
+    version_repo: tuple[Any, Path],
+    metadata: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    draft: bool,
+    covers: bool,
+) -> None:
+    version, root = version_repo
+    previous = version.run(root, "git", "rev-parse", "HEAD")
+    version.run(root, "git", "commit", "--allow-empty", "-qm", "Next change")
+    revision = version.run(root, "git", "rev-parse", "HEAD")
+    tag = f"nightly-{revision}" if kind in {"nightly", "untagged"} else "v0.1.0"
+    if kind != "untagged":
+        version.run(root, "git", "tag", tag, previous if kind == "older" else revision)
+    check_output = subprocess.check_output
+
+    def api(command: list[str], **kwargs: Any) -> str:
+        if command[0] == "gh":
+            release = {"tag_name": tag, "draft": draft, "prerelease": kind == "nightly"}
+            return json.dumps([[release]])
+        return check_output(command, **kwargs)
+
+    monkeypatch.setattr(metadata.subprocess, "check_output", api)
+    result = metadata.nightly_metadata("Owner/GraphArrow", revision, 42, root)
+    if covers:
+        assert result == {}
+    else:
+        expected = "0.1.1.dev42" if kind == "older" else "0.1.0.dev42"
+        assert result == {
+            "tag": f"nightly-{revision}",
+            "version": expected,
+            "prerelease": "true",
+            "image": "ghcr.io/owner/grapharrow",
+        }
 
 
 @pytest.fixture
@@ -100,6 +228,7 @@ def publication(metadata: Any, artifacts: Path, monkeypatch: pytest.MonkeyPatch)
         "GH_TOKEN": "test-placeholder",
     }.items():
         monkeypatch.setenv(key, value)
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
     calls = []
 
     def run(*args: str, capture: bool = False, **kwargs: Any) -> str:
@@ -245,32 +374,43 @@ def test_push_failure_keeps_the_release_unpublished(
     assert calls[-1] == ("docker", "logout", "ghcr.io")
 
 
-def test_prereleases_do_not_change_latest(
-    publication: Any, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("covered_during_build", [False, True])
+def test_nightly_creates_only_its_own_tag_after_image_validation(
+    publication: Any, monkeypatch: pytest.MonkeyPatch, covered_during_build: bool
 ) -> None:
     publisher, calls = publication
-    monkeypatch.setattr(
-        publisher,
-        "release_metadata",
-        lambda *args: {
-            "version": "0.1.0b1",
-            "prerelease": "true",
-            "image": "ghcr.io/owner/grapharrow",
-        },
-    )
+    tag, revision = "nightly-" + "a" * 40, "a" * 40
+    for path in Path("dist").glob("grapharrow-0.1.0*"):
+        path.rename(path.with_name(path.name.replace("0.1.0", "0.1.1.dev42")))
+    metadata = sys.modules["release_metadata"]
+    metadata.write_checksums(Path("dist"))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+    monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
+    monkeypatch.setenv("RELEASE_VERSION", "0.1.1.dev42")
+    monkeypatch.setenv("RELEASE_TAG", tag)
+    monkeypatch.setattr(publisher, "release_covers_commit", lambda *args: covered_during_build)
     original = publisher.run
 
     def run(*args: str, **kwargs: Any) -> str:
         value = original(*args, **kwargs)
         if args[:3] == ("docker", "image", "inspect"):
             data = json.loads(value)
-            data[0]["Config"]["Labels"]["org.opencontainers.image.version"] = "0.1.0b1"
+            data[0]["Config"]["Labels"]["org.opencontainers.image.version"] = "0.1.1.dev42"
             return json.dumps(data)
         return value
 
     monkeypatch.setattr(publisher, "run", run)
     publisher.main()
-    assert "--prerelease" in next(c for c in calls if c[:3] == ("gh", "release", "create"))
+    if covered_during_build:
+        assert all(c[0] != "docker" and "POST" not in c for c in calls)
+        return
+    created_ref = next(c for c in calls if c[:4] == ("gh", "api", "--method", "POST"))
+    assert created_ref[-4:] == ("-f", f"ref=refs/tags/{tag}", "-f", f"sha={revision}")
+    last_inspect = max(i for i, c in enumerate(calls) if c[:3] == ("docker", "image", "inspect"))
+    assert calls.index(created_ref) > last_inspect
+    creation = next(c for c in calls if c[:3] == ("gh", "release", "create"))
+    assert creation[3] == tag and "--prerelease" in creation
+    assert "GraphArrow 0.1.1.dev42 (Nightly)" in creation
     assert "--latest=false" in calls[-2]
     assert not any("ghcr.io/owner/grapharrow:latest" in c for c in calls)
 

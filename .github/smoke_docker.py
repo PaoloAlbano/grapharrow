@@ -43,8 +43,9 @@ def count(client: httpx.Client) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image")
+    parser.add_argument("--expected-version", default=version("grapharrow"))
     args = parser.parse_args()
-    expected = version("grapharrow")
+    expected = args.expected_version
     installed = docker(
         "run",
         "--rm",

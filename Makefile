@@ -1,4 +1,5 @@
 UV ?= uv
+PYTHON ?= python3
 PACKAGE ?= grapharrow
 SRC_DIRS := src tests
 ANTLR_JAR ?=
@@ -7,6 +8,7 @@ CYPHER_GENERATED := src/grapharrow/interfaces/opencypher/generated/vendor/opency
 .PHONY: help sync sync-dev lint format format-check typecheck test test-unit test-interface-comparison test-integration test-integration-live coverage check cli-help server-help bolt-help db-init db-show-catalog db-show-snapshot db-verify db-recover-dry-run db-bulk-add-nodes db-bulk-add-edges db-import-nodes db-import-edges serve bolt benchmark-backends benchmark-cypher-engine benchmark-tabular-json benchmark-ana-sessions clean
 .PHONY: generate-cypher-parser
 .PHONY: benchmark-cypher-columnar
+.PHONY: version
 
 help:
 	@printf "Available targets:\n"
@@ -43,7 +45,14 @@ help:
 	@printf "  make benchmark-tabular-json      Compare json vs orjson tabular serialization\n"
 	@printf "  make benchmark-ana-sessions      Measure ANA session latency and memory\n"
 	@printf "  make test-interface-comparison   Compare public graph interfaces and save results\n"
+	@printf "  make version                     Show the project version\n"
+	@printf "  make version BUMP=major|minor|patch  Prepare a release version\n"
+	@printf "  make version BUMP=tag            Tag the committed version locally\n"
 	@printf "  make clean        Remove local tool caches\n"
+
+version:
+	$(if $(strip $(BETA)),$(error Use a final version bump. Nightly builds run once a week))
+	@"$(PYTHON)" .github/version.py "$(or $(BUMP),show)" --uv "$(UV)"
 
 sync:
 	$(UV) sync --no-dev

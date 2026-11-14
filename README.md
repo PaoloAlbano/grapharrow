@@ -27,8 +27,9 @@ visibility, local writer coordination, conflict handling and object-storage limi
 ## Getting Started
 
 See [CI and Releases](docs/releases.md) for the Python test matrix, downloadable
-release wheels and versioned Docker images. Release publication starts when a
-maintainer pushes a matching `v*` tag; it is separate from ordinary main/PR CI.
+release wheels and versioned Docker images. Stable releases start from a
+maintainer-pushed `v*` tag. The Nightly runs once a week and publishes when
+`main` has new commits since the last release.
 
 This project requires Python 3.11+, Git and `uv`. ANA is installed with the
 standard dependencies; no optional extra or adjacent checkout is needed.

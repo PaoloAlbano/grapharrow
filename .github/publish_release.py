@@ -1,4 +1,4 @@
-"""Publish only the artifacts verified by the tag workflow; never rebuild them."""
+"""Publish only the artifacts verified by the release workflow."""
 
 from __future__ import annotations
 
@@ -9,7 +9,15 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from release_metadata import artifact_files, release_metadata, verify_checksums
+from release_metadata import (
+    DEVELOPMENT_VERSION,
+    NIGHTLY_TAG,
+    artifact_files,
+    publication_metadata,
+    release_covers_commit,
+    release_metadata,
+    verify_checksums,
+)
 
 
 def run(*args: str, capture: bool = False, **kwargs: Any) -> str:
@@ -58,14 +66,37 @@ def container_package_exists(repository: str) -> bool:
 def main() -> None:
     tag = os.environ["RELEASE_TAG"]
     repository = os.environ["GITHUB_REPOSITORY"]
-    metadata = release_metadata(tag, repository)
-    version, image = metadata["version"], metadata["image"]
     revision = os.environ["GITHUB_SHA"]
+    nightly = os.environ.get("GITHUB_EVENT_NAME") == "schedule"
+    if nightly:
+        version = os.environ["RELEASE_VERSION"]
+        if (
+            not DEVELOPMENT_VERSION.fullmatch(version)
+            or not NIGHTLY_TAG.fullmatch(tag)
+            or tag != f"nightly-{revision}"
+            or os.environ["GITHUB_REF"] != "refs/heads/main"
+        ):
+            raise ValueError("Unexpected nightly release identity")
+        metadata = publication_metadata(version, repository, prerelease=True)
+    else:
+        metadata = release_metadata(tag, repository)
+    version, image = metadata["version"], metadata["image"]
     verify_checksums(Path("dist"))
-    remote = json.loads(run("gh", "api", f"repos/{repository}/commits/{tag}", capture=True))
-    if remote["sha"] != revision:
-        raise ValueError("The remote tag moved after validation")
-    releases = json.loads(
+    if nightly:
+        package_names = {p.name for p in artifact_files(Path("dist"))}
+        if package_names != {
+            f"grapharrow-{version}-py3-none-any.whl",
+            f"grapharrow-{version}.tar.gz",
+            "runtime-requirements.txt",
+        }:
+            raise ValueError("Nightly distributions have an unexpected version")
+    if nightly:
+        run("git", "merge-base", "--is-ancestor", revision, "origin/main")
+    else:
+        remote = json.loads(run("gh", "api", f"repos/{repository}/commits/{tag}", capture=True))
+        if remote["sha"] != revision:
+            raise ValueError("The remote tag moved after validation")
+    pages = json.loads(
         run(
             "gh",
             "api",
@@ -75,22 +106,25 @@ def main() -> None:
             capture=True,
         )
     )
-    if any(r["tag_name"] == tag for page in releases for r in page):
+    releases = [release for page in pages for release in page]
+    if nightly and release_covers_commit(releases, revision):
+        print("This commit is already covered by a published release.")
+        return
+    if any(r["tag_name"] == tag for r in releases):
         raise ValueError(f"Release {tag} already exists; inspect any previous partial run")
     package_exists = container_package_exists(repository)
     latest = metadata["prerelease"] == "false"
     if latest:
         current = tuple(int(part) for part in version.split("."))
-        for page in releases:
-            for release in page:
-                match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", release["tag_name"])
-                if (
-                    match
-                    and not release.get("draft")
-                    and not release.get("prerelease")
-                    and tuple(map(int, match.groups())) > current
-                ):
-                    latest = False
+        for release in releases:
+            match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", release["tag_name"])
+            if (
+                match
+                and not release.get("draft")
+                and not release.get("prerelease")
+                and tuple(map(int, match.groups())) > current
+            ):
+                latest = False
     run(
         "docker",
         "login",
@@ -118,6 +152,21 @@ def main() -> None:
                 or labels.get("org.opencontainers.image.version") != version
             ):
                 raise ValueError(f"Downloaded {arch} image has unexpected release identity")
+        if nightly:
+            # Creating the ref is atomic and fails if the tag already exists.
+            # This uses a separate namespace from the owner's manual release tags.
+            run(
+                "gh",
+                "api",
+                "--method",
+                "POST",
+                f"repos/{repository}/git/refs",
+                "-f",
+                f"ref=refs/tags/{tag}",
+                "-f",
+                f"sha={revision}",
+                capture=True,
+            )
         args = [
             "gh",
             "release",
@@ -127,12 +176,12 @@ def main() -> None:
             "--draft",
             "--generate-notes",
             "--title",
-            tag,
+            f"GraphArrow {version} (Nightly)" if nightly else tag,
             *[str(p) for p in artifact_files(Path("dist"))],
             "dist/SHA256SUMS",
         ]
         if metadata["prerelease"] == "true":
-            args.append("--prerelease")
+            args.extend(("--prerelease", "--latest=false"))
         run(*args)
         for arch in ("amd64", "arm64"):
             target = f"{image}:{version}-{arch}"

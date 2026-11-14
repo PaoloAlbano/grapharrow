@@ -31,6 +31,7 @@ assert find_spec("neo4j") is None
 
 assert Path(grapharrow.__file__).is_relative_to(Path(sys.prefix)), grapharrow.__file__
 assert version('grapharrow') == os.environ['GRAPHARROW_EXPECTED_VERSION']
+assert grapharrow.__version__ == version('grapharrow')
 token = secrets.token_urlsafe(32)
 auth = Path('clients.json')
 auth.write_text(json.dumps({'clients': [{'id': 'smoke', 'api_key': token, 'profile': 'readonly'}]}))

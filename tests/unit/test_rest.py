@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+import grapharrow
 from grapharrow.config import GraphArrowSettings
 from grapharrow.core.errors import WriteConflictError
 from grapharrow.interfaces.rest import create_rest_app
@@ -11,8 +12,9 @@ from grapharrow.interfaces.rest import create_rest_app
 
 def test_rest_reports_the_installed_package_version(tmp_path: Path) -> None:
     app = create_rest_app(tmp_path / "version")
-    assert app.version == version("grapharrow")
-    assert TestClient(app).get("/openapi.json").json()["info"]["version"] == version("grapharrow")
+    assert grapharrow.__version__ == version("grapharrow")
+    assert app.version == grapharrow.__version__
+    assert TestClient(app).get("/openapi.json").json()["info"]["version"] == grapharrow.__version__
 
 
 def test_rest_write_conflict_is_a_409_response(
