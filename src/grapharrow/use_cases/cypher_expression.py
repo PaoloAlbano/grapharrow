@@ -29,6 +29,7 @@ from grapharrow.use_cases.cypher_temporal import (
 Row = dict[str, Any]
 Scope = dict[str, str]
 LIST_ACCESSORS = frozenset({"head", "last", "tail"})
+PERCENTILE_FUNCTIONS = frozenset({"percentilecont", "percentiledisc"})
 TYPED_SCALAR_FUNCTIONS = frozenset(
     {
         "rand",
@@ -169,10 +170,28 @@ class ExpressionCompiler:
                             f"Invalid operand for {function}", phase="compile"
                         )
                 return Expression("function", function, arguments)
-            if function in {"count", "sum", "avg", "min", "max", "collect"}:
-                if len(arguments) != 1 or any(has_aggregate(a) for a in arguments):
+            percentile = function in PERCENTILE_FUNCTIONS
+            if percentile or function in {"count", "sum", "avg", "min", "max", "collect"}:
+                if percentile:
+                    if len(arguments) != 2:
+                        raise QueryError.syntax(
+                            f"{function}() requires a value and a percentile.",
+                            "InvalidNumberOfArguments",
+                        )
+                    if any(has_aggregate(argument) for argument in arguments):
+                        raise QueryError.syntax(
+                            "Percentile arguments cannot contain aggregates.", "NestedAggregation"
+                        )
+                    if any(
+                        known_kind(argument, scope) not in {"number", "any", "scalar", "null"}
+                        for argument in arguments
+                    ):
+                        raise QueryError.invalid_type(
+                            f"{function}() requires numeric arguments.", phase="compile"
+                        )
+                elif len(arguments) != 1 or any(has_aggregate(a) for a in arguments):
                     raise QueryError("Aggregates require one non-aggregate operand")
-                if _contains_rand(arguments[0]):
+                if any(_contains_rand(argument) for argument in arguments):
                     raise QueryError.syntax(
                         "Project rand() before aggregating its value.", "NonConstantExpression"
                     )
@@ -729,6 +748,8 @@ class ExpressionEvaluator:
             function, distinct = value
             if not args:
                 return len(group)
+            if function in PERCENTILE_FUNCTIONS:
+                return self._percentile(function, distinct, args[0], args[1], group)
             values = [self.evaluate(args[0], r) for r in group]
             values = [v for v in values if v is not None]
             if distinct:
@@ -968,3 +989,65 @@ class ExpressionEvaluator:
             true_count = sum(r is True for r in results)
             return False if true_count > 1 else None if None in results else true_count == 1
         raise QueryError(f"Unsupported expression operation: {kind}")
+
+    def _percentile(
+        self,
+        function: str,
+        distinct: bool,
+        sample_expression: Expression,
+        percentile_expression: Expression,
+        group: list[Row],
+    ) -> int | float | None:
+        samples: list[int | float] = []
+        seen: set[Any] | None = set() if distinct else None
+        percentile: float | None = None
+        for row in group:
+            sample = self.evaluate(sample_expression, row)
+            if sample is None:
+                continue
+            if type(sample) not in {int, float}:
+                raise QueryError.invalid_type(
+                    f"{function}() requires numeric samples.", phase="runtime"
+                )
+            if percentile is None:
+                # The first contributing row supplies the percentile for the group.
+                argument = self.evaluate(percentile_expression, row)
+                if type(argument) not in {int, float}:
+                    raise QueryError.invalid_type(
+                        f"{function}() requires a numeric percentile.", phase="runtime"
+                    )
+                if not 0 <= argument <= 1:
+                    raise QueryError(
+                        f"{function}() requires a percentile between 0 and 1.",
+                        category="ArgumentError",
+                        phase="runtime",
+                        detail="NumberOutOfRange",
+                    )
+                percentile = float(argument)
+            if seen is not None:
+                key = freeze(sample)
+                if key in seen:
+                    continue
+                seen.add(key)
+            samples.append(sample)
+
+        if percentile is None:
+            return None
+        discrete = function == "percentiledisc"
+        if percentile in {0.0, 1.0}:
+            edge = (
+                min(samples, key=sort_key)
+                if percentile == 0.0
+                else max(reversed(samples), key=sort_key)
+            )
+            return edge if discrete else float(edge)
+
+        samples.sort(key=sort_key)
+        if discrete:
+            return samples[math.ceil(percentile * len(samples)) - 1]
+        position = percentile * (len(samples) - 1)
+        lower, upper = math.floor(position), math.ceil(position)
+        if lower == upper or samples[lower] == samples[upper]:
+            return float(samples[lower])
+        fraction = position - lower
+        return (1.0 - fraction) * samples[lower] + fraction * samples[upper]

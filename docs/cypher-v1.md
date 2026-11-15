@@ -161,6 +161,20 @@ RETURN p.country AS country, count(*) AS total
 ORDER BY total DESC
 ```
 
+`percentileCont(value, percentile)` computes a floating-point percentile by
+linear interpolation. `percentileDisc(value, percentile)` selects an observed
+number and preserves its type. Both ignore null samples and return null when
+no samples contribute. `DISTINCT` removes duplicate samples. The
+percentile is evaluated on the first contributing row of each group and must
+be a number in the inclusive range from 0 to 1.
+
+```cypher
+MATCH (p:Person)
+RETURN p.country AS country,
+       percentileCont(p.age, 0.5) AS medianAge,
+       percentileDisc(p.age, 0.9) AS observed90thPercentile
+```
+
 ### Temporal values
 
 `date()`, `localtime()`, `time()`, `localdatetime()` and `datetime()` accept

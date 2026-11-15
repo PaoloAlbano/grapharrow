@@ -23,6 +23,7 @@ from grapharrow.domain import SnapshotManifest
 from grapharrow.repositories import EdgeRecord, NodeRecord
 from grapharrow.use_cases import cypher as core
 from grapharrow.use_cases.cypher_expression import (
+    PERCENTILE_FUNCTIONS,
     TYPED_SCALAR_FUNCTIONS,
     Expression,
     ExpressionCompiler,
@@ -162,6 +163,7 @@ def needs_pipeline(tree: Any, source: str, parameters: Mapping[str, object] | No
             "case",
             "coalesce",
             *TYPED_SCALAR_FUNCTIONS,
+            *PERCENTILE_FUNCTIONS,
             "with",
             "union",
             "call",
@@ -241,7 +243,8 @@ def needs_pipeline(tree: Any, source: str, parameters: Mapping[str, object] | No
             return True
         if (
             name == "oC_FunctionInvocation"
-            and node.oC_FunctionName().getText().lower() in TYPED_SCALAR_FUNCTIONS | {"coalesce"}
+            and node.oC_FunctionName().getText().lower()
+            in TYPED_SCALAR_FUNCTIONS | PERCENTILE_FUNCTIONS | {"coalesce"}
         ):
             return True
         if name == "oC_MultiPartQuery" and len(node.oC_With()) > 1:
@@ -635,7 +638,7 @@ class ReadCompiler:
                         or (
                             rule(part) == "oC_FunctionInvocation"
                             and identifier(part.oC_FunctionName().getText()).lower()
-                            in TYPED_SCALAR_FUNCTIONS
+                            in TYPED_SCALAR_FUNCTIONS | PERCENTILE_FUNCTIONS
                         )
                         for part in walk(expression)
                     )
