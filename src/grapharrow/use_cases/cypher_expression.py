@@ -32,10 +32,14 @@ LIST_ACCESSORS = frozenset({"head", "last", "tail"})
 PERCENTILE_FUNCTIONS = frozenset({"percentilecont", "percentiledisc"})
 TYPED_SCALAR_FUNCTIONS = frozenset(
     {
+        "ceil",
         "rand",
         "range",
         "reverse",
         "properties",
+        "split",
+        "sqrt",
+        "substring",
         *LIST_ACCESSORS,
         *SCALAR_CONVERSIONS,
         *TEMPORAL_ARITIES,
@@ -134,7 +138,10 @@ class ExpressionCompiler:
             arguments = tuple(build(p) for p in node.oC_Expression())
             if function in TYPED_SCALAR_FUNCTIONS:
                 allowed_counts = TEMPORAL_ARITIES.get(
-                    function, {"rand": (0,), "range": (2, 3)}.get(function, (1,))
+                    function,
+                    {"rand": (0,), "range": (2, 3), "split": (2,), "substring": (2, 3)}.get(
+                        function, (1,)
+                    ),
                 )
                 if len(arguments) not in allowed_counts:
                     raise QueryError.syntax(
@@ -569,6 +576,21 @@ def _range_values(arguments: list[Any]) -> list[int]:
     return list(range(start, end + (1 if step > 0 else -1), step))
 
 
+def _substring(value: str, positions: list[Any]) -> str:
+    if any(type(position) is not int for position in positions):
+        raise QueryError.invalid_type("substring() requires integer bounds.", phase="runtime")
+    if any(position < 0 for position in positions):
+        raise QueryError(
+            "substring() requires nonnegative bounds.",
+            category="ArgumentError",
+            phase="runtime",
+            detail="NumberOutOfRange",
+        )
+    start = positions[0]
+    end = start + positions[1] if len(positions) == 2 else None
+    return value[start:end]
+
+
 def public_value(value: Any) -> Any:
     if isinstance(value, Instant | Duration):
         return TemporalResult(value)
@@ -700,6 +722,21 @@ class ExpressionEvaluator:
             operand = evaluate(args[0])
             if operand is None:
                 return None
+            if value in {"ceil", "sqrt"} and type(operand) in {int, float}:
+                number = float(operand)
+                if value == "sqrt":
+                    return math.nan if number < 0 else math.sqrt(number)
+                return math.copysign(math.ceil(number), number) if math.isfinite(number) else number
+            if value == "split":
+                delimiter = evaluate(args[1])
+                if delimiter is None:
+                    return None
+                if isinstance(operand, str) and isinstance(delimiter, str):
+                    if not delimiter:
+                        return list(operand) if operand else ["", ""]
+                    return operand.split(delimiter)
+            if value == "substring" and isinstance(operand, str):
+                return _substring(operand, [evaluate(arg) for arg in args[1:]])
             if value in SCALAR_CONVERSIONS:
                 if value == "tostring" and isinstance(operand, Instant | Duration):
                     return str(operand)
@@ -852,10 +889,8 @@ class ExpressionEvaluator:
             return True if True in results else None if None in results else False
         if kind == "string":
             left, right = evaluate(args[0]), evaluate(args[1])
-            if left is None or right is None:
-                return None
             if not isinstance(left, str) or not isinstance(right, str):
-                raise QueryError.invalid_type("String predicates require strings", phase="runtime")
+                return None
             return (
                 left.startswith(right)
                 if value == "starts"

@@ -1,5 +1,6 @@
 """Columnar pipelines must preserve row semantics and avoid canonical graph reads."""
 
+import math
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -103,6 +104,50 @@ def test_columnar_and_row_results_match(
     expected = app.use_cases.cypher.execute(query)
     monkeypatch.delenv("GRAPHARROW_DISABLE_CYPHER_COLUMNAR")
     assert app.use_cases.cypher.execute(query) == expected
+
+
+def test_numeric_functions_and_string_predicates_use_arrow_columns(
+    app: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbid_graph_read(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("Query loaded the complete graph")
+
+    monkeypatch.setattr(app.use_cases.graph, "load_state", forbid_graph_read)
+    result = app.use_cases.cypher.execute(
+        "MATCH (p:Person) RETURN p.name AS name, ceil(p.age) AS ceiling, sqrt(p.age) AS root, "
+        "p.age STARTS WITH '3' AS prefix, p.name CONTAINS $suffix AS hasPart ORDER BY name",
+        {"suffix": 3},
+    )
+    assert result.rows == (
+        {"name": "Alice", "ceiling": 30.0, "root": math.sqrt(30), "prefix": None, "hasPart": None},
+        {"name": "Bob", "ceiling": 20.0, "root": math.sqrt(20), "prefix": None, "hasPart": None},
+        {"name": "Carol", "ceiling": 30.0, "root": math.sqrt(30), "prefix": None, "hasPart": None},
+        {"name": "Dan", "ceiling": None, "root": None, "prefix": None, "hasPart": None},
+    )
+
+
+@pytest.mark.parametrize("operator", ["CONTAINS", "STARTS WITH", "ENDS WITH"])
+def test_negated_string_predicate_on_non_text_does_not_match(app: Any, operator: str) -> None:
+    cypher = app.use_cases.cypher
+    assert (
+        cypher.execute(
+            f"MATCH (p:Person) WHERE NOT p.age {operator} '3' RETURN p.name AS name"
+        ).rows
+        == ()
+    )
+    assert (
+        cypher.execute(
+            f"MATCH (p:Person) WHERE NOT p.name {operator} $argument RETURN p.name AS name",
+            {"argument": 3},
+        ).rows
+        == ()
+    )
+
+
+def test_computed_string_predicate_operand_reaches_expression_pipeline(app: Any) -> None:
+    assert app.use_cases.cypher.execute(
+        "MATCH (p:Person) WHERE p.name STARTS WITH 'A' + 'l' RETURN p.name AS name"
+    ).rows == ({"name": "Alice"},)
 
 
 @pytest.mark.parametrize(

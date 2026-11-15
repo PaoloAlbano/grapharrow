@@ -235,7 +235,7 @@ class StringPredicate:
     variable: str
     field: str
     operator: str
-    value: object
+    value: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -5834,10 +5834,28 @@ def _compile_string_predicate(
     expression = predicate_ctx.oC_AddOrSubtractExpression()
     if expression is None:
         raise QueryError("String predicates require a right-hand operand.")
-    value = _parse_value(expression.getText(), params)
-    if not isinstance(value, str):
-        raise QueryError("String predicates require a string literal or parameter value.")
-    return StringPredicate(variable=variable, field=field, operator=operator, value=value)
+    atom = _single_predicate_atom(expression)
+    literal = atom.oC_Literal() if atom is not None else None
+    if (
+        atom is None
+        or atom.getText() != expression.getText()
+        or (
+            atom.oC_Parameter() is None
+            and (
+                literal is None
+                or literal.oC_ListLiteral() is not None
+                or literal.oC_MapLiteral() is not None
+            )
+        )
+    ):
+        raise QueryError("Computed string operands require the expression pipeline.")
+    value = _parse_value(atom.getText(), params)
+    return StringPredicate(
+        variable=variable,
+        field=field,
+        operator=operator,
+        value=value if isinstance(value, str) else None,
+    )
 
 
 def _compile_exists_predicate(
@@ -13266,10 +13284,8 @@ def _predicate_mask(
             variable=predicate.variable,
             field=predicate.field,
         )
-        if column is None:
+        if column is None or predicate.field == "labels":
             return pa.nulls(table.num_rows, type=pa.bool_())
-        if predicate.field == "labels":
-            raise QueryError("String predicates are not supported for labels(...).")
         return _string_predicate_mask(column, predicate.operator, predicate.value)
 
     if isinstance(predicate, ExistsPredicate):
@@ -13560,10 +13576,12 @@ def _comparison_mask(column: pa.ChunkedArray, operator: str, value: object) -> p
     return result
 
 
-def _string_predicate_mask(column: pa.ChunkedArray, operator: str, value: object) -> pa.Array:
+def _string_predicate_mask(column: pa.ChunkedArray, operator: str, value: str | None) -> pa.Array:
     """Support the current Cypher compilation or execution step."""
-    if not isinstance(value, str):
-        raise QueryError("String predicate values must be strings.")
+    if value is None or not (
+        pa.types.is_string(column.type) or pa.types.is_large_string(column.type)
+    ):
+        return pa.nulls(len(column), type=pa.bool_())
     if _has_encoded_values(column):
         decoded = [_decode_join_json_value(entry) for entry in column.to_pylist()]
         column = pa.chunked_array(

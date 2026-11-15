@@ -134,11 +134,18 @@ Read a node or relationship property by a computed string key with
 
 The implemented expression subset includes comparisons, boolean composition,
 `IN`, null checks, property existence checks, `CONTAINS`, `STARTS WITH`,
-`ENDS WITH`, `id`, `labels`, `type`, `keys`, `toLower`, `toUpper`, `size`, `abs`
-and arithmetic expressions. Read projections can compose these with searched
-and simple `CASE`, `coalesce`, lists, maps, indexing, slicing, list comprehensions
+`ENDS WITH`, `id`, `labels`, `type`, `keys`, `toLower`, `toUpper`, `size`, `abs`,
+`ceil`, `sqrt`, `split`, `substring` and arithmetic expressions. Read projections
+can compose these with searched and simple `CASE`, `coalesce`, lists, maps,
+indexing, slicing, list comprehensions
 and `all`/`any`/`none`/`single` predicates. Unknown functions and variables are
 rejected during compilation, including in an unselected `CASE` branch.
+
+`split(text, delimiter)` splits on a literal string delimiter. `substring(text,
+start[, length])` uses zero-based Unicode character positions and returns the
+rest of the string when `length` is omitted. `ceil()` and `sqrt()` return floats.
+The square root of a negative number returns `NaN`. String predicates return
+`null` if either operand is null or a non-string value.
 
 `CASE` evaluates only the selected result; `coalesce` stops at the first non-null
 argument. Predicates retain three-valued null semantics. Simple `CASE` compares

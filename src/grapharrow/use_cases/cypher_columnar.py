@@ -71,7 +71,15 @@ def dependencies(expression: Expression, entities: set[str]) -> set[str]:
         return set()
     if kind == "binary" and value not in {"+", "-", "*"}:
         raise UnsupportedColumnar
-    if kind == "function" and value not in {"coalesce", "abs", "size", "tolower", "toupper"}:
+    if kind == "function" and value not in {
+        "coalesce",
+        "abs",
+        "ceil",
+        "size",
+        "sqrt",
+        "tolower",
+        "toupper",
+    }:
         raise UnsupportedColumnar
     if kind not in {
         "binary",
@@ -321,6 +329,8 @@ def evaluate(expression: Expression, batch: Batch) -> Any:
         operand = operands[0]
         if value == "abs" and category in {"null", "int", "float"}:
             return pc.abs_checked(operand)
+        if value in {"ceil", "sqrt"} and category in {"null", "int", "float"}:
+            return pc.ceil(operand) if value == "ceil" else pc.sqrt(operand)
         if value == "size" and category in {"null", "str"}:
             return pc.utf8_length(operand)
         if value in {"tolower", "toupper"} and category in {"null", "str"}:
@@ -348,9 +358,9 @@ def evaluate(expression: Expression, batch: Batch) -> Any:
         return otherwise
     if kind == "string":
         operand, pattern = ev(args[0]), ev(args[1])
-        if _compatible([operand, pattern]) not in {"str", "null"} or not isinstance(
-            pattern, pa.Scalar
-        ):
+        if _category(operand.type) != "str" or _category(pattern.type) != "str":
+            return pa.scalar(None, type=pa.bool_())
+        if not isinstance(pattern, pa.Scalar):
             raise UnsupportedColumnar
         if not pattern.is_valid:
             return pa.scalar(None, type=pa.bool_())

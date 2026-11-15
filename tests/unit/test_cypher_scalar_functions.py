@@ -1,5 +1,6 @@
-"""Regression tests for list accessors and properties()."""
+"""Regression tests for scalar Cypher functions."""
 
+import math
 from pathlib import Path
 
 import pytest
@@ -55,3 +56,59 @@ def test_dynamic_invalid_operands(tmp_path: Path, function: str) -> None:
     with Database(tmp_path / "db").read_transaction() as session, pytest.raises(QueryError) as err:
         session.query(f"UNWIND [1] AS x RETURN {function}(x)")
     assert (err.value.phase, err.value.category) == ("runtime", "TypeError")
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ("split(',one,,two,', ',')", ["", "one", "", "two", ""]),
+        ("split('a.b', '.')", ["a", "b"]),
+        ("split('a😀é', '')", ["a", "😀", "é"]),
+        ("split('', '')", ["", ""]),
+        ("split('a', null)", None),
+        ("substring('a😀é', 1, 1)", "😀"),
+        ("substring('a😀é', 1)", "😀é"),
+        ("substring('abc', 10)", ""),
+        ("substring('abc', 1, 5)", "bc"),
+        ("substring(null, null)", None),
+    ],
+)
+def test_string_scalar_functions(tmp_path: Path, expression: str, expected: object) -> None:
+    with Database(tmp_path / "db").read_transaction() as session:
+        assert session.query(f"RETURN {expression} AS value").rows == ({"value": expected},)
+
+
+def test_ceil_and_sqrt_return_ieee_floats(tmp_path: Path) -> None:
+    with Database(tmp_path / "db").read_transaction() as session:
+        row = session.query(
+            "RETURN ceil(2) AS ceiling, sqrt(9) AS root, ceil(-0.5) AS zero, "
+            "ceil(toFloat('Infinity')) AS infinity, sqrt(-1) AS nan, sqrt(null) AS missing"
+        ).rows[0]
+    assert type(row["ceiling"]) is float and row["ceiling"] == 2.0
+    assert type(row["root"]) is float and row["root"] == 3.0
+    assert row["zero"] == 0.0 and math.copysign(1, row["zero"]) == -1.0
+    assert row["infinity"] == math.inf
+    assert math.isnan(row["nan"])
+    assert row["missing"] is None
+
+
+@pytest.mark.parametrize(
+    ("expression", "phase", "detail"),
+    [
+        ("split('a')", "compile", "InvalidNumberOfArguments"),
+        ("substring('a')", "compile", "InvalidNumberOfArguments"),
+        ("sqrt(1, 2)", "compile", "InvalidNumberOfArguments"),
+        ("ceil(DISTINCT 1)", "compile", "InvalidArgumentPassingMode"),
+        ("split('a', 1)", "runtime", "InvalidArgumentType"),
+        ("substring('a', 0, null)", "runtime", "InvalidArgumentType"),
+        ("substring('a', 1.0)", "runtime", "InvalidArgumentType"),
+        ("substring('a', -1)", "runtime", "NumberOutOfRange"),
+        ("sqrt(false)", "runtime", "InvalidArgumentType"),
+    ],
+)
+def test_new_scalar_functions_reject_bad_arguments(
+    tmp_path: Path, expression: str, phase: str, detail: str
+) -> None:
+    with Database(tmp_path / "db").read_transaction() as session, pytest.raises(QueryError) as err:
+        session.query(f"RETURN {expression}")
+    assert (err.value.phase, err.value.detail) == (phase, detail)
