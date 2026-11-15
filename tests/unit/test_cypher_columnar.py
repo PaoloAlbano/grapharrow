@@ -7,6 +7,7 @@ import pyarrow as pa
 import pytest
 
 from grapharrow.app import build_application
+from grapharrow.config import GraphArrowSettings
 from grapharrow.core.errors import QueryError
 
 
@@ -100,6 +101,119 @@ def test_columnar_and_row_results_match(
     expected = app.use_cases.cypher.execute(query)
     monkeypatch.delenv("GRAPHARROW_DISABLE_CYPHER_COLUMNAR")
     assert app.use_cases.cypher.execute(query) == expected
+
+
+@pytest.mark.parametrize(
+    "anchor, pattern, name, expected",
+    [
+        (
+            "MATCH (p:Person {name:$name})",
+            "(a)-[:LINK]->(q:Person)",
+            "Alice",
+            ["Alice", "Bob", "Bob"],
+        ),
+        (
+            "MATCH (p:Person) WHERE p.name=$name",
+            "(a)<-[:LINK]-(q:Person)",
+            "Bob",
+            ["Alice", "Alice"],
+        ),
+        (
+            "MATCH (p:Person {name:$name})",
+            "(a)-[:LINK]->(:Person)<-[:LINK]-(q:Person)",
+            "Alice",
+            ["Alice", "Alice"],
+        ),
+        ("MATCH (p:Person {name:$name})", "(a)-[:LINK]->(q:Person)", "Missing", []),
+    ],
+)
+def test_selective_with_match_uses_tabular_expansion(
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    anchor: str,
+    pattern: str,
+    name: str,
+    expected: list[str],
+) -> None:
+    cypher = app.use_cases.cypher
+    cypher.execute(
+        "MATCH (a:Person {name:'Alice'}), (b:Person {name:'Bob'}) "
+        "CREATE (a)-[:LINK]->(a), (a)-[:LINK]->(b), (a)-[:LINK]->(b)"
+    )
+    cypher.execute("CREATE INDEX person_name FOR (p:Person) ON (p.name)")
+    query = f"{anchor} WITH p AS a MATCH {pattern} RETURN q.name AS name"
+    params = {"name": name}
+    monkeypatch.setenv("GRAPHARROW_DISABLE_CYPHER_COLUMNAR", "1")
+    reference = cypher.execute(query, params)
+    monkeypatch.delenv("GRAPHARROW_DISABLE_CYPHER_COLUMNAR")
+
+    def forbid_records(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("Selective expansion loaded every graph record")
+
+    graph = app.use_cases.graph
+    monkeypatch.setattr(graph, "load_state", forbid_records)
+    result = cypher.execute(query, params)
+    assert result.columns == reference.columns == ("name",)
+    assert sorted(row["name"] for row in result.rows) == expected
+    assert sorted(row["name"] for row in reference.rows) == expected
+    assert graph.property_indexes.builds == 1
+    if expected:
+        assert graph.adjacency_indexes._entries
+
+
+def test_selective_expansion_keeps_snapshot_pinned_during_planning(
+    app: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph = app.use_cases.graph
+    cypher = app.use_cases.cypher
+    cypher.execute(
+        "MATCH (a:Person {name:'Alice'}), (b:Person {name:'Bob'}) CREATE (a)-[:LINK]->(b)"
+    )
+    original_schema = graph.load_node_property_schema
+
+    def publish_after_capture(**kwargs: Any) -> Any:
+        monkeypatch.setattr(graph, "load_node_property_schema", original_schema)
+        schema = original_schema(**kwargs)
+        cypher.execute(
+            "MATCH (a:Person {name:'Alice'}), (c:Person {name:'Carol'}) CREATE (a)-[:LINK]->(c)"
+        )
+        return schema
+
+    monkeypatch.setattr(graph, "load_node_property_schema", publish_after_capture)
+    query = (
+        "MATCH (a:Person {name:'Alice'}) WITH a MATCH (a)-[:LINK]->(q:Person) RETURN q.name AS name"
+    )
+    assert cypher.execute(query).rows == ({"name": "Bob"},)
+    assert sorted(row["name"] for row in cypher.execute(query).rows) == ["Bob", "Carol"]
+
+
+def test_selective_expansion_preserves_native_text_values(tmp_path: Path) -> None:
+    app = build_application(
+        tmp_path / "native-text",
+        settings=GraphArrowSettings(_env_file=None, parquet_filter_pushdown_enabled=False),
+    )
+    graph = app.use_cases.graph
+    _, nodes = graph.create_nodes_bulk(
+        table=pa.table({"name": ["Alice", '__grapharrow_join_json__:"Alice"', "Bob", "Carol"]}),
+        default_labels=("Person",),
+    )
+    raw = '__grapharrow_join_json__:{"value":1}'
+    graph.create_edges_bulk(
+        table=pa.table(
+            {
+                "src_id": [nodes[0].node_id, nodes[1].node_id],
+                "dst_id": [nodes[2].node_id, nodes[3].node_id],
+                "rel_type": ["LINK", "LINK"],
+            }
+        )
+    )
+    cypher = app.use_cases.cypher
+    cypher.execute("MATCH (p:Person {name:'Bob'}) SET p.value=$value", {"value": raw})
+    result = cypher.execute(
+        "MATCH (a:Person {name:'Alice'}) WITH a MATCH (a)-[:LINK]->(b:Person) "
+        "RETURN b.value AS value, b.value AS copy"
+    )
+    assert result.rows == ({"value": raw, "copy": raw},)
 
 
 @pytest.mark.parametrize(

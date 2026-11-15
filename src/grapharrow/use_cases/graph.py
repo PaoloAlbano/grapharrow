@@ -129,12 +129,15 @@ class GraphStateUseCase:
             edges=edges,
         )
 
-    def load_tabular_state(self, *, include_edges: bool = True) -> GraphTabularState:
-        """Load the current snapshot and the canonical tables needed by the caller."""
+    def load_tabular_state(
+        self, *, include_edges: bool = True, snapshot: SnapshotManifest | None = None
+    ) -> GraphTabularState:
+        """Load canonical tables from a pinned or current snapshot using the live catalog."""
 
         self._admin_service.initialize()
         catalog = self._catalog_store.load()
-        snapshot = self._snapshot_store.load_manifest()
+        if snapshot is None:
+            snapshot = self._snapshot_store.load_manifest()
         node_table = self._graph_store.load_node_table(snapshot.nodes)
         edge_table = (
             self._graph_store.load_edge_table(snapshot.edges)

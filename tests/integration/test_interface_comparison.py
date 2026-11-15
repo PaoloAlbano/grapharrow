@@ -211,6 +211,11 @@ class Case:
             "WHERE c.name='Acme' } RETURN p.name AS name ORDER BY name",
             [{"name": "Alice"}, {"name": "Bob"}],
         ),
+        (
+            "MATCH (c:Company {name:'Beta'}) WITH c AS employer "
+            "MATCH (employer)<-[:WORKS]-(p:Person) RETURN employer.name AS name",
+            [{"name": "Beta"}, {"name": "Beta"}],
+        ),
     ],
 )
 def test_composable_cypher_matches_across_frontends(

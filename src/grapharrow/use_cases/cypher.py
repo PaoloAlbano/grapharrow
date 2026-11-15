@@ -1185,10 +1185,15 @@ class CypherQueryUseCase:
         return _build_query_result_from_table(query.return_items, result_rows)
 
     def _execute_match_logical_plan(
-        self, plan: MatchLogicalPlan, *, include_edges: bool = True
+        self,
+        plan: MatchLogicalPlan,
+        *,
+        include_edges: bool = True,
+        state: GraphTabularState | None = None,
     ) -> MatchLogicalPlanResult:
         """Execute this query shape and return the result needed by the caller."""
-        state = self._graph_service.load_tabular_state(include_edges=include_edges)
+        if state is None:
+            state = self._graph_service.load_tabular_state(include_edges=include_edges)
         adjacency_loader = self._adjacency_loader_for_state(state)
         edge_property_loader = self._edge_property_loader_for_state(state)
         node_property_loader = self._node_property_loader_for_state(state)
@@ -12722,7 +12727,17 @@ def _apply_node_property_table_pattern_filter(
     for key, value in pattern.properties.items():
         if key not in property_table.column_names:
             return property_table.slice(0, 0)
-        masks.append(_comparison_mask(property_table[key], "=", value))
+        column = property_table[key]
+        field = property_table.schema.field(key)
+        if (
+            isinstance(value, str)
+            and pa.types.is_string(field.type)
+            and (field.metadata or {}).get(b"grapharrow.encoding") == b"native"
+        ):
+            # Native text can contain the same prefix used for encoded join values.
+            masks.append(pc.equal(column, value))
+        else:
+            masks.append(_comparison_mask(column, "=", value))
     return _filter_table_with_masks(property_table, masks)
 
 

@@ -1,6 +1,6 @@
 """Narrow Parquet scans and Arrow projections for composable node reads.
 
-Eligibility is conservative: one labeled node scan followed by projections.
+Eligibility covers labeled node scans with projections and selective fixed-hop reads.
 Physical encoding metadata is checked before offering any reader predicates.
 Unsupported types or kernels fall back on the same captured snapshot.
 """
@@ -141,6 +141,101 @@ def plan_branch(branch: ReadBranch) -> ScanPlan:
     if entities or not projections:
         raise UnsupportedColumnar
     return ScanPlan(match, pattern, tuple(sorted(fields)), tuple(projections), tuple(residual))
+
+
+def _plan_selective_expansion(query: ReadQuery) -> core.CompiledMatchQuery | None:
+    """Lower a pass-through WITH to the existing Arrow scan and expand operators."""
+    if len(query.branches) != 1:
+        return None
+    branch = query.branches[0]
+    if branch.initial_scope or len(branch.stages) != 4:
+        return None
+    start, carried, expansion, result = branch.stages
+    if not isinstance(start, MatchStage) or not isinstance(expansion, MatchStage):
+        return None
+    if any(
+        stage.optional or stage.paths or len(stage.patterns) != 1 for stage in (start, expansion)
+    ):
+        return None
+    if expansion.predicate is not None:
+        return None
+    for stage in (carried, result):
+        if not isinstance(stage, ProjectionStage) or (
+            stage.globals
+            or stage.distinct
+            or stage.predicate
+            or stage.ordering
+            or stage.skip is not None
+            or stage.limit is not None
+        ):
+            return None
+    assert isinstance(carried, ProjectionStage) and isinstance(result, ProjectionStage)
+    anchor, path = start.patterns[0], expansion.patterns[0]
+    if not isinstance(anchor, core.NodePattern) or len(anchor.labels) != 1:
+        return None
+    if not isinstance(path, core.PathPattern) or not 1 <= len(path.steps) <= 2:
+        return None
+    if carried.items != ((path.start.variable, Expression("variable", anchor.variable)),):
+        return None
+    if path.start.labels or path.start.properties or path.capture_relationships:
+        return None
+    if any(
+        step.variable is not None
+        or step.rel_type is None
+        or step.variable_length
+        or step.direction == "undirected"
+        or step.properties
+        or len(step.node.labels) != 1
+        or step.node.properties
+        for step in path.steps
+    ):
+        return None
+
+    equalities = anchor.properties
+    if start.predicate is not None:
+        predicate = start.predicate
+        if equalities or predicate.kind != "compare" or predicate.value != ("=",):
+            return None
+        left, right = predicate.arguments
+        if (
+            left.kind != "property"
+            or left.arguments != (Expression("variable", anchor.variable),)
+            or right.kind != "literal"
+        ):
+            return None
+        equalities = {left.value: right.value}
+    if len(equalities) != 1 or any(
+        type(value) not in {bool, int, str} for value in equalities.values()
+    ):
+        return None
+
+    variables = {path.start.variable, *(step.node.variable for step in path.steps)}
+    if len(variables) != len(path.steps) + 1:
+        return None
+    returns = []
+    for name, expression in result.items:
+        if expression.kind != "property":
+            return None
+        owner = expression.arguments[0]
+        if owner.kind != "variable" or owner.value not in variables:
+            return None
+        returns.append(core.ReturnItem(name, owner.value, expression.value))
+    fields = (*equalities, *(item.field for item in returns))
+    if any(
+        field in {None, "id", "keys", "labels", "node_id"} or field.startswith("__")
+        for field in fields
+    ):
+        return None
+    path = replace(path, start=replace(anchor, variable=path.start.variable, properties=equalities))
+    return core.CompiledMatchQuery(
+        patterns=(path,),
+        where_predicate=None,
+        return_items=tuple(returns),
+        distinct=False,
+        order_by=None,
+        skip=None,
+        limit=None,
+    )
 
 
 def _category(dtype: pa.DataType) -> str:
@@ -301,6 +396,10 @@ class ColumnarReadRuntime:
         if not isinstance(graph, GraphStateUseCase):
             return None
         try:
+            if core._cypher_planner_enabled():
+                expansion = _plan_selective_expansion(query)
+                if expansion is not None:
+                    return self._execute_expansion(graph, expansion)
             plans = tuple(plan_branch(branch) for branch in query.branches)
             self.runtime._snapshot = graph.capture_snapshot()
             rows: list[dict[str, Any]] = []
@@ -334,6 +433,56 @@ class ColumnarReadRuntime:
             return QueryResult(query.columns or (), tuple(rows))
         except (UnsupportedColumnar, pa.ArrowException, OverflowError, TypeError, ValueError):
             return None
+
+    def _execute_expansion(
+        self, graph: GraphStateUseCase, query: core.CompiledMatchQuery
+    ) -> QueryResult:
+        logical = core._build_match_logical_plan(query)
+        if logical is None:
+            raise UnsupportedColumnar
+        path = query.patterns[0]
+        assert isinstance(path, core.PathPattern)
+        snapshot = self.runtime._snapshot = graph.capture_snapshot()
+        anchor_field, anchor_value = next(iter(path.start.properties.items()))
+        if isinstance(anchor_value, str) and anchor_value.startswith(core._JOIN_JSON_PREFIX):
+            raise UnsupportedColumnar
+        schemas: dict[str, Any] = {}
+        for node in (path.start, *(step.node for step in path.steps)):
+            fields = {item.field for item in query.return_items if item.variable == node.variable}
+            fields.update(node.properties)
+            if not fields:
+                continue
+            label = node.labels[0]
+            if label not in schemas:
+                schemas[label] = graph.load_node_property_schema(snapshot=snapshot, label=label)
+            schema = schemas[label]
+            if "node_id" not in schema.names or schema.field("node_id").metadata:
+                raise UnsupportedColumnar
+            for name in fields:
+                assert name is not None
+                if name not in schema.names:
+                    raise UnsupportedColumnar
+                field = schema.field(name)
+                if (field.metadata or {}).get(b"grapharrow.encoding") != b"native":
+                    raise UnsupportedColumnar
+                category = _category(field.type)
+                if (
+                    node is path.start
+                    and name == anchor_field
+                    and category != _category(pa.scalar(anchor_value).type)
+                ):
+                    raise UnsupportedColumnar
+        state = graph.load_tabular_state(snapshot=snapshot)
+        planned = self.runtime.executor._execute_match_logical_plan(logical, state=state)
+        table = planned.table
+        assert table is not None
+        names = tuple(item.expression for item in query.return_items)
+        if not table.num_rows:
+            return QueryResult(names, ())
+        columns = [f"{item.variable}.{item.field}" for item in query.return_items]
+        if not set(columns).issubset(table.column_names):
+            raise UnsupportedColumnar
+        return QueryResult(names, tuple(table.select(columns).rename_columns(names).to_pylist()))
 
     def scan(self, graph: GraphStateUseCase, plan: ScanPlan) -> tuple[Batch, bool, tuple[str, ...]]:
         assert self.runtime._snapshot is not None

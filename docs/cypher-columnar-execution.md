@@ -2,8 +2,9 @@
 
 Eligible composable read queries scan selected per-label property columns from
 Parquet, filter Arrow batches and project expressions before constructing public
-Python result rows. They do not load canonical node/edge tables or decode the
-whole graph into records. All query interfaces use the same Cypher dispatcher.
+Python result rows. Projection-only reads avoid canonical node and edge tables.
+Selective traversals use canonical Arrow tables without decoding the whole graph
+into records. All query interfaces use the same Cypher dispatcher.
 
 ## Coverage
 
@@ -26,10 +27,17 @@ grouping and `DISTINCT` can use the existing row executor over that reduced data
 Unions whose branches qualify share one captured snapshot and retain their
 existing column alignment and duplicate semantics.
 
-Traversal, optional patterns, correlated subqueries, entity-valued results and
-transaction-local graph overlays retain the general runtime. This optimization
-does not lower every composable query into Arrow or provide streaming execution.
-The existing planner and specialized direct execution paths remain available.
+A selective read can use the existing Arrow scan and expand operators when
+`WITH` only carries the anchor node, optionally under an alias. The anchor must
+have one label and an equality on a native scalar property. The following
+`MATCH` can expand one or two fixed, typed, directed hops to labeled nodes and
+return native scalar properties. An eligible declared equality index can resolve
+the anchor, and the shared adjacency cache can narrow each expansion. Schema
+checks and table reads use the same published graph snapshot.
+
+Optional patterns, correlated subqueries, entity-valued results and
+transaction-local graph overlays use the general runtime. Traversals outside
+the supported shapes also use that runtime.
 
 ## LIMIT and bounded ordering
 
