@@ -17,6 +17,7 @@ from grapharrow.use_cases.cypher_expression import (
     Scope,
     children,
     equal,
+    freeze,
     has_aggregate,
     identifier,
     public_value,
@@ -30,6 +31,8 @@ from grapharrow.use_cases.cypher_pipeline import (
     Stage,
     expression_kind,
     ordered_clauses,
+    union_parts,
+    validate_union_columns,
 )
 from grapharrow.use_cases.graph import GraphTransactionUseCase, QueryResult
 
@@ -90,9 +93,16 @@ UpdateStage = CreateStage | MergeStage | SetStage | DeleteStage
 
 
 @dataclass(frozen=True)
-class WriteQuery:
+class WriteBranch:
     stages: tuple[Stage | UpdateStage, ...]
     columns: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class WriteQuery:
+    branches: tuple[WriteBranch, ...]
+    columns: tuple[str, ...]
+    union_all: bool
 
 
 def _labels(node: Any) -> tuple[str, ...]:
@@ -106,13 +116,29 @@ def _labels(node: Any) -> tuple[str, ...]:
 class WriteCompiler(ReadCompiler):
     def compile_write(self, tree: Any) -> WriteQuery:
         regular = tree.oC_Statement().oC_Query().oC_RegularQuery()
-        if regular is None or regular.oC_Union():
-            raise QueryError.unsupported("Updating UNION branches are not supported.")
+        if regular is None:
+            raise QueryError.unsupported("Expected a regular updating query.")
         self.reserve_variables(regular)
+        singles, union_all = union_parts(regular)
+        branches = tuple(self.compile_branch(single) for single in singles)
+        columns = branches[0].columns
+        for branch in branches[1:]:
+            validate_union_columns(columns, branch.columns)
+        if self.deferred_traversal_errors:
+            raise self.deferred_traversal_errors[0]
+        if not any(
+            isinstance(stage, CreateStage | MergeStage | SetStage | DeleteStage)
+            for branch in branches
+            for stage in branch.stages
+        ):
+            raise QueryError.unsupported("Updating subqueries are not supported.")
+        return WriteQuery(branches, columns, union_all)
+
+    def compile_branch(self, single: Any) -> WriteBranch:
         stages: list[Stage | UpdateStage] = []
         columns: tuple[str, ...] = ()
         scope: Scope = {}
-        for clause in ordered_clauses(regular.oC_SingleQuery()):
+        for clause in ordered_clauses(single):
             kind = rule(clause)
             stage: Stage | UpdateStage
             if kind == "oC_ReadingClause":
@@ -124,13 +150,7 @@ class WriteCompiler(ReadCompiler):
             else:
                 stage, scope = self.update(clause, scope)
             stages.append(stage)
-        if self.deferred_traversal_errors:
-            raise self.deferred_traversal_errors[0]
-        if not any(
-            isinstance(stage, CreateStage | MergeStage | SetStage | DeleteStage) for stage in stages
-        ):
-            raise QueryError.unsupported("Updating subqueries are not supported.")
-        return WriteQuery(tuple(stages), columns)
+        return WriteBranch(tuple(stages), columns)
 
     def update(self, clause: Any, scope: Scope) -> tuple[UpdateStage, Scope]:
         node = children(clause)[0]
@@ -349,8 +369,24 @@ class WriteRuntime(ReadRuntime):
         return public_value(value)
 
     def execute_write(self, query: WriteQuery) -> QueryResult:
+        rows: list[Row] = []
+        seen: set[Any] | None = set() if len(query.branches) > 1 and not query.union_all else None
+        for branch in query.branches:
+            result = self.execute_branch(branch)
+            if not query.columns:
+                continue
+            for row in result:
+                if seen is not None:
+                    key = freeze({name: row[name] for name in query.columns})
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                rows.append({name: self.output(row[name]) for name in query.columns})
+        return QueryResult(query.columns, tuple(rows))
+
+    def execute_branch(self, branch: WriteBranch) -> list[Row]:
         rows: list[Row] = [{}]
-        for stage in query.stages:
+        for stage in branch.stages:
             if isinstance(stage, CreateStage):
                 rows = [self.create(stage, row) for row in rows]
             elif isinstance(stage, MergeStage):
@@ -370,12 +406,7 @@ class WriteRuntime(ReadRuntime):
             if state is not previous:
                 self._state = None
                 self._match_indexes.clear()
-        return QueryResult(
-            query.columns,
-            tuple({name: self.output(row[name]) for name in query.columns} for row in rows)
-            if query.columns
-            else (),
-        )
+        return rows
 
     def properties(self, expression: Expression | None, row: Row) -> dict[str, object]:
         if expression is None:

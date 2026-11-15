@@ -332,6 +332,24 @@ def _expression_nodes(expression: Expression) -> Iterator[Expression]:
         yield from _expression_nodes(child)
 
 
+def union_parts(node: Any) -> tuple[list[Any], bool]:
+    """Return the separate branch scopes and the common UNION mode."""
+    unions = node.oC_Union()
+    modes = {branch.ALL() is not None for branch in unions}
+    if len(modes) > 1:
+        raise QueryError.syntax(
+            "Cannot mix UNION and UNION ALL in one query", "InvalidClauseComposition"
+        )
+    return [node.oC_SingleQuery(), *(branch.oC_SingleQuery() for branch in unions)], True in modes
+
+
+def validate_union_columns(first: tuple[str, ...], returned: tuple[str, ...]) -> None:
+    if set(first) != set(returned):
+        raise QueryError.syntax(
+            "UNION branches must return the same column names", "DifferentColumnsInUnion"
+        )
+
+
 class ReadCompiler:
     def __init__(self, parameters: Mapping[str, object]) -> None:
         self.parameters = dict(parameters)
@@ -368,13 +386,7 @@ class ReadCompiler:
         globals: Scope | None = None,
         legacy_outer: Scope | None = None,
     ) -> ReadQuery:
-        unions = node.oC_Union()
-        modes = {u.ALL() is not None for u in unions}
-        if len(modes) > 1:
-            raise QueryError.syntax(
-                "Cannot mix UNION and UNION ALL in one query", "InvalidClauseComposition"
-            )
-        singles = [node.oC_SingleQuery(), *(u.oC_SingleQuery() for u in unions)]
+        singles, union_all = union_parts(node)
         branches = []
         columns = None
         for single in singles:
@@ -412,14 +424,12 @@ class ReadCompiler:
                 stages.append(stage)
             if returned is None:
                 raise QueryError("Read queries require a RETURN clause")
-            if columns is not None and set(returned) != set(columns):
-                raise QueryError.syntax(
-                    "UNION branches must return the same column names", "DifferentColumnsInUnion"
-                )
             if columns is None:
                 columns = returned
+            else:
+                validate_union_columns(columns, returned)
             branches.append(ReadBranch(initial, tuple(stages), visible))
-        return ReadQuery(tuple(branches), bool(modes and True in modes), columns)
+        return ReadQuery(tuple(branches), union_all, columns)
 
     def _legacy_import(self, node: Any, outer: Scope) -> Scope | None:
         body = node.oC_ProjectionBody()

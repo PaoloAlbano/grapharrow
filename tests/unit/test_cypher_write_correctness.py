@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from grapharrow import Database
-from grapharrow.core.errors import QueryError
+from grapharrow.core.errors import QueryError, TransactionError
 from grapharrow.use_cases import CypherQueryUseCase, GraphTransactionUseCase
 
 
@@ -307,3 +307,76 @@ def test_with_window_and_return_window_apply_on_opposite_sides_of_write(tmp_path
         )
         assert result.rows == ()
     assert sorted(n.properties["p"] for n in db._app.use_cases.graph.load_state().nodes) == [1, 2]
+
+
+@pytest.mark.parametrize(("operator", "expected"), [("UNION", (1, 2)), ("UNION ALL", (1, 1, 2))])
+def test_write_union_preserves_branch_order_and_result_multiplicity(
+    tmp_path: Path, operator: str, expected: tuple[int, ...]
+) -> None:
+    database = Database(tmp_path / "graph")
+    query = (
+        f"CREATE (:Probe {{value:1}}) RETURN 1 AS n {operator} "
+        f"MATCH (p:Probe) RETURN p.value AS n {operator} "
+        "MATCH (p:Probe) SET p.value=2 RETURN p.value AS n"
+    )
+    with database.read_transaction() as session, pytest.raises(TransactionError):
+        session.query(query)
+    with database.write_transaction() as session:
+        result = session.query(query)
+        assert tuple(row["n"] for row in result.rows) == expected
+    with database.read_transaction() as session:
+        assert session.query("MATCH (p:Probe) RETURN p.value AS n").rows == ({"n": 2},)
+
+
+def test_write_union_aligns_columns_and_rejects_incompatible_scopes(tmp_path: Path) -> None:
+    database = Database(tmp_path / "graph")
+    with database.write_transaction() as session:
+        with pytest.raises(QueryError) as error:
+            session.query("CREATE (:Probe) RETURN 1 AS first UNION RETURN 1 AS second")
+        assert error.value.detail == "DifferentColumnsInUnion"
+        with pytest.raises(QueryError) as error:
+            session.query("CREATE (p:Probe) RETURN p UNION RETURN p")
+        assert error.value.detail == "UndefinedVariable"
+        with pytest.raises(QueryError) as error:
+            session.query(
+                "CREATE (:Probe) RETURN 1 AS n UNION RETURN 2 AS n UNION ALL RETURN 3 AS n"
+            )
+        assert error.value.detail == "InvalidClauseComposition"
+        assert session.query("MATCH (p:Probe) RETURN count(p) AS n").rows == ({"n": 0},)
+        result = session.query("CREATE (:Probe) RETURN 1 AS a,2 AS b UNION RETURN 3 AS b,4 AS a")
+        assert result.columns == ("a", "b")
+        assert result.rows == ({"a": 1, "b": 2}, {"a": 4, "b": 3})
+
+
+def test_write_union_rolls_back_every_branch_on_runtime_error(tmp_path: Path) -> None:
+    database = Database(tmp_path / "graph")
+    graph = database._app.use_cases.graph
+    snapshot = graph.capture_snapshot()
+    with database.write_transaction() as session:
+        with pytest.raises(QueryError) as error:
+            session.query(
+                "CREATE (:Probe {value:1}) RETURN 1 AS n UNION ALL "
+                "CREATE (p:Probe {value:2}) SET p.value=1 / 0 RETURN p.value AS n"
+            )
+        assert error.value.detail == "DivisionByZero"
+        assert graph.capture_snapshot() == snapshot
+        assert session.query("MATCH (p:Probe) RETURN count(p) AS n").rows == ({"n": 0},)
+
+
+def test_failed_write_union_keeps_earlier_statements_in_explicit_transaction(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "graph")
+    app = database._app
+    transaction = GraphTransactionUseCase(app.use_cases.graph)
+    executor = CypherQueryUseCase(transaction, app.adapters.tabular, app.use_cases.indexes)
+    executor.execute("CREATE (:Probe {value:10})")
+    with pytest.raises(QueryError) as error:
+        executor.execute(
+            "CREATE (:Probe {value:20}) RETURN 1 AS n UNION "
+            "CREATE (:Probe {value:30}) RETURN 1 / 0 AS n"
+        )
+    assert error.value.detail == "DivisionByZero"
+    assert executor.execute("MATCH (p:Probe) RETURN p.value AS n").rows == ({"n": 10},)
+    transaction.commit()
+    assert app.use_cases.cypher.execute("MATCH (p:Probe) RETURN p.value AS n").rows == ({"n": 10},)

@@ -412,7 +412,6 @@ def test_subquery_scope_errors_are_detected(database: Database, query: str) -> N
 @pytest.mark.parametrize(
     "query",
     [
-        "RETURN 1 AS n UNION CREATE (:Unexpected) RETURN 2 AS n",
         "CALL { CREATE (:Unexpected) RETURN 1 AS n } RETURN n",
         "MATCH (p:Person) WHERE EXISTS { CREATE (:Unexpected) RETURN 1 } RETURN p",
     ],
