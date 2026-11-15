@@ -220,10 +220,12 @@ class WriteCompiler(ReadCompiler):
                 raise QueryError.syntax(
                     f"Node variable already bound: {name}", "VariableAlreadyBound"
                 )
+            if name not in nodes:
+                nodes[name] = WriteNode(
+                    name, bound, labels, self.properties(node, scope if merge else visible)
+                )
             if variable is not None:
                 visible[name] = "node"
-            if name not in nodes:
-                nodes[name] = WriteNode(name, bound, labels, self.properties(node, scope))
             return name
 
         for part in parts:
@@ -425,7 +427,7 @@ class WriteRuntime(ReadRuntime):
                 result[node.name] = self.node_endpoint(row[node.name])
             else:
                 values = (
-                    self.properties(node.properties, row)
+                    self.properties(node.properties, result)
                     if properties is None
                     else properties[node.name]
                 )

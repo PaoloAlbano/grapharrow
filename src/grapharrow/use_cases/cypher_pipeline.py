@@ -254,7 +254,9 @@ def expression_kind(expression: Expression, scope: Scope) -> str:
         if base.kind == "map" and expression.value in base.value:
             return expression_kind(base.arguments[base.value.index(expression.value)], scope)
         return "any"
-    if expression.kind == "function" and expression.value in {"head", "last"}:
+    if expression.kind == "index" or (
+        expression.kind == "function" and expression.value in {"head", "last"}
+    ):
         return "any"
     if expression.kind == "function" and expression.value == "coalesce":
         kinds = {

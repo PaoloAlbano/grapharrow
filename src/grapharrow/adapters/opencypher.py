@@ -7,6 +7,7 @@ from typing import cast
 
 from antlr4 import CommonTokenStream, InputStream
 from antlr4.error.ErrorListener import ErrorListener  # type: ignore[import-untyped]
+from antlr4.Token import Token  # type: ignore[import-untyped]
 
 from grapharrow.core.errors import QueryError
 from grapharrow.interfaces.opencypher.generated.vendor.opencypher.GraphArrowCypherLexer import (
@@ -75,6 +76,24 @@ def _normalize_legacy_exists_syntax(query: str) -> str:
     return "".join(segments)
 
 
+def _malformed_number(recognizer: object, token: object) -> bool:
+    if (
+        not isinstance(recognizer, CypherParser)
+        or not isinstance(token, Token)
+        or token.type != CypherParser.UnescapedSymbolicName
+        or token.tokenIndex < 1
+    ):
+        return False
+    previous = recognizer.getInputStream().get(token.tokenIndex - 1)
+    return previous.stop + 1 == token.start and previous.type in {
+        CypherParser.DecimalInteger,
+        CypherParser.HexInteger,
+        CypherParser.OctalInteger,
+        CypherParser.RegularDecimalReal,
+        CypherParser.ExponentDecimalReal,
+    }
+
+
 class _RaisingErrorListener(ErrorListener):  # type: ignore[misc]
     """Convert ANTLR syntax callbacks into GraphArrow query errors."""
 
@@ -87,12 +106,15 @@ class _RaisingErrorListener(ErrorListener):  # type: ignore[misc]
         msg: str,
         e: Exception | None,
     ) -> None:
-        _ = (recognizer, offendingSymbol, e)
         raise QueryError(
             f"openCypher syntax error at {line}:{column}: {msg}",
             category="SyntaxError",
             phase="compile",
-            detail="UnexpectedSyntax",
+            detail=(
+                "InvalidNumberLiteral"
+                if _malformed_number(recognizer, offendingSymbol)
+                else "UnexpectedSyntax"
+            ),
             line=line,
             column=column,
         )

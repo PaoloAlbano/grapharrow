@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import math
 import operator as operations
-import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -387,14 +386,14 @@ class ExpressionCompiler:
                 result = Expression("binary", operator, operands)
             return result
         if name == "oC_UnaryAddOrSubtractExpression":
-            if re.fullmatch(r"[+-]\d+", node.getText()):
-                from grapharrow.use_cases.cypher import _parse_value
-
-                return Expression(
-                    "literal", _parse_value(node.getText().lstrip("+"), dict(self.parameters))
-                )
-            result = build(parts[0])
             prefix = node.children[0].getText()
+            if prefix in {"+", "-"}:
+                from grapharrow.use_cases.cypher import _INTEGER_LITERAL, _parse_value
+
+                text = prefix + parts[0].getText()
+                if _INTEGER_LITERAL.fullmatch(text):
+                    return Expression("literal", _parse_value(text, dict(self.parameters)))
+            result = build(parts[0])
             return Expression("unary", prefix, (result,)) if prefix in {"+", "-"} else result
         if len(parts) == 1:
             return build(parts[0])

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from collections.abc import Callable, Generator, Iterable, Mapping
@@ -678,8 +679,17 @@ class CypherQueryUseCase:
         from grapharrow.use_cases.cypher_write import WriteCompiler, WriteRuntime
 
         clauses = tuple(walk(tree))
-        composable = sum(rule(node) == "oC_UpdatingClause" for node in clauses) > 1 or any(
-            rule(node) == "oC_Match" and node.OPTIONAL() is not None for node in clauses
+        composable = (
+            sum(rule(node) == "oC_UpdatingClause" for node in clauses) > 1
+            or any(rule(node) == "oC_Match" and node.OPTIONAL() is not None for node in clauses)
+            or any(
+                rule(value) == "oC_Variable"
+                for clause in clauses
+                if rule(clause) == "oC_Create"
+                for properties in walk(clause)
+                if rule(properties) == "oC_Properties"
+                for value in walk(properties)
+            )
         )
         if not composable and not needs_pipeline(tree, source, params):
             try:
@@ -11675,6 +11685,10 @@ def _can_bind_node(binding: Mapping[str, Any], variable: str, node: NodeRecord) 
     return existing.node_id == node.node_id
 
 
+_INTEGER_LITERAL = re.compile(r"[+-]?(?:[0-9]+|0x[0-9a-fA-F]+|0o[0-7]+)")
+_REAL_LITERAL = re.compile(r"[+-]?(?:[0-9]*\.[0-9]+(?:[eE]-?[0-9]+)?|[0-9]+[eE]-?[0-9]+)")
+
+
 def _parse_value(text: str, params: dict[str, object]) -> object:
     """Parse this low-level fragment into the normalized internal form."""
     if text.startswith("$"):
@@ -11702,15 +11716,27 @@ def _parse_value(text: str, params: dict[str, object]) -> object:
     if _IDENTIFIER_RE.fullmatch(text):
         return PropertyReferenceValue(variable=text, field="value")
 
-    if re.fullmatch(r"-?\d+", text):
-        value = int(text)
+    if _INTEGER_LITERAL.fullmatch(text):
+        digits = text.lstrip("+-")
+        base = 16 if digits.startswith("0x") else 8 if digits.startswith("0o") else 10
+        try:
+            value = int(text, base)
+        except ValueError as error:
+            raise QueryError.syntax(
+                "Integer literal is outside the signed 64-bit range.", "IntegerOverflow"
+            ) from error
         if not -(2**63) <= value < 2**63:
             raise QueryError.syntax(
                 "Integer literal is outside the signed 64-bit range.", "IntegerOverflow"
             )
         return value
-    if re.fullmatch(r"-?\d+\.\d+", text):
-        return float(text)
+    if _REAL_LITERAL.fullmatch(text):
+        real = float(text)
+        if not math.isfinite(real):
+            raise QueryError.syntax(
+                "Floating point literal exceeds the supported range.", "FloatingPointOverflow"
+            )
+        return real
 
     raise QueryError(f"Unsupported literal value: {text}")
 

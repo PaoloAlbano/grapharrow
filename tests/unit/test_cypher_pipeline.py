@@ -438,3 +438,43 @@ def test_pipeline_reads_transaction_overlay_without_publishing(database: Databas
     tx.rollback()
     with database.read_transaction() as session:
         assert session.query("MATCH (p:Person) RETURN count(*) AS n").rows == ({"n": 3},)
+
+
+@pytest.mark.parametrize(
+    ("literal", "value"),
+    [
+        (".5", 0.5),
+        ("1E-2", 0.01),
+        ("-.1e9", -1e8),
+        ("0x7fffffffffffffff", 2**63 - 1),
+        ("- 0x8000000000000000", -(2**63)),
+        ("-0o1000000000000000000000", -(2**63)),
+        ("[0x10,{value:0o10},.5]", [16, {"value": 8}, 0.5]),
+    ],
+)
+def test_opencypher_numeric_literals(database: Database, literal: str, value: Any) -> None:
+    with database.read_transaction() as session:
+        assert session.query(f"RETURN {literal} AS x").rows == ({"x": value},)
+
+
+@pytest.mark.parametrize(
+    ("literal", "detail"),
+    [
+        ("0x8000000000000000", "IntegerOverflow"),
+        ("-0o1000000000000000000001", "IntegerOverflow"),
+        ("1.34E999", "FloatingPointOverflow"),
+        ("0x", "InvalidNumberLiteral"),
+        ("0x1A2b3j4", "InvalidNumberLiteral"),
+        ("123h54", "InvalidNumberLiteral"),
+    ],
+)
+def test_opencypher_invalid_numeric_literal_errors(
+    database: Database, literal: str, detail: str
+) -> None:
+    with database.read_transaction() as session, pytest.raises(QueryError) as error:
+        session.query(f"RETURN {literal} AS x")
+    assert (error.value.category, error.value.phase, error.value.detail) == (
+        "SyntaxError",
+        "compile",
+        detail,
+    )

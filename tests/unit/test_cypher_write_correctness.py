@@ -380,3 +380,32 @@ def test_failed_write_union_keeps_earlier_statements_in_explicit_transaction(
     assert executor.execute("MATCH (p:Probe) RETURN p.value AS n").rows == ({"n": 10},)
     transaction.commit()
     assert app.use_cases.cypher.execute("MATCH (p:Probe) RETURN p.value AS n").rows == ({"n": 10},)
+
+
+def test_create_properties_can_use_an_earlier_node_in_the_same_clause(tmp_path: Path) -> None:
+    db = Database(tmp_path / "graph")
+    with db.write_transaction() as session:
+        session.query("CREATE (a:End {num:0x10}), (:Begin {num:a.num})")
+        assert session.query("MATCH (b:Begin) RETURN b.num AS n").rows == ({"n": 16},)
+
+        before = db._app.use_cases.graph.capture_snapshot()
+        with pytest.raises(QueryError) as error:
+            session.query("CREATE (:First {value:later.value}), (later:Later {value:1})")
+        assert error.value.detail == "UndefinedVariable"
+        assert db._app.use_cases.graph.capture_snapshot() == before
+
+
+def test_create_relationship_endpoints_from_list_elements(tmp_path: Path) -> None:
+    db = Database(tmp_path / "graph")
+    with db.write_transaction() as session:
+        session.query(
+            "CREATE (a:Node {n:0}), (b:Node {n:2}) "
+            "WITH a,b UNWIND [1] AS n CREATE (middle:Node {n:n}) "
+            "WITH a,b,[a]+collect(middle)+[b] AS endpoints "
+            "UNWIND range(0,size(endpoints)-2) AS i "
+            "WITH endpoints[i] AS left,endpoints[i+1] AS right "
+            "CREATE (left)-[:NEXT]->(right)"
+        )
+        assert session.query(
+            "MATCH (a)-[:NEXT]->(b) RETURN a.n AS source,b.n AS target ORDER BY source"
+        ).rows == ({"source": 0, "target": 1}, {"source": 1, "target": 2})
