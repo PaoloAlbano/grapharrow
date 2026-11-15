@@ -93,6 +93,12 @@ class MatchStage:
 
 
 @dataclass(frozen=True)
+class PatternComprehension:
+    match: MatchStage
+    locals: frozenset[str]
+
+
+@dataclass(frozen=True)
 class UnwindStage:
     expression: Expression
     variable: str
@@ -167,6 +173,7 @@ def needs_pipeline(tree: Any, source: str, parameters: Mapping[str, object] | No
             "{",
             "=",
             ",",
+            "|",
         )
     ):
         return False
@@ -221,6 +228,7 @@ def needs_pipeline(tree: Any, source: str, parameters: Mapping[str, object] | No
                         return True
         if name in {
             "oC_CaseExpression",
+            "oC_PatternComprehension",
             "oC_SubqueryCall",
             "oC_InQueryCall",
             "oC_StandaloneCall",
@@ -328,6 +336,13 @@ def pattern_bindings(patterns: tuple[core.CompiledPattern, ...]) -> Scope:
     return scope
 
 
+def _pattern_parts(pattern: Any) -> list[tuple[Any, Any]]:
+    return [
+        (part.oC_AnonymousPatternPart().oC_PatternElement(), part.oC_Variable())
+        for part in pattern.oC_PatternPart()
+    ]
+
+
 def _grouping_valid(
     expression: Expression, grouping: tuple[Expression, ...], aliases: set[str]
 ) -> bool:
@@ -341,6 +356,8 @@ def _grouping_valid(
             _grouping_valid(child, grouping, aliases | {variable})
             for child in expression.arguments[1:]
         )
+    if expression.kind == "pattern_comprehension":
+        aliases = aliases | expression.value.locals
     return all(_grouping_valid(child, grouping, aliases) for child in expression.arguments)
 
 
@@ -376,7 +393,7 @@ class ReadCompiler:
     ) -> None:
         self.parameters = dict(parameters)
         self.state = core._CompilerState()
-        self.expressions = ExpressionCompiler(parameters, self._exists)
+        self.expressions = ExpressionCompiler(parameters, self._exists, self._pattern_comprehension)
         self.deferred_traversal_errors: list[QueryError] = []
         self.procedures = procedures if procedures is not None else {}
 
@@ -614,9 +631,12 @@ class ReadCompiler:
                 identifier(key.getText()): (
                     _PatternExpression(expression)
                     if any(
-                        rule(part) == "oC_FunctionInvocation"
-                        and identifier(part.oC_FunctionName().getText()).lower()
-                        in TYPED_SCALAR_FUNCTIONS
+                        rule(part) == "oC_PatternComprehension"
+                        or (
+                            rule(part) == "oC_FunctionInvocation"
+                            and identifier(part.oC_FunctionName().getText()).lower()
+                            in TYPED_SCALAR_FUNCTIONS
+                        )
                         for part in walk(expression)
                     )
                     else core._compile_value_expression(expression, self.parameters)
@@ -628,16 +648,14 @@ class ReadCompiler:
 
         patterns_list: list[core.CompiledPattern] = []
         paths = []
-        parts = pattern.oC_PatternPart()
-        if any(part.oC_Variable() is not None for part in parts):
-            self.validate_path_bindings(parts, scope)
-        multiple_paths = (
-            sum(
-                bool(part.oC_AnonymousPatternPart().oC_PatternElement().oC_PatternElementChain())
-                for part in parts
-            )
-            > 1
+        parts = (
+            [(pattern.oC_RelationshipsPattern(), pattern.oC_Variable())]
+            if rule(pattern) == "oC_PatternComprehension"
+            else _pattern_parts(pattern)
         )
+        if any(alias is not None for _, alias in parts):
+            self.validate_path_bindings(parts, scope)
+        multiple_paths = sum(bool(element.oC_PatternElementChain()) for element, _ in parts) > 1
         if multiple_paths:
             from grapharrow.use_cases.cypher_validation import LegacyValidator
 
@@ -645,10 +663,9 @@ class ReadCompiler:
             LegacyValidator(self.parameters).pattern(
                 pattern, {}, creating=False, validate_properties=False
             )
-        for part in parts:
-            alias = part.oC_Variable()
+        for element, alias in parts:
             compiled = core._compile_pattern_element(
-                part.oC_AnonymousPatternPart().oC_PatternElement(),
+                element,
                 self.parameters,
                 self.state,
                 allow_relationship_variables=True,
@@ -800,18 +817,17 @@ class ReadCompiler:
         parts = [
             part
             for clause in clauses[index:end]
-            for part in clause.oC_Match().oC_Pattern().oC_PatternPart()
+            for part in _pattern_parts(clause.oC_Match().oC_Pattern())
         ]
-        if any(part.oC_Variable() is not None for part in parts):
+        if any(alias is not None for _, alias in parts):
             ReadCompiler.validate_path_bindings(parts, scope)
 
     @staticmethod
-    def validate_path_bindings(parts: list[Any], scope: Scope) -> None:
+    def validate_path_bindings(parts: list[tuple[Any, Any]], scope: Scope) -> None:
         """Check path declarations in pattern order, before compiling relationship bounds."""
         bound = set(scope)
         declared_paths: set[str] = set()
-        for part in parts:
-            element = part.oC_AnonymousPatternPart().oC_PatternElement()
+        for element, alias in parts:
             while element.oC_NodePattern() is None:
                 element = element.oC_PatternElement()
             binding_nodes = [element.oC_NodePattern()]
@@ -825,7 +841,6 @@ class ReadCompiler:
                 for node in binding_nodes
                 if node.oC_Variable() is not None
             }
-            alias = part.oC_Variable()
             if alias is not None:
                 name = identifier(alias.getText())
                 if name in bound or name in entities:
@@ -965,6 +980,33 @@ class ReadCompiler:
             window(body.oC_Limit()),
         ), output
 
+    def _pattern_comprehension(self, node: Any, scope: Scope) -> Expression:
+        stage, visible = self.match(node, node.oC_Where(), False, scope)
+        projection = self.expressions.compile(node.oC_Expression(), visible)
+        if has_aggregate(projection):
+            raise QueryError.syntax(
+                "Pattern comprehensions cannot contain aggregates.", "InvalidAggregation"
+            )
+        # Grouping validation sees the projection, predicate and references to
+        # outer variables. Locals are valid only inside this expression.
+        pattern = stage.patterns[0]
+        assert isinstance(pattern, core.PathPattern)
+        return Expression(
+            "pattern_comprehension",
+            PatternComprehension(stage, frozenset(visible.keys() - scope.keys())),
+            (
+                projection,
+                *((stage.predicate,) if stage.predicate is not None else ()),
+                *(Expression("variable", name) for name in stage.bindings if name in scope),
+                *_property_expressions(pattern.start.properties),
+                *(
+                    expression
+                    for step in pattern.steps
+                    for expression in _property_expressions((step.properties, step.node.properties))
+                ),
+            ),
+        )
+
     def _exists(self, node: Any, scope: Scope) -> ReadQuery:
         regular = node.oC_RegularQuery() if rule(node) == "oC_ExistentialSubquery" else None
         if regular is not None:
@@ -1007,6 +1049,20 @@ class ReadCompiler:
 @dataclass(frozen=True, slots=True)
 class _PatternExpression:
     node: Any
+
+
+def _property_expressions(value: object) -> Iterator[Expression]:
+    if isinstance(value, Expression):
+        yield value
+    elif isinstance(value, core.PropertyReferenceValue):
+        variable = Expression("variable", identifier(value.variable))
+        yield Expression("property", value.field, (variable,))
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _property_expressions(item)
+    elif isinstance(value, list | tuple):
+        for item in value:
+            yield from _property_expressions(item)
 
 
 def _deferred(value: Any) -> bool:
@@ -1062,6 +1118,7 @@ class ReadRuntime:
         graph = executor._graph_service
         self.evaluator = ExpressionEvaluator(
             lambda query, row: bool(self.rows(query, [row])),
+            pattern_matches=lambda comprehension, row: self.match(comprehension.match, [row]),
             transaction_time=graph.transaction_time_ns
             if isinstance(graph, GraphTransactionUseCase)
             else None,

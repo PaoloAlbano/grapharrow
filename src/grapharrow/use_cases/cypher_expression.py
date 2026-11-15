@@ -55,6 +55,8 @@ def known_kind(expression: Expression, scope: Scope) -> str:
     """Identify statically known types while leaving parameter values to runtime."""
     if expression.kind == "variable":
         return scope[expression.value]
+    if expression.kind == "pattern_comprehension":
+        return "list"
     if expression.kind in {"list", "map"}:
         return expression.kind
     if expression.kind == "literal" and not expression.parameter:
@@ -85,9 +87,11 @@ class ExpressionCompiler:
         self,
         parameters: Mapping[str, object],
         exists: Callable[[Any, Scope], Any],
+        pattern_comprehension: Callable[[Any, Scope], Expression],
     ) -> None:
         self.parameters = parameters
         self.exists = exists
+        self.pattern_comprehension = pattern_comprehension
 
     def compile(self, node: Any, scope: Scope) -> Expression:
         name = rule(node)
@@ -114,6 +118,8 @@ class ExpressionCompiler:
                 tuple(identifier(p.getText()) for p in node.oC_PropertyKeyName()),
                 tuple(build(p) for p in node.oC_Expression()),
             )
+        if name == "oC_PatternComprehension":
+            return self.pattern_comprehension(node, scope)
         if name in {"oC_ExistentialSubquery", "oC_PatternPredicate"}:
             if name == "oC_PatternPredicate":
                 parent = node.parentCtx
@@ -141,7 +147,9 @@ class ExpressionCompiler:
                 if function in LIST_ACCESSORS or function == "properties":
                     operand = arguments[0]
                     invalid_kinds = (
-                        {"map"} if function in LIST_ACCESSORS else {"list", "comprehension"}
+                        {"map"}
+                        if function in LIST_ACCESSORS
+                        else {"list", "comprehension", "pattern_comprehension"}
                     )
                     invalid_entities = (
                         {"node", "relationship", "path"}
@@ -416,7 +424,7 @@ def _contains_rand(expression: Expression) -> bool:
 
 def validate_predicate(expression: Expression) -> None:
     """Reject known non-boolean predicates even when the input has no rows."""
-    if expression.kind in {"list", "map"} or (
+    if expression.kind in {"list", "map", "pattern_comprehension"} or (
         expression.kind == "literal"
         and expression.value is not None
         and type(expression.value) is not bool
@@ -606,10 +614,12 @@ class ExpressionEvaluator:
         self,
         exists: Callable[[Any, Row], bool],
         *,
+        pattern_matches: Callable[[Any, Row], list[Row]] | None = None,
         resolve_entity: Callable[[Any], Any] | None = None,
         transaction_time: int | None = None,
     ) -> None:
         self.exists = exists
+        self.pattern_matches = pattern_matches
         self.resolve_entity = resolve_entity
         self._statement_time: int | None = None
         self._transaction_time = transaction_time
@@ -635,6 +645,9 @@ class ExpressionEvaluator:
             return {k: evaluate(p) for k, p in zip(value, args, strict=True)}
         if kind == "exists":
             return self.exists(value, row)
+        if kind == "pattern_comprehension":
+            assert self.pattern_matches is not None
+            return [self.evaluate(args[0], match) for match in self.pattern_matches(value, row)]
         if kind == "case":
             subject = evaluate(args[0]) if value else None
             choices = args[1:-1] if value else args[:-1]

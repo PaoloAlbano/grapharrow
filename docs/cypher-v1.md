@@ -334,6 +334,19 @@ In `MATCH` and `OPTIONAL MATCH`, both `-[:KNOWS]-` and `<-[:KNOWS]->` match
 stored relationships in either direction. A named path retains the original
 direction of each stored relationship.
 
+Pattern comprehensions produce a list by matching a pattern for each input
+row, applying an optional `WHERE`, and projecting one value per match. They
+reuse outer bindings and keep new node, relationship and path variables local.
+A match whose projected value is null contributes a null element. With no
+matches, the result is an empty list. Variable-length segments follow the
+same five-hop limit as `MATCH`.
+
+```cypher
+MATCH (p:Person)
+RETURN p.name AS name,
+       [(p)-[:KNOWS]->(friend) WHERE friend.age >= 18 | friend.name] AS adultFriends
+```
+
 ## Write queries
 
 Writing statements can combine successive `CREATE`, `MERGE`, `SET`,

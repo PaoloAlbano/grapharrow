@@ -70,6 +70,77 @@ def test_composed_expression_semantics(database: Database, expression: str, expe
     assert result.rows == ({"value": expected},)
 
 
+def test_pattern_comprehension_filters_correlated_matches(database: Database) -> None:
+    with database.read_transaction() as session:
+        rows = session.query(
+            "MATCH (n:Person) "
+            "WITH n, [(n)-[r:KNOWS]->(m) WHERE m.age < n.age | [m.name, r.since]] AS friends "
+            "RETURN n.name AS name, friends ORDER BY name"
+        ).rows
+    assert rows == (
+        {"name": "Alice", "friends": [["Bob", 2020]]},
+        {"name": "Bob", "friends": []},
+        {"name": "Carol", "friends": []},
+    )
+
+
+def test_pattern_comprehension_preserves_null_projections_and_empty_lists(
+    database: Database,
+) -> None:
+    with database.read_transaction() as session:
+        row = session.query(
+            "MATCH (a:Person {name:'Alice'}) OPTIONAL MATCH (missing:Missing) "
+            "RETURN [(a)-[:KNOWS]->(b) | b.unknown] AS null_value, "
+            "[(a)-[:KNOWS]->(b) WHERE b.age > a.age | b.name] AS filtered, "
+            "[(missing)-[:KNOWS]->() | 1] AS empty"
+        ).rows
+    assert row == ({"null_value": [None], "filtered": [], "empty": []},)
+
+
+def test_pattern_comprehension_handles_bounded_named_paths(database: Database) -> None:
+    with database.read_transaction() as session:
+        row = session.query(
+            "MATCH (n:Person {name:'Alice'}) "
+            "RETURN [p=(n)-[rs:KNOWS*0..2]->(m) | [length(p), size(rs), m.name]] AS paths"
+        ).rows[0]
+    assert sorted(row["paths"]) == [[0, 0, "Alice"], [1, 1, "Bob"]]
+
+
+def test_pattern_comprehension_sees_changes_made_by_the_statement(database: Database) -> None:
+    with database.write_transaction() as session:
+        result = session.query(
+            "MATCH (n:Person {name:'Carol'}) "
+            "CREATE (n)-[:KNOWS]->(:Person {name:'Dora'}) "
+            "RETURN [(n)-[:KNOWS]->(m) | m.name] AS friends"
+        )
+    assert result.rows == ({"friends": ["Dora"]},)
+
+
+@pytest.mark.parametrize(
+    ("projection", "detail"),
+    [
+        ("[(a)-->(b) | b] AS neighbors, b", "UndefinedVariable"),
+        ("[p=(a)-->() | p] AS paths, p", "UndefinedVariable"),
+        ("[(a)-->(b) | count(b)] AS result", "InvalidAggregation"),
+        ("[(a)-[*]->() | 1] AS result", "UnboundedTraversal"),
+    ],
+)
+def test_pattern_comprehension_checks_scope_and_traversal_before_execution(
+    database: Database, projection: str, detail: str
+) -> None:
+    with database.read_transaction() as session, pytest.raises(QueryError) as error:
+        session.query(f"MATCH (a:Missing) RETURN {projection}")
+    assert error.value.phase == "compile"
+    assert error.value.detail == detail
+
+
+def test_pattern_comprehension_cannot_correlate_to_an_ungrouped_variable(
+    database: Database,
+) -> None:
+    with database.read_transaction() as session, pytest.raises(QueryError, match="grouping keys"):
+        session.query("MATCH (n:Person) RETURN count(*) + size([(n)-->() | 1]) AS total")
+
+
 def test_rand_returns_a_float_in_unit_interval(database: Database) -> None:
     with database.read_transaction() as session:
         rows = session.query("UNWIND [1,2,3] AS x RETURN RaNd() AS sample").rows

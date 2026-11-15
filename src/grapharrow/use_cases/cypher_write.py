@@ -336,6 +336,7 @@ class WriteRuntime(ReadRuntime):
         self.next_edge = max(self.edges, default=0) + 1
         self.evaluator = ExpressionEvaluator(
             self.evaluator.exists,
+            pattern_matches=self.evaluator.pattern_matches,
             resolve_entity=self.live,
             transaction_time=self.graph.transaction_time_ns,
         )

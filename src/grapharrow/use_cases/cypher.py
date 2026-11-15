@@ -4433,7 +4433,9 @@ def _compile_merge_actions(
 
 
 def _compile_pattern_element(
-    element_ctx: CypherParser.OC_PatternElementContext | None,
+    element_ctx: CypherParser.OC_PatternElementContext
+    | CypherParser.OC_RelationshipsPatternContext
+    | None,
     params: dict[str, object],
     state: _CompilerState,
     *,
@@ -4446,7 +4448,8 @@ def _compile_pattern_element(
     """Compile this Cypher fragment into the internal structures used later."""
     if element_ctx is None:
         raise QueryError("Pattern element is required.")
-    if element_ctx.oC_PatternElement() is not None:
+    start_ctx = element_ctx.oC_NodePattern()
+    if start_ctx is None:
         raise QueryError("Parenthesized nested pattern elements are not supported yet.")
 
     if compile_properties is None:
@@ -4454,7 +4457,7 @@ def _compile_pattern_element(
         def compile_properties(node: Any) -> dict[str, object]:
             return _compile_properties(node, params)
 
-    start_node = _compile_node_pattern(element_ctx.oC_NodePattern(), state, compile_properties)
+    start_node = _compile_node_pattern(start_ctx, state, compile_properties)
     chains = cast(
         list[CypherParser.OC_PatternElementChainContext],
         element_ctx.oC_PatternElementChain(),
