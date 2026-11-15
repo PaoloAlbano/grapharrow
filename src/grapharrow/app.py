@@ -112,6 +112,7 @@ def build_application(
         catalog_store=repositories.catalog,
         snapshot_store=repositories.snapshot,
         graph_store=repositories.graph,
+        snapshot_table_cache_max_bytes=resolved_settings.snapshot_table_cache_max_bytes,
         property_index_max_bytes=resolved_settings.property_index_max_bytes,
         adjacency_index_max_bytes=resolved_settings.adjacency_index_max_bytes,
     )

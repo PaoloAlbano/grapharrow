@@ -21,16 +21,17 @@ from tests.ana_support import load_grapharrow
 def test_queries_release_canonical_tables_without_cyclic_gc(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("GRAPHARROW_SNAPSHOT_TABLE_CACHE_MAX_BYTES", "0")
     app = load_grapharrow(tmp_path / "db")
-    original = app.use_cases.graph.load_tabular_state
+    original = app.repositories.graph.load_edge_table
     tables = []
 
-    def load(**kwargs: Any) -> Any:
-        state = original(**kwargs)
-        tables.append(weakref.ref(state.edge_table))
-        return state
+    def load(*args: Any) -> pa.Table:
+        table = original(*args)
+        tables.append(weakref.ref(table))
+        return table
 
-    monkeypatch.setattr(app.use_cases.graph, "load_tabular_state", load)
+    monkeypatch.setattr(app.repositories.graph, "load_edge_table", load)
     enabled = gc.isenabled()
     gc.collect()
     gc.disable()

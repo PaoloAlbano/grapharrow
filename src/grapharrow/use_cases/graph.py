@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Generator, Mapping
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
@@ -14,6 +14,7 @@ import pyarrow as pa  # type: ignore[import-untyped]
 
 from grapharrow.adapters.adjacency import AdjacencyIndexStore, GraphAdjacency
 from grapharrow.adapters.property_index import PropertyIndexStore
+from grapharrow.adapters.snapshot_tables import SnapshotTableCache
 from grapharrow.adapters.writer import writer_locked
 from grapharrow.core import property_codec
 from grapharrow.core.errors import NotFoundError, QueryError, SchemaError, WriteConflictError
@@ -80,6 +81,7 @@ class GraphStateUseCase:
         catalog_store: CatalogRepository,
         snapshot_store: SnapshotRepository,
         graph_store: GraphRepository,
+        snapshot_table_cache_max_bytes: int = 64 * 1024 * 1024,
         property_index_max_bytes: int = 32 * 1024 * 1024,
         adjacency_index_max_bytes: int = 32 * 1024 * 1024,
     ) -> None:
@@ -89,6 +91,7 @@ class GraphStateUseCase:
         self._snapshot_store = snapshot_store
         self._graph_store = graph_store
         self._writer = snapshot_store.writer
+        self.snapshot_tables = SnapshotTableCache(snapshot_table_cache_max_bytes)
         self.property_indexes = PropertyIndexStore(property_index_max_bytes)
         self.adjacency_indexes = AdjacencyIndexStore(adjacency_index_max_bytes)
 
@@ -150,6 +153,31 @@ class GraphStateUseCase:
             node_table=node_table,
             edge_table=edge_table,
         )
+
+    @contextmanager
+    def borrow_tabular_state(
+        self, *, include_edges: bool = True, snapshot: SnapshotManifest | None = None
+    ) -> Generator[GraphTabularState, None, None]:
+        """Share canonical buffers for the lifetime of a read-only Cypher query."""
+        self._admin_service.initialize()
+        catalog = self._catalog_store.load()
+        if snapshot is None:
+            snapshot = self._snapshot_store.load_manifest()
+        nodes, edges = snapshot.nodes, snapshot.edges
+        edge_table = (
+            self.snapshot_tables.borrow(
+                ("edges", edges), lambda: self._graph_store.load_edge_table(edges)
+            )
+            if include_edges
+            else nullcontext(EDGE_SCHEMA.empty_table())
+        )
+        with (
+            self.snapshot_tables.borrow(
+                ("nodes", nodes), lambda: self._graph_store.load_node_table(nodes)
+            ) as node_table,
+            edge_table as borrowed_edges,
+        ):
+            yield GraphTabularState(catalog, snapshot, node_table, borrowed_edges)
 
     def load_node_property_table(
         self,
@@ -1247,6 +1275,12 @@ class GraphTransactionUseCase:
             node_table=self._state.node_table,
             edge_table=self._state.edge_table if include_edges else EDGE_SCHEMA.empty_table(),
         )
+
+    def borrow_tabular_state(
+        self, *, include_edges: bool = True
+    ) -> AbstractContextManager[GraphTabularState]:
+        """Keep transaction-local overlays on their existing read path."""
+        return nullcontext(self.load_tabular_state(include_edges=include_edges))
 
     def replace_records(
         self, nodes: tuple[NodeRecord, ...], edges: tuple[EdgeRecord, ...]

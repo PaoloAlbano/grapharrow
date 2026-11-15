@@ -1117,21 +1117,24 @@ class CypherQueryUseCase:
             else None
         )
         if logical_plan is not None:
-            planned = self._execute_match_logical_plan(
-                logical_plan,
+            with self._graph_service.borrow_tabular_state(
                 include_edges=_match_requires_edges(query.patterns, query.where_predicate),
-            )
-            if planned.query_result is not None:
-                return cast(QueryResult, planned.query_result)
-            assert planned.table is not None
-            return self._finalize_table_query_result(
-                query.return_items,
-                planned.table,
-                distinct=False if planned.planned_distinct else query.distinct,
-                order_by=None if planned.planned_order_window else query.order_by,
-                skip=None if planned.planned_order_window else query.skip,
-                limit=None if planned.planned_order_window else query.limit,
-            )
+            ) as state:
+                planned = self._execute_match_logical_plan(
+                    logical_plan,
+                    state=state,
+                )
+                if planned.query_result is not None:
+                    return cast(QueryResult, planned.query_result)
+                assert planned.table is not None
+                return self._finalize_table_query_result(
+                    query.return_items,
+                    planned.table,
+                    distinct=False if planned.planned_distinct else query.distinct,
+                    order_by=None if planned.planned_order_window else query.order_by,
+                    skip=None if planned.planned_order_window else query.skip,
+                    limit=None if planned.planned_order_window else query.limit,
+                )
         matched_rows = self._match_rows(
             query.patterns,
             query.where_predicate,

@@ -472,17 +472,19 @@ class ColumnarReadRuntime:
                     and category != _category(pa.scalar(anchor_value).type)
                 ):
                     raise UnsupportedColumnar
-        state = graph.load_tabular_state(snapshot=snapshot)
-        planned = self.runtime.executor._execute_match_logical_plan(logical, state=state)
-        table = planned.table
-        assert table is not None
-        names = tuple(item.expression for item in query.return_items)
-        if not table.num_rows:
-            return QueryResult(names, ())
-        columns = [f"{item.variable}.{item.field}" for item in query.return_items]
-        if not set(columns).issubset(table.column_names):
-            raise UnsupportedColumnar
-        return QueryResult(names, tuple(table.select(columns).rename_columns(names).to_pylist()))
+        with graph.borrow_tabular_state(snapshot=snapshot) as state:
+            planned = self.runtime.executor._execute_match_logical_plan(logical, state=state)
+            table = planned.table
+            assert table is not None
+            names = tuple(item.expression for item in query.return_items)
+            if not table.num_rows:
+                return QueryResult(names, ())
+            columns = [f"{item.variable}.{item.field}" for item in query.return_items]
+            if not set(columns).issubset(table.column_names):
+                raise UnsupportedColumnar
+            return QueryResult(
+                names, tuple(table.select(columns).rename_columns(names).to_pylist())
+            )
 
     def scan(self, graph: GraphStateUseCase, plan: ScanPlan) -> tuple[Batch, bool, tuple[str, ...]]:
         assert self.runtime._snapshot is not None

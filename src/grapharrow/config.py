@@ -39,6 +39,7 @@ class GraphArrowSettings(BaseSettings):
     cypher_parse_cache_max_entries: int = Field(default=128, ge=0)
     cypher_parse_cache_max_source_bytes: int = Field(default=262144, ge=0)
     parquet_filter_pushdown_enabled: bool = Field(default=True)
+    snapshot_table_cache_max_bytes: int = Field(default=64 * 1024 * 1024, ge=0)
     property_index_max_bytes: int = Field(default=32 * 1024 * 1024, ge=0)
     adjacency_index_max_bytes: int = Field(default=32 * 1024 * 1024, ge=0)
     bolt_host: str = Field(default="127.0.0.1")
