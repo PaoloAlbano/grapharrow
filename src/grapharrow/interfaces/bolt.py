@@ -419,6 +419,7 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
             tabular_adapter=server.bolt_app.grapharrow.adapters.tabular,
             index_service=server.bolt_app.grapharrow.use_cases.indexes,
             parse_cache=server.bolt_app.grapharrow.use_cases.cypher._parse_cache,
+            procedures=server.bolt_app.grapharrow.use_cases.cypher._procedures,
         )
         _send_success(self.request, self.codec, {})
 

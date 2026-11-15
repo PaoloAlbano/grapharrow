@@ -66,7 +66,8 @@ Supported query families include:
 - node labels, inline property predicates and fixed-hop relationship variables;
 - typed outgoing and incoming traversal, relationship-type alternatives and
   supported bounded variable-length patterns.
-- `UNION`, `UNION ALL`, read `CALL { ... }` subqueries and query-form `EXISTS { ... }`.
+- `UNION`, `UNION ALL`, read `CALL { ... }` subqueries, registered read procedure
+  calls and query-form `EXISTS { ... }`.
 
 For example:
 
@@ -122,9 +123,14 @@ draw in later expressions for that row or to aggregate the sampled values.
 `reverse()` reverses the elements of a list or the characters of a string and
 propagates null.
 
-`toFloat()` also accepts the strings `"NaN"` and `"Infinity"`. Non-finite
-floats are represented as null in REST JSON results. Use `toString()` when
-the result needs to preserve their textual spelling over REST.
+`toFloat()` also accepts the strings `"NaN"` and `"Infinity"`. Floating-point
+division by zero can produce these values. Division by zero between integers is
+an arithmetic error. Embedded and Bolt results retain non-finite floating-point
+values. REST JSON represents them as null. Use `toString()` to return their
+textual spelling over REST.
+
+Read a node or relationship property by a computed string key with
+`n[$key]` or `r[key]`. Null or missing keys return null.
 
 The implemented expression subset includes comparisons, boolean composition,
 `IN`, null checks, property existence checks, `CONTAINS`, `STARTS WITH`,
@@ -270,9 +276,9 @@ WHERE EXISTS {
 RETURN p.name AS name
 ```
 
-These subqueries and composable pipelines are read-only. Updating clauses,
-unit subqueries without `RETURN`, `CALL ... IN TRANSACTIONS`, arbitrary procedure
-calls inside pipelines and unrestricted pattern shapes are not implemented.
+Read subqueries support returning pipelines. Unit subqueries without
+`RETURN`, `CALL ... IN TRANSACTIONS` and updating subqueries are outside this
+subset.
 Compilation validates every branch before execution; queries do not delegate
 execution to Neo4j. The parser uses the unchanged
 [openCypher grammar](../vendor/opencypher/Cypher.g4) plus the derived
@@ -318,9 +324,15 @@ RETURN p, rs, length(p) AS hops
 Named paths and relationship-list bindings support exact lengths, closed
 ranges, and ranges with an omitted lower bound such as `*..3`. The lower
 bound defaults to one. An explicit zero-hop segment binds both endpoints
-to the same node and produces an empty relationship list. Each variable-length
+to the same node and produces an empty relationship list. An empty interval
+such as `*2..1` matches no paths. `OPTIONAL MATCH` preserves each input row
+and binds newly introduced values to `null` in that case. Each variable-length
 segment has an upper limit of five hops. Ranges without an upper bound
 remain unsupported.
+
+In `MATCH` and `OPTIONAL MATCH`, both `-[:KNOWS]-` and `<-[:KNOWS]->` match
+stored relationships in either direction. A named path retains the original
+direction of each stored relationship.
 
 ## Write queries
 
@@ -387,7 +399,13 @@ and storage publication behavior.
 Selected Neo4j/Memgraph-compatible discovery calls and metadata statements
 support graph exploration clients. Examples include schema discovery,
 `CALL dbms.components()`, `CALL db.ping()` and the implemented `SHOW` shapes.
-This is a compatibility subset, not general procedure execution.
+Applications can register additional read procedures through
+`app.use_cases.cypher.register_read_procedure(name, procedure)`.
+The [procedure definition](../src/grapharrow/use_cases/cypher_procedures.py)
+declares input fields, output fields and a trusted Python read handler.
+Register handlers before serving queries. Each application has its own registry.
+Standalone calls can use explicit arguments or implicit named parameters.
+Pipelines use explicit arguments and can project named results with `YIELD`.
 
 Index DDL supports selected legacy and named `CREATE INDEX`, `CREATE TEXT INDEX`
 and `DROP INDEX` forms. Case-sensitive, single-property node `range` and
@@ -432,7 +450,6 @@ The public `QueryResult` contains `columns` and a tuple of row dictionaries.
 The engine is not a complete openCypher implementation. Important limits include:
 
 - updating subqueries, unit subqueries and unrestricted multi-part updates;
-- arbitrary procedure calls beyond the implemented discovery subset;
 - unbounded traversal;
 - expression/function combinations outside the implemented read subset;
 - a planner that covers only selected read shapes.

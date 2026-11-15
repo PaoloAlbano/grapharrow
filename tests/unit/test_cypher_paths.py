@@ -135,6 +135,57 @@ def test_range_can_contribute_zero_hops_and_enforce_endpoint_constraints(tmp_pat
     ]
 
 
+@pytest.mark.parametrize("bounds", ["*2..1", "*1..0", "*..0"])
+def test_empty_range_yields_no_matches_and_preserves_optional_rows(
+    tmp_path: Path, bounds: str
+) -> None:
+    db = Database(tmp_path / "db")
+    with db.write_transaction() as session:
+        session.query("CREATE (a:A {name:'a'})-[:R]->(a), (a)-[:R]->(:B)")
+
+    with db.read_transaction() as session:
+        assert session.query(f"MATCH (:A)-[:R{bounds}]->(b) RETURN b").rows == ()
+        assert session.query(f"MATCH (:A)-[:R{bounds}]->(b) RETURN count(b) AS n").rows == (
+            {"n": 0},
+        )
+        rows = session.query(
+            "MATCH (a:A) UNWIND [1,2] AS n "
+            f"OPTIONAL MATCH p=(a)-[rs:R{bounds}]->()-[:R]->(b) "
+            "RETURN a.name AS name, n, p, rs, b ORDER BY n"
+        ).rows
+    assert rows == (
+        {"name": "a", "n": 1, "p": None, "rs": None, "b": None},
+        {"name": "a", "n": 2, "p": None, "rs": None, "b": None},
+    )
+
+
+def test_empty_range_does_not_send_rows_to_an_update(tmp_path: Path) -> None:
+    db = Database(tmp_path / "db")
+    with db.write_transaction() as session:
+        session.query("CREATE (a:A {value:1})-[:R]->(:B)")
+        result = session.query("MATCH (a:A)-[:R*2..1]->() SET a.value=2 RETURN a.value AS value")
+        assert result.rows == ()
+        assert session.query("MATCH (a:A) RETURN a.value AS value").rows == ({"value": 1},)
+
+
+def test_double_headed_pattern_matches_both_directions_and_keeps_loop_once(tmp_path: Path) -> None:
+    db = Database(tmp_path / "db")
+    with db.write_transaction() as session:
+        session.query(
+            "CREATE (a:A {name:'a'})-[:R]->(a), "
+            "(a)-[:R]->(:B {name:'b'}), (:C {name:'c'})-[:R]->(a)"
+        )
+    with db.read_transaction() as session:
+        assert session.query("MATCH (:A)<-[:R]->(b) RETURN b.name AS name ORDER BY name").rows == (
+            {"name": "a"},
+            {"name": "b"},
+            {"name": "c"},
+        )
+        assert session.query(
+            "MATCH p=(:B)<-[:R]->()-[:R]->(b) RETURN length(p) AS hops, b.name AS name"
+        ).rows == ({"hops": 2, "name": "a"},)
+
+
 def test_bounded_undirected_path_does_not_reuse_edges_or_duplicate_loops(tmp_path: Path) -> None:
     with Database(tmp_path / "db").write_transaction() as session:
         session.query("CREATE (a:A)-[:R]->(a), (:B)-[:R]->(a)")

@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 
 import pytest
@@ -7,7 +8,8 @@ from neo4j.graph import Node, Relationship
 from neo4j.time import Date, DateTime, Duration, Time
 
 from grapharrow.config import GraphArrowSettings
-from grapharrow.interfaces.bolt import build_bolt_application, run_bolt_server
+from grapharrow.interfaces.bolt import build_bolt_application, run_bolt_server, start_bolt_server
+from grapharrow.use_cases.cypher_procedures import ProcedureField, ReadProcedure
 
 
 def test_bolt_application_uses_configured_server_agent(tmp_path: Path) -> None:
@@ -20,6 +22,31 @@ def test_bolt_application_uses_configured_server_agent(tmp_path: Path) -> None:
     app = build_bolt_application(database_path, settings=settings)
 
     assert app.server_agent == "Neo4j/5.26.0"
+
+
+@pytest.mark.integration
+def test_bolt_transaction_calls_registered_procedure_and_keeps_nan(tmp_path: Path) -> None:
+    path = tmp_path / "graph"
+    settings = GraphArrowSettings(database_path=path, bolt_host="127.0.0.1", bolt_port=0)
+    app = build_bolt_application(path, settings=settings)
+    app.grapharrow.use_cases.cypher.register_read_procedure(
+        "sample.measure",
+        ReadProcedure((), (ProcedureField("value", "FLOAT"),), lambda _: [{"value": math.nan}]),
+    )
+    handle = start_bolt_server(app)
+    try:
+        with (
+            GraphDatabase.driver(f"bolt://127.0.0.1:{handle.port}", auth=None) as driver,
+            driver.session() as session,
+            session.begin_transaction() as tx,
+        ):
+            record = tx.run(
+                "CALL sample.measure() YIELD value RETURN value, 1.0/0.0 AS overflow"
+            ).single(strict=True)
+            assert math.isnan(record["value"])
+            assert record["overflow"] == math.inf
+    finally:
+        handle.stop()
 
 
 @pytest.mark.integration

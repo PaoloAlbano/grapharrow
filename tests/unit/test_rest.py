@@ -1197,3 +1197,12 @@ def test_cypher_limit_rejects_overload_and_releases_failed_statements(tmp_path: 
         assert client.post("/v1/query", json={"query": "RETURN 1 / 0"}).status_code == 400
         response = client.post("/v1/query", json={"query": "RETURN 1 AS value"})
         assert response.json()["data"]["rows"] == [{"value": 1}]
+
+
+def test_rest_serializes_non_finite_cypher_results(tmp_path: Path) -> None:
+    client = TestClient(create_rest_app(tmp_path / "graph"))
+    response = client.post(
+        "/v1/query", json={"query": "RETURN [0.0/0.0,1.0/0.0,1.0/(-0.0),1.0] AS values"}
+    )
+    assert response.status_code == 200
+    assert response.json()["data"]["rows"] == [{"values": [None, None, None, 1.0]}]

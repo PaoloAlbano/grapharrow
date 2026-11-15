@@ -46,6 +46,7 @@ def test_created_incoming_relationship_survives_reopen(
         "CREATE (:Scratch),(:A)-[:R]-(:B)",
         "MATCH (a:A) CREATE (a)-[:R]-(:B)",
         "MATCH (a:A) WITH a CREATE (a)-[:R]-(:B)",
+        "MATCH (a:A) CREATE (a)<-[:R]->(:B)",
     ],
 )
 def test_undirected_create_rejected_before_publication(tmp_path: Path, query: str) -> None:

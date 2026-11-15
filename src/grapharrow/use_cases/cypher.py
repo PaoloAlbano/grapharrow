@@ -44,6 +44,7 @@ from grapharrow.use_cases.cypher_plan import (
     WithAggregatePlan,
     WithProjectPlan,
 )
+from grapharrow.use_cases.cypher_procedures import ReadProcedure
 from grapharrow.use_cases.cypher_window import check_window_value, limit_optimizations_enabled
 from grapharrow.use_cases.graph import (
     GraphState,
@@ -580,12 +581,21 @@ class CypherQueryUseCase:
         tabular_adapter: PyArrowTabularAdapter | None = None,
         index_service: IndexCatalogUseCase | None = None,
         parse_cache: CypherParseCache | None = None,
+        *,
+        procedures: dict[str, ReadProcedure] | None = None,
     ) -> None:
         """Store the services that the Cypher compiler and executor use at runtime."""
         self._graph_service = graph_service
         self._tabular = tabular_adapter or PyArrowTabularAdapter()
         self._index_service = index_service
         self._parse_cache = parse_cache if parse_cache is not None else CypherParseCache()
+        self._procedures = procedures if procedures is not None else {}
+
+    def register_read_procedure(self, name: str, procedure: ReadProcedure) -> None:
+        """Register a trusted read handler on this application before serving queries."""
+        if not all(name.split(".")) or name in self._procedures:
+            raise ValueError(f"Invalid or duplicate procedure name: {name!r}")
+        self._procedures[name] = procedure
 
     def execute(self, query: str, params: dict[str, object] | None = None) -> QueryResult:
         """Execute ``query`` against the current graph state."""
@@ -649,7 +659,7 @@ class CypherQueryUseCase:
         if contains_updates(parse_tree):
             return self._compile_and_execute_write(parse_tree, normalized, parameters)
         if needs_pipeline(parse_tree, normalized, parameters):
-            read_query = ReadCompiler(parameters).compile(parse_tree)
+            read_query = ReadCompiler(parameters, self._procedures).compile(parse_tree)
             with _query_phase("runtime"):
                 return ReadRuntime(self).execute(read_query)
 
@@ -660,7 +670,7 @@ class CypherQueryUseCase:
             # Preserve legacy diagnostics when the general compiler also rejects
             # the query. A newly composable read can use the explicit stages.
             try:
-                read_query = ReadCompiler(parameters).compile(parse_tree)
+                read_query = ReadCompiler(parameters, self._procedures).compile(parse_tree)
             except QueryError as fallback:
                 if original.detail == "Unclassified" and fallback.detail != "Unclassified":
                     raise fallback from None
@@ -719,7 +729,7 @@ class CypherQueryUseCase:
                         return self._execute_write(
                             lambda executor: executor._execute_compiled(compiled)
                         )
-        query = WriteCompiler(params).compile_write(tree)
+        query = WriteCompiler(params, self._procedures).compile_write(tree)
         with _query_phase("runtime"):
             return self._execute_write(lambda executor: WriteRuntime(executor).execute_write(query))
 
@@ -732,7 +742,11 @@ class CypherQueryUseCase:
             with graph.writer_lock():
                 transaction = GraphTransactionUseCase(graph)
                 executor = CypherQueryUseCase(
-                    transaction, self._tabular, self._index_service, self._parse_cache
+                    transaction,
+                    self._tabular,
+                    self._index_service,
+                    self._parse_cache,
+                    procedures=self._procedures,
                 )
                 with transaction.statement():
                     result = run(executor)
@@ -4170,6 +4184,7 @@ def _compile_match_patterns(
                 params,
                 state,
                 allow_relationship_variables=True,
+                allow_bidirectional=True,
             )
         )
     return tuple(compiled_parts)
@@ -4423,6 +4438,7 @@ def _compile_pattern_element(
     state: _CompilerState,
     *,
     allow_relationship_variables: bool,
+    allow_bidirectional: bool = False,
     allow_ranged_bindings: bool = False,
     compile_properties: Callable[[Any], dict[str, object]] | None = None,
     defer_unbounded: Callable[[QueryError], None] | None = None,
@@ -4455,6 +4471,7 @@ def _compile_pattern_element(
                 relationship_pattern,
                 compile_properties,
                 allow_variable=allow_relationship_variables,
+                allow_bidirectional=allow_bidirectional,
                 allow_ranged_bindings=allow_ranged_bindings,
                 defer_unbounded=defer_unbounded,
             )
@@ -4539,6 +4556,7 @@ def _compile_relationship_pattern(
     compile_properties: Callable[[Any], dict[str, object]],
     *,
     allow_variable: bool,
+    allow_bidirectional: bool,
     allow_ranged_bindings: bool = False,
     defer_unbounded: Callable[[QueryError], None] | None = None,
 ) -> tuple[str | None, str | None, tuple[str, ...], dict[str, object], str, int, int]:
@@ -4547,9 +4565,12 @@ def _compile_relationship_pattern(
         raise QueryError("Relationship pattern is required.")
     has_left_arrow = relationship_ctx.oC_LeftArrowHead() is not None
     has_right_arrow = relationship_ctx.oC_RightArrowHead() is not None
-    if has_left_arrow and has_right_arrow:
+    if has_left_arrow and has_right_arrow and not allow_bidirectional:
         raise QueryError("Bidirectional relationship arrows are not supported.")
-    direction = "incoming" if has_left_arrow else "outgoing" if has_right_arrow else "undirected"
+    if has_left_arrow == has_right_arrow:
+        direction = "undirected"
+    else:
+        direction = "incoming" if has_left_arrow else "outgoing"
 
     detail = relationship_ctx.oC_RelationshipDetail()
     if detail is None:
@@ -4619,7 +4640,8 @@ def _compile_range_literal(
         max_hops = int(bounded_match.group(2))
         if min_hops == 0 and not allow_ranged_bindings:
             raise QueryError("Variable-length relationships require at least one hop.")
-        if max_hops < min_hops:
+        if max_hops < min_hops and not allow_ranged_bindings:
+            # The general MATCH pipeline handles empty intervals before expansion.
             raise QueryError("Variable-length relationship upper bound must be >= lower bound.")
         if max_hops > _MAX_VARIABLE_LENGTH_HOPS:
             raise QueryError("Variable-length relationships are limited to at most 5 hops.")
@@ -11643,7 +11665,8 @@ def _evaluate_scalar_expression_array(
         if expression.operator == "*":
             return pc.multiply(left, right)
         if expression.operator == "/":
-            if pc.any(pc.equal(right, 0)).as_py():
+            floating = pa.types.is_floating(left.type) or pa.types.is_floating(right.type)
+            if not floating and pc.any(pc.and_(pc.is_valid(left), pc.equal(right, 0))).as_py():
                 raise QueryError(
                     "Division by zero", category="ArithmeticError", detail="DivisionByZero"
                 )

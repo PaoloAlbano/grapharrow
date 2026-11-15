@@ -43,6 +43,7 @@ from grapharrow.use_cases.cypher_expression import (
     validate_predicate,
 )
 from grapharrow.use_cases.cypher_path import PathValue
+from grapharrow.use_cases.cypher_procedures import ReadProcedure
 from grapharrow.use_cases.cypher_window import (
     check_window_value,
     limit_optimizations_enabled,
@@ -114,7 +115,16 @@ class CallStage:
     optional: bool
 
 
-Stage = MatchStage | UnwindStage | ProjectionStage | CallStage
+@dataclass(frozen=True)
+class ProcedureStage:
+    procedure: ReadProcedure
+    arguments: tuple[Expression, ...]
+    yielded: tuple[tuple[str, str], ...]
+    predicate: Expression | None
+    standalone: bool
+
+
+Stage = MatchStage | UnwindStage | ProjectionStage | CallStage | ProcedureStage
 
 
 @dataclass(frozen=True)
@@ -209,7 +219,13 @@ def needs_pipeline(tree: Any, source: str, parameters: Mapping[str, object] | No
                     kinds = {type(v) for v in value if v is not None}
                     if len(kinds) > 1 or any(isinstance(v, list | tuple | dict) for v in value):
                         return True
-        if name in {"oC_CaseExpression", "oC_SubqueryCall", "oC_Union"}:
+        if name in {
+            "oC_CaseExpression",
+            "oC_SubqueryCall",
+            "oC_InQueryCall",
+            "oC_StandaloneCall",
+            "oC_Union",
+        }:
             return True
         if name == "oC_ExistentialSubquery" and (
             node.oC_RegularQuery() is not None or node.oC_ExistentialBody() is not None
@@ -353,18 +369,28 @@ def validate_union_columns(first: tuple[str, ...], returned: tuple[str, ...]) ->
 
 
 class ReadCompiler:
-    def __init__(self, parameters: Mapping[str, object]) -> None:
+    def __init__(
+        self,
+        parameters: Mapping[str, object],
+        procedures: Mapping[str, ReadProcedure] | None = None,
+    ) -> None:
         self.parameters = dict(parameters)
         self.state = core._CompilerState()
         self.expressions = ExpressionCompiler(parameters, self._exists)
         self.deferred_traversal_errors: list[QueryError] = []
+        self.procedures = procedures if procedures is not None else {}
 
     def compile(self, tree: Any) -> ReadQuery:
         if contains_updates(tree):
             raise QueryError(
                 "Composable pipelines and subqueries currently support read queries only"
             )
-        regular = tree.oC_Statement().oC_Query().oC_RegularQuery()
+        query_node = tree.oC_Statement().oC_Query()
+        standalone = query_node.oC_StandaloneCall()
+        if standalone is not None:
+            stage, scope = self.procedure(standalone, {}, standalone=True)
+            return ReadQuery((ReadBranch({}, (stage,), scope),), False, tuple(scope))
+        regular = query_node.oC_RegularQuery()
         if regular is None:
             raise QueryError("Expected a read query")
         self.reserve_variables(regular)
@@ -475,6 +501,9 @@ class ReadCompiler:
             if has_aggregate(expression):
                 raise QueryError("UNWIND cannot contain an aggregate")
             return UnwindStage(expression, variable), scope | {variable: "any"}
+        invocation = node.oC_InQueryCall()
+        if invocation is not None:
+            return self.procedure(invocation, scope, standalone=False)
         call = node.oC_SubqueryCall()
         if call is None:
             raise QueryError(
@@ -502,6 +531,77 @@ class ReadCompiler:
             kinds = {branch.output_scope[column] for branch in query.branches}
             exported[column] = next(iter(kinds)) if len(kinds) == 1 else "any"
         return CallStage(query, call.OPTIONAL() is not None), scope | exported
+
+    def procedure(
+        self, node: Any, scope: Scope, *, standalone: bool
+    ) -> tuple[ProcedureStage, Scope]:
+        explicit = node.oC_ExplicitProcedureInvocation()
+        invocation = explicit if explicit is not None else node.oC_ImplicitProcedureInvocation()
+        name_node = invocation.oC_ProcedureName()
+        name = ".".join(
+            identifier(part.getText())
+            for part in (*name_node.oC_Namespace().oC_SymbolicName(), name_node.oC_SymbolicName())
+        )
+        procedure = self.procedures.get(name)
+        if procedure is None:
+            raise QueryError(
+                f"Unknown procedure: {name}.",
+                category="ProcedureError",
+                phase="compile",
+                detail="ProcedureNotFound",
+            )
+        if explicit is None:
+            for field in procedure.inputs:
+                if field.name not in self.parameters:
+                    raise QueryError.missing_parameter(field.name)
+            arguments = tuple(
+                Expression("literal", self.parameters[field.name], parameter=True)
+                for field in procedure.inputs
+            )
+        else:
+            expressions = explicit.oC_Expression()
+            if len(expressions) != len(procedure.inputs):
+                raise QueryError.syntax(
+                    f"Procedure {name} expects {len(procedure.inputs)} arguments.",
+                    "InvalidNumberOfArguments",
+                )
+            arguments = tuple(self.expressions.compile(expr, scope) for expr in expressions)
+            if any(has_aggregate(arg) for arg in arguments):
+                raise QueryError.syntax(
+                    "Procedure arguments cannot contain aggregates.", "InvalidAggregation"
+                )
+        for field, argument in zip(procedure.inputs, arguments, strict=True):
+            if argument.kind == "literal" and not argument.parameter:
+                field.coerce(argument.value, phase="compile")
+
+        items = node.oC_YieldItems()
+        outputs = {field.name for field in procedure.outputs}
+        yielded = []
+        visible = dict(scope)
+        if items is None:
+            if standalone:
+                yielded = [(field.name, field.name) for field in procedure.outputs]
+                visible.update(dict.fromkeys((alias for _, alias in yielded), "any"))
+        else:
+            for item in items.oC_YieldItem():
+                alias = identifier(item.oC_Variable().getText())
+                field_node = item.oC_ProcedureResultField()
+                output_name = identifier(field_node.getText()) if field_node is not None else alias
+                if output_name not in outputs:
+                    raise QueryError.syntax(
+                        f"Unknown procedure output: {output_name}.", "UndefinedVariable"
+                    )
+                if alias in visible:
+                    raise QueryError.syntax(
+                        f"Variable already declared: {alias}.", "VariableAlreadyBound"
+                    )
+                yielded.append((output_name, alias))
+                visible[alias] = "any"
+        predicate = None
+        if items is not None and items.oC_Where() is not None:
+            predicate = self.expressions.compile(items.oC_Where().oC_Expression(), visible)
+            validate_predicate(predicate)
+        return ProcedureStage(procedure, arguments, tuple(yielded), predicate, standalone), visible
 
     def match(
         self, pattern: Any, where: Any, optional: bool, scope: Scope
@@ -552,6 +652,7 @@ class ReadCompiler:
                 self.parameters,
                 self.state,
                 allow_relationship_variables=True,
+                allow_bidirectional=True,
                 allow_ranged_bindings=True,
                 compile_properties=compile_properties,
                 defer_unbounded=self.deferred_traversal_errors.append
@@ -1021,6 +1122,8 @@ class ReadRuntime:
                 values = value if isinstance(value, list | tuple) else [value]
                 unwound.extend(row | {stage.variable: p} for p in values)
             return unwound
+        if isinstance(stage, ProcedureStage):
+            return self.call_procedure(stage, rows)
         called: list[Row] = []
         for row in rows:
             nested = self.rows(stage.query, [row])
@@ -1029,6 +1132,34 @@ class ReadRuntime:
             )
             if not nested and stage.optional:
                 called.append(row | dict.fromkeys(stage.query.columns or ()))
+        return called
+
+    def call_procedure(self, stage: ProcedureStage, rows: list[Row]) -> list[Row]:
+        outputs = stage.procedure.outputs
+        called = []
+        for row in rows:
+            arguments = tuple(
+                field.coerce(self.evaluator.evaluate(expression, row), phase="runtime")
+                for field, expression in zip(stage.procedure.inputs, stage.arguments, strict=True)
+            )
+            for record in stage.procedure.handler(arguments):
+                if any(field.name not in record for field in outputs):
+                    raise QueryError(
+                        "Procedure result is missing a declared field.", phase="runtime"
+                    )
+                values = {
+                    field.name: field.coerce(record[field.name], phase="runtime")
+                    for field in outputs
+                }
+                if outputs:
+                    projected = row | {alias: values[field] for field, alias in stage.yielded}
+                    if (
+                        stage.predicate is None
+                        or truth(self.evaluator.evaluate(stage.predicate, projected)) is True
+                    ):
+                        called.append(projected)
+            if not outputs and not stage.standalone:
+                called.append(row)
         return called
 
     def match(self, stage: MatchStage, rows: list[Row]) -> list[Row]:
@@ -1047,6 +1178,18 @@ class ReadRuntime:
                 )
                 if not isinstance(row[variable], expected_type):
                     raise QueryError(f"MATCH variable {variable} must be a {kind}")
+        null_bindings = (
+            dict.fromkeys((*stage.bindings, *(path.name for path in stage.paths)))
+            if stage.optional
+            else {}
+        )
+        if any(
+            step.min_hops > step.max_hops
+            for pattern in stage.patterns
+            if isinstance(pattern, core.PathPattern)
+            for step in pattern.steps
+        ):
+            return [null_bindings | row for row in rows] if stage.optional else []
         shared = tuple(name for name in stage.bindings if name in rows[0])
         cache_key = (id(stage), shared)
         index = self._match_indexes.get(cache_key)
@@ -1144,9 +1287,7 @@ class ReadRuntime:
                 output.append(joined)
                 found = True
             if stage.optional and not found:
-                output.append(
-                    dict.fromkeys((*stage.bindings, *(path.name for path in stage.paths))) | row
-                )
+                output.append(null_bindings | row)
         return output
 
     def _properties(self, patterns: tuple[core.CompiledPattern, ...], row: Row) -> bool:

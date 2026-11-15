@@ -478,3 +478,50 @@ def test_opencypher_invalid_numeric_literal_errors(
         "compile",
         detail,
     )
+
+
+def test_dynamic_node_and_relationship_properties(database: Database) -> None:
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (p:Person {name:'Alice'})-[r:KNOWS]->() "
+            "RETURN p[$key] AS value, r['sin'+'ce'] AS year, p[null] AS missing",
+            {"key": "age"},
+        )
+        assert result.rows == ({"value": 30, "year": 2020, "missing": None},)
+        with pytest.raises(QueryError) as error:
+            session.query("MATCH (p:Person) RETURN p[1]")
+        assert error.value.detail == "InvalidArgumentType"
+    with database.write_transaction() as session:
+        result = session.query(
+            "MATCH (p:Person {name:'Alice'}) SET p.age=31 RETURN p[$key] AS value",
+            {"key": "age"},
+        )
+        assert result.rows == ({"value": 31},)
+
+
+def test_float_division_and_nan_comparisons(database: Database) -> None:
+    import math
+
+    with database.read_transaction() as session:
+        result = session.query(
+            "WITH 0.0/0.0 AS x RETURN x,x=x AS eq,x<>x AS ne,x>1 AS gt,x<'a' AS text"
+        )
+        row = result.rows[0]
+        assert math.isnan(row["x"])
+        assert (row["eq"], row["ne"], row["gt"], row["text"]) == (False, True, False, None)
+        assert session.query("RETURN 1/(-0.0) AS x").rows == ({"x": -math.inf},)
+        with pytest.raises(QueryError) as error:
+            session.query("RETURN 1/0")
+        assert error.value.detail == "DivisionByZero"
+
+
+def test_nan_sorts_after_numbers_and_before_null(database: Database) -> None:
+    import math
+
+    with database.read_transaction() as session:
+        result = session.query("UNWIND [null,0.0/0.0,1,0] AS x RETURN x ORDER BY x")
+        assert [row["x"] for row in result.rows[:2]] == [0, 1]
+        assert math.isnan(result.rows[2]["x"])
+        assert result.rows[3]["x"] is None
+        result = session.query("MATCH (p:Person {name:'Alice'}) RETURN p.age/0.0 AS x")
+        assert result.rows == ({"x": math.inf},)

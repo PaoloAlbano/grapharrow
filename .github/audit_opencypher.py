@@ -238,6 +238,56 @@ def table(step):
     ]
 
 
+def register_procedure_fixture(app, step):
+    from grapharrow.use_cases.cypher_expression import freeze
+    from grapharrow.use_cases.cypher_procedures import ProcedureField, ReadProcedure
+
+    signature = re.fullmatch(
+        r"there exists a procedure ([\w.]+)\((.*?)\)\s*::\s*\((.*?)\)\s*:",
+        step["text"],
+    )
+    if signature is None:
+        raise HarnessError(f"Invalid procedure fixture signature: {step['text']}")
+
+    def fields(text):
+        result = []
+        for item in text.split(",") if text.strip() else ():
+            field = re.fullmatch(r"\s*(\w+)\s*::\s*([A-Z]+)(\?)?\s*", item)
+            if field is None or field[2] not in {
+                "ANY",
+                "BOOLEAN",
+                "FLOAT",
+                "INTEGER",
+                "NUMBER",
+                "STRING",
+            }:
+                raise HarnessError(f"Unsupported procedure fixture field: {item}")
+            result.append(ProcedureField(field[1], field[2], nullable=bool(field[3])))
+        return tuple(result)
+
+    inputs, outputs = fields(signature[2]), fields(signature[3])
+    header, *rows = table(step)
+    if header != [field.name for field in (*inputs, *outputs)]:
+        raise HarnessError(f"Unexpected procedure fixture columns: {header}")
+    data = {}
+    for row in rows:
+        values = [parameter(parse_value(cell)) for cell in row]
+        if len(values) != len(header):
+            raise HarnessError(f"Invalid procedure fixture row: {row}")
+        key = tuple(freeze(value) for value in values[: len(inputs)])
+        record = {
+            field.name: value for field, value in zip(outputs, values[len(inputs) :], strict=True)
+        }
+        data.setdefault(key, []).append(record)
+
+    def lookup(arguments):
+        return data.get(tuple(freeze(value) for value in arguments), ())
+
+    app.use_cases.cypher.register_read_procedure(
+        signature[1], ReadProcedure(inputs, outputs, lookup)
+    )
+
+
 def snapshot(app):
     state = app.use_cases.graph.load_state()
     nodes = {n.node_id for n in state.nodes}
@@ -371,7 +421,8 @@ def run_case(case, timeout=10):
                     seed_named_graph(app, named[1])
                     continue
                 if text.startswith("there exists a procedure "):
-                    return finish("unsupported_procedure_fixture", step=text)
+                    register_procedure_fixture(app, step)
+                    continue
                 if text == "parameters are:":
                     params = {k: parameter(parse_value(v)) for k, v in table(step)}
                     continue
@@ -533,6 +584,8 @@ def preflight(cases):
                 values = [v for row in table(step)[1:] for v in row]
             elif text == "parameters are:":
                 values = [row[1] for row in table(step)]
+            elif text.startswith("there exists a procedure "):
+                values = [v for row in table(step)[1:] for v in row]
             for value in values:
                 try:
                     parse_value(value)

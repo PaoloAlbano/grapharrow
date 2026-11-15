@@ -94,6 +94,23 @@ def _malformed_number(recognizer: object, token: object) -> bool:
     }
 
 
+def _syntax_detail(recognizer: object, token: object) -> str:
+    if _malformed_number(recognizer, token):
+        return "InvalidNumberLiteral"
+    if isinstance(recognizer, CypherParser) and isinstance(token, Token):
+        context = recognizer._ctx
+        if isinstance(context, CypherParser.OC_CypherContext) and token.type in {
+            CypherParser.RETURN,
+            CypherParser.WITH,
+        }:
+            statement = context.oC_Statement()  # type: ignore[no-untyped-call]
+            query = statement.oC_Query() if statement is not None else None
+            call = query.oC_StandaloneCall() if query is not None else None
+            if call is not None and call.oC_ImplicitProcedureInvocation() is not None:
+                return "InvalidArgumentPassingMode"
+    return "UnexpectedSyntax"
+
+
 class _RaisingErrorListener(ErrorListener):  # type: ignore[misc]
     """Convert ANTLR syntax callbacks into GraphArrow query errors."""
 
@@ -110,11 +127,7 @@ class _RaisingErrorListener(ErrorListener):  # type: ignore[misc]
             f"openCypher syntax error at {line}:{column}: {msg}",
             category="SyntaxError",
             phase="compile",
-            detail=(
-                "InvalidNumberLiteral"
-                if _malformed_number(recognizer, offendingSymbol)
-                else "UnexpectedSyntax"
-            ),
+            detail=_syntax_detail(recognizer, offendingSymbol),
             line=line,
             column=column,
         )

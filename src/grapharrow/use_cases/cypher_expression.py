@@ -855,8 +855,14 @@ class ExpressionEvaluator:
                 return values[0] if value == "+" else -values[0]
             left, right = values
             try:
-                if value == "/" and type(left) is int and type(right) is int:
-                    return (abs(left) // abs(right)) * (-1 if (left < 0) != (right < 0) else 1)
+                if value == "/":
+                    if type(left) is int and type(right) is int:
+                        return (abs(left) // abs(right)) * (-1 if (left < 0) != (right < 0) else 1)
+                    if right == 0:
+                        if left == 0 or math.isnan(left):
+                            return math.nan
+                        return math.copysign(math.inf, left) * math.copysign(1.0, right)
+                    return left / right
                 if value == "%":
                     if type(left) is int and type(right) is int:
                         quotient = (abs(left) // abs(right)) * (
@@ -870,7 +876,6 @@ class ExpressionEvaluator:
                     "+": lambda: left + right,
                     "-": lambda: left - right,
                     "*": lambda: left * right,
-                    "/": lambda: left / right,
                     "%": lambda: left % right,
                 }[value]()
             except ZeroDivisionError as error:
@@ -888,15 +893,24 @@ class ExpressionEvaluator:
             if collection is None:
                 return None
             positions = [evaluate(p) for p in args[1:]]
-            if kind == "index" and isinstance(collection, dict):
-                if positions[0] is not None and not isinstance(positions[0], str):
+            if kind == "index" and isinstance(collection, Mapping | NodeRecord | EdgeRecord):
+                key = positions[0]
+                if key is None:
+                    return None
+                if not isinstance(key, str):
                     raise QueryError(
-                        "Map indexes must be strings",
+                        "Property and map indexes must be strings",
                         category="TypeError",
                         phase="runtime",
-                        detail="MapElementAccessByNonString",
+                        detail=(
+                            "MapElementAccessByNonString"
+                            if isinstance(collection, Mapping)
+                            else "InvalidArgumentType"
+                        ),
                     )
-                return collection.get(positions[0])
+                if self.resolve_entity is not None:
+                    collection = self.resolve_entity(collection)
+                return property_value(collection, key)
             if not isinstance(collection, list | tuple):
                 raise QueryError.invalid_type("Indexing requires a list or map", phase="runtime")
             if any(p is not None and type(p) is not int for p in positions):
