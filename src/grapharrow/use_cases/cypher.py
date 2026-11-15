@@ -1335,12 +1335,17 @@ class CypherQueryUseCase:
                 current_edge_prefix=plan.edge_variable,
                 previous_edge_prefixes=plan.previous_edge_variables,
             )
+            candidate_ids = None
+            # A batch with many matches can use the existing join without extra scans.
+            if matched.num_rows * 4 < state.node_table.num_rows:
+                candidate_ids = pc.unique(matched[next_edge_key])
             next_nodes = _node_binding_table(
                 state.node_table,
                 plan.end_variable,
                 requested_fields=plan.end_requested_fields,
                 pattern=step.node,
                 node_property_loader=node_property_loader,
+                candidate_ids=candidate_ids,
             )
             matched = self._tabular.inner_join(
                 matched,
@@ -12311,6 +12316,7 @@ def _node_binding_table(
     pattern: NodePattern | None = None,
     node_property_loader: PropertyTableLoader | None = None,
     pushdown_predicate: WherePredicate | None = None,
+    candidate_ids: pa.Array | None = None,
 ) -> pa.Table:
     """Handle node-specific matching, projection, or lookup logic for Cypher."""
     if isinstance(nodes, pa.Table):
@@ -12373,7 +12379,15 @@ def _node_binding_table(
                     requested_fields=requested_fields,
                     property_table=property_table,
                     pushdown_predicate=pushdown_predicate,
+                    candidate_ids=candidate_ids,
                 )
+        if (
+            candidate_ids is not None
+            and requested_fields is not None
+            and requested_fields <= {_NODE_ID_FIELD, _ENTITY_ID_FIELD, "__join_id", "labels"}
+        ):
+            # Canonical scalar bindings infer their Arrow types from the full set of values.
+            nodes = nodes.filter(pc.is_in(nodes["node_id"], value_set=candidate_ids))
         return _node_binding_table_from_canonical_table(
             nodes,
             variable,
@@ -12582,6 +12596,7 @@ def _node_binding_table_from_property_projection(
     requested_fields: set[str],
     property_table: pa.Table,
     pushdown_predicate: WherePredicate | None = None,
+    candidate_ids: pa.Array | None = None,
 ) -> pa.Table:
     """Handle node-specific matching, projection, or lookup logic for Cypher."""
     restrict_candidates = _node_property_projection_restricts_candidates(
@@ -12596,7 +12611,14 @@ def _node_binding_table_from_property_projection(
         variable=variable,
         predicate=pushdown_predicate,
     )
+    # Preserve the projection's types when no projected row matches the reached IDs.
+    has_property_rows = property_table.num_rows > 0
     candidates = canonical_table.select(["node_id", "labels"])
+    if candidate_ids is not None:
+        candidates = candidates.filter(pc.is_in(candidates["node_id"], value_set=candidate_ids))
+        property_table = property_table.filter(
+            pc.is_in(property_table["node_id"], value_set=candidate_ids)
+        )
     if restrict_candidates:
         candidates = candidates.filter(
             pc.is_in(candidates["node_id"], value_set=property_table["node_id"])
@@ -12638,7 +12660,7 @@ def _node_binding_table_from_property_projection(
         base = base.select(
             [column_name for column_name in base.column_names if column_name != "node_id"]
         )
-    if property_table.num_rows == 0:
+    if not has_property_rows:
         projected = base
     else:
         projection_columns = {

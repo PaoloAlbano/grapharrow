@@ -1,5 +1,6 @@
 """Columnar pipelines must preserve row semantics and avoid canonical graph reads."""
 
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,7 @@ import pytest
 from grapharrow.app import build_application
 from grapharrow.config import GraphArrowSettings
 from grapharrow.core.errors import QueryError
+from grapharrow.use_cases import cypher as cypher_module
 
 
 @pytest.fixture
@@ -159,6 +161,79 @@ def test_selective_with_match_uses_tabular_expansion(
     assert graph.property_indexes.builds == 1
     if expected:
         assert graph.adjacency_indexes._entries
+
+
+@pytest.mark.parametrize(
+    "query, name, ages, encoded_rows",
+    [
+        (
+            "MATCH (a:Person {name:$name})-[:LINK]->(q:Person) RETURN q.age AS age",
+            "Alice",
+            [30, 20, 20, None],
+            [1, 3],
+        ),
+        (
+            "MATCH (a:Person {name:$name}) WITH a AS start "
+            "MATCH (start)-[:LINK]->(:Person)-[:LINK]->(q:Person) RETURN q.age AS age",
+            "Alice",
+            [20, 20, None, 30, 30],
+            [1, 3, 3],
+        ),
+        (
+            "MATCH (a:Person {name:$name}) WITH a AS start "
+            "MATCH (start)<-[:LINK]-(q:Person) RETURN q.age AS age",
+            "Bob",
+            [30, 30],
+            [1, 1],
+        ),
+        (
+            "MATCH (a:Person {name:$name})-[:LINK]->(q:Person) RETURN q.age AS age",
+            "Dan",
+            [],
+            [1],
+        ),
+        (
+            "MATCH (a:Person {name:$name})-[:WIDE]->(q:Person) RETURN q.age AS age",
+            "Alice",
+            [30, 20, 30, None, *([40] * 28)],
+            [1, 32],
+        ),
+    ],
+)
+def test_expansion_encodes_labels_for_reached_nodes(
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    query: str,
+    name: str,
+    ages: list[int | None],
+    encoded_rows: list[int],
+) -> None:
+    app.use_cases.graph.create_nodes_bulk(
+        table=pa.table({"name": [f"Extra {index}" for index in range(28)], "age": [40] * 28}),
+        default_labels=("Person",),
+    )
+    cypher = app.use_cases.cypher
+    cypher.execute(
+        "MATCH (a:Person {name:'Alice'}), (b:Person {name:'Bob'}), "
+        "(c:Person {name:'Carol'}), (d:Person {name:'Dan'}) "
+        "CREATE (a)-[:LINK]->(a), (a)-[:LINK]->(b), (a)-[:LINK]->(b), "
+        "(a)-[:LINK]->(d), (b)-[:LINK]->(c)"
+    )
+    cypher.execute("MATCH (a:Person {name:'Alice'}), (q:Person) CREATE (a)-[:WIDE]->(q)")
+    cypher.execute("CREATE INDEX person_name FOR (p:Person) ON (p.name)")
+
+    encoded = []
+    original = cypher_module._encode_binding_labels
+
+    def record_rows(column: pa.ChunkedArray, *, normalize: bool = False) -> pa.Array:
+        encoded.append(len(column))
+        return original(column, normalize=normalize)
+
+    monkeypatch.setattr(cypher_module, "_encode_binding_labels", record_rows)
+    result = cypher.execute(query, {"name": name})
+    assert result.columns == ("age",)
+    assert Counter(row["age"] for row in result.rows) == Counter(ages)
+    assert encoded == encoded_rows
 
 
 def test_selective_expansion_keeps_snapshot_pinned_during_planning(
