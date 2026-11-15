@@ -1177,3 +1177,23 @@ def test_rest_query_supports_in_predicates(tmp_path: Path) -> None:
         {"n.name": "Alice"},
         {"n.name": "Carol"},
     ]
+
+
+def test_cypher_limit_rejects_overload_and_releases_failed_statements(tmp_path: Path) -> None:
+    app = create_rest_app(
+        tmp_path / "limited", settings=GraphArrowSettings(cypher_max_concurrent_queries=1)
+    )
+    graph = app.state.grapharrow.use_cases.graph
+    with TestClient(app) as client:
+        with graph.cypher_query_slot():
+            response = client.post("/v1/query", json={"query": "RETURN 1 AS value"})
+            assert response.status_code == 503
+            assert response.json()["error"]["details"] == {
+                "category": "ResourceExhausted",
+                "code": "Neo.TransientError.Invalid.ResourceExhaustion",
+                "phase": "runtime",
+                "detail": "ConcurrentQueryLimit",
+            }
+        assert client.post("/v1/query", json={"query": "RETURN 1 / 0"}).status_code == 400
+        response = client.post("/v1/query", json={"query": "RETURN 1 AS value"})
+        assert response.json()["data"]["rows"] == [{"value": 1}]

@@ -588,13 +588,14 @@ class CypherQueryUseCase:
 
     def execute(self, query: str, params: dict[str, object] | None = None) -> QueryResult:
         """Execute ``query`` against the current graph state."""
-        with _query_phase("compile"):
-            result = self._execute(query, params)
-        if not any(property_codec.contains_temporal(row) for row in result.rows):
-            return result
-        from grapharrow.use_cases.cypher_expression import public_value
+        with self._graph_service.cypher_query_slot():
+            with _query_phase("compile"):
+                result = self._execute(query, params)
+            if not any(property_codec.contains_temporal(row) for row in result.rows):
+                return result
+            from grapharrow.use_cases.cypher_expression import public_value
 
-        return QueryResult(result.columns, tuple(public_value(row) for row in result.rows))
+            return QueryResult(result.columns, tuple(public_value(row) for row in result.rows))
 
     def _execute(self, query: str, params: dict[str, object] | None) -> QueryResult:
         normalized = query.strip()
@@ -797,6 +798,8 @@ class CypherQueryUseCase:
     def _adjacency_loader_for_state(
         self,
         state: GraphState | GraphTabularState,
+        *,
+        scan_adjacency: bool = False,
     ) -> Callable[[str], pa.Table] | None:
         """Support the current Cypher compilation or execution step."""
         source_cache: dict[str, pa.Table] = {}
@@ -864,6 +867,27 @@ class CypherQueryUseCase:
             # Broad frontiers are better served by the existing vectorized join.
             if len(unique_ids) > max(8, state.node_table.num_rows // 4):
                 return None
+            if scan_adjacency:
+                graph = self._graph_service
+                assert isinstance(graph, GraphStateUseCase) and step.rel_type is not None
+                incoming = step.direction == "incoming"
+                column = "dst_id" if incoming else "src_id"
+                load = (
+                    graph.load_adjacency_by_dest_table
+                    if incoming
+                    else graph.load_adjacency_by_source_table
+                )
+                table = load(
+                    snapshot=state.snapshot,
+                    rel_type=step.rel_type,
+                    predicates=(ScanPredicate(column, "in", tuple(unique_ids.to_pylist())),)
+                    if len(unique_ids) <= _INCREMENTAL_MATCH_MAX_INPUT_ROWS
+                    else (),
+                )
+                table = table.filter(pc.is_in(table[column], value_set=unique_ids))
+                return table.append_column(
+                    "rel_type", pa.array([step.rel_type] * table.num_rows, type=pa.string())
+                )
             index = self._graph_service.adjacency_for_state(state)
             if index is None:
                 return None
@@ -1193,11 +1217,12 @@ class CypherQueryUseCase:
         *,
         include_edges: bool = True,
         state: GraphTabularState | None = None,
+        scan_adjacency: bool = False,
     ) -> MatchLogicalPlanResult:
         """Execute this query shape and return the result needed by the caller."""
         if state is None:
             state = self._graph_service.load_tabular_state(include_edges=include_edges)
-        adjacency_loader = self._adjacency_loader_for_state(state)
+        adjacency_loader = self._adjacency_loader_for_state(state, scan_adjacency=scan_adjacency)
         edge_property_loader = self._edge_property_loader_for_state(state)
         node_property_loader = self._node_property_loader_for_state(state)
         if isinstance(plan.root, AggregateCountPlan):

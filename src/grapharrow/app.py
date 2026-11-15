@@ -113,6 +113,7 @@ def build_application(
         snapshot_store=repositories.snapshot,
         graph_store=repositories.graph,
         snapshot_table_cache_max_bytes=resolved_settings.snapshot_table_cache_max_bytes,
+        cypher_max_concurrent_queries=resolved_settings.cypher_max_concurrent_queries,
         property_index_max_bytes=resolved_settings.property_index_max_bytes,
         adjacency_index_max_bytes=resolved_settings.adjacency_index_max_bytes,
     )

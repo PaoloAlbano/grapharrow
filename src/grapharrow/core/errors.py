@@ -51,6 +51,7 @@ class QueryError(GraphArrowError):
             "EntityNotFound": "Neo.ClientError.Statement.EntityNotFound",
             "ConstraintVerificationFailed": "Neo.ClientError.Schema.ConstraintValidationFailed",
             "UnsupportedFeature": "GraphArrow.UnsupportedFeature",
+            "ResourceExhausted": "Neo.TransientError.Invalid.ResourceExhaustion",
         }.get(self.category, "GraphArrow.QueryError")
 
     def metadata(self) -> dict[str, str | int | None]:

@@ -472,8 +472,25 @@ class ColumnarReadRuntime:
                     and category != _category(pa.scalar(anchor_value).type)
                 ):
                     raise UnsupportedColumnar
-        with graph.borrow_tabular_state(snapshot=snapshot) as state:
-            planned = self.runtime.executor._execute_match_logical_plan(logical, state=state)
+        # The fixed-width IDs and offsets in canonical tables already imply this lower bound.
+        minimum_canonical_bytes = (
+            sum(item.row_count for item in snapshot.nodes) * 16
+            + sum(item.row_count for item in snapshot.edges) * 32
+        )
+        scan_adjacency = minimum_canonical_bytes > graph.snapshot_tables.max_bytes and all(
+            step.rel_type is not None
+            and len(step.rel_type_alternatives) <= 1
+            and graph.has_complete_adjacency(
+                snapshot, step.rel_type, incoming=step.direction == "incoming"
+            )
+            for step in path.steps
+        )
+        with graph.borrow_tabular_state(
+            snapshot=snapshot, include_edges=not scan_adjacency
+        ) as state:
+            planned = self.runtime.executor._execute_match_logical_plan(
+                logical, state=state, scan_adjacency=scan_adjacency
+            )
             table = planned.table
             assert table is not None
             names = tuple(item.expression for item in query.return_items)

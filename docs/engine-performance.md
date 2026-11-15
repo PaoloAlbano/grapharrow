@@ -213,3 +213,19 @@ sharing. Unused entries are eligible for eviction. A table above the
 available cache budget is read for its caller. The setting controls retained
 canonical tables. Query intermediates, uncached reads and other engine caches
 have their own memory costs.
+
+## Selective traversal reads and concurrency limits
+
+For eligible fixed one- and two-hop Cypher traversals after `WITH`, the engine
+uses derived adjacency for the required relationship type and direction when
+the canonical tables' minimum estimated size exceeds the cache budget.
+Small endpoint sets are passed to the Parquet reader and checked again in
+Arrow. Snapshots without complete applicable adjacency retain the canonical
+read path.
+
+Set `GRAPHARROW_CYPHER_MAX_CONCURRENT_QUERIES` to a positive value to limit
+running Cypher statements in one application. At saturation, the next
+statement fails before it starts reading the graph. REST reports HTTP 503 and
+Bolt reports resource exhaustion. The default of `0` disables the concurrency
+limit. Separate processes have separate limits. A statement slot limits
+concurrency and leaves the memory of each statement workload-dependent.

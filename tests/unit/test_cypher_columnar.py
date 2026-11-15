@@ -348,3 +348,66 @@ def test_columnar_filter_type_error_is_not_hidden_by_pushdown(app: Any) -> None:
         app.use_cases.cypher.execute(
             "MATCH (p:Person) WHERE 1 AND p.age<0 RETURN coalesce(p.name,'?') AS name"
         )
+
+
+@pytest.mark.parametrize("direction", ["incoming", "outgoing"])
+@pytest.mark.parametrize("pushdown", [True, False])
+def test_oversized_snapshot_reads_only_typed_adjacency(
+    app: Any, monkeypatch: pytest.MonkeyPatch, direction: str, pushdown: bool
+) -> None:
+    graph = app.use_cases.graph
+    cypher = app.use_cases.cypher
+    store = app.repositories.graph
+    graph.snapshot_tables.max_bytes = 1
+    store._parquet.filter_pushdown_enabled = pushdown
+    cypher.execute(
+        "MATCH (a:Person {name:'Alice'}), (b:Person {name:'Bob'}), "
+        "(c:Person {name:'Carol'}) "
+        "CREATE (a)-[:LINK]->(b), (a)-[:LINK]->(b), (c)-[:LINK]->(a)"
+    )
+
+    def forbid_canonical(*args: Any) -> Any:
+        raise AssertionError("Selective traversal loaded the canonical edges")
+
+    monkeypatch.setattr(store, "load_edge_table", forbid_canonical)
+    calls = []
+    incoming = direction == "incoming"
+    name = f"load_adjacency_by_{'dest' if incoming else 'source'}_table"
+    original = getattr(store, name)
+
+    def read(*args: Any, **kwargs: Any) -> pa.Table:
+        calls.append(kwargs["predicates"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, name, read)
+    relationship = "<-[:LINK]-" if incoming else "-[:LINK]->"
+    query = (
+        "MATCH (a:Person {name:'Alice'}) WITH a AS seed "
+        f"MATCH (seed){relationship}(b:Person) RETURN b.name AS name"
+    )
+    result = cypher.execute(query)
+    expected = ["Carol"] if incoming else ["Bob", "Bob"]
+    assert [row["name"] for row in result.rows] == expected
+    assert len(calls) == len(calls[0]) == 1
+    predicate = calls[0][0]
+    assert (predicate.column, predicate.operator) == ("dst_id" if incoming else "src_id", "in")
+    assert len(predicate.value) == 1
+
+
+def test_selective_adjacency_falls_back_for_old_manifest(
+    app: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+
+    graph = app.use_cases.graph
+    cypher = app.use_cases.cypher
+    graph.snapshot_tables.max_bytes = 1
+    cypher.execute(
+        "MATCH (a:Person {name:'Alice'}), (b:Person {name:'Bob'}) CREATE (a)-[:LINK]->(b)"
+    )
+    snapshot = replace(graph.capture_snapshot(), adjacency_by_dest=())
+    monkeypatch.setattr(graph, "capture_snapshot", lambda: snapshot)
+    result = cypher.execute(
+        "MATCH (b:Person {name:'Bob'}) WITH b MATCH (b)<-[:LINK]-(a:Person) RETURN a.name AS name"
+    )
+    assert result.rows == ({"name": "Alice"},)

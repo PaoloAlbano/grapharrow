@@ -8,6 +8,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
+from threading import BoundedSemaphore
 from typing import Any
 
 import pyarrow as pa  # type: ignore[import-untyped]
@@ -81,6 +82,7 @@ class GraphStateUseCase:
         catalog_store: CatalogRepository,
         snapshot_store: SnapshotRepository,
         graph_store: GraphRepository,
+        cypher_max_concurrent_queries: int = 0,
         snapshot_table_cache_max_bytes: int = 64 * 1024 * 1024,
         property_index_max_bytes: int = 32 * 1024 * 1024,
         adjacency_index_max_bytes: int = 32 * 1024 * 1024,
@@ -91,6 +93,11 @@ class GraphStateUseCase:
         self._snapshot_store = snapshot_store
         self._graph_store = graph_store
         self._writer = snapshot_store.writer
+        self._cypher_slots = (
+            BoundedSemaphore(cypher_max_concurrent_queries)
+            if cypher_max_concurrent_queries
+            else None
+        )
         self.snapshot_tables = SnapshotTableCache(snapshot_table_cache_max_bytes)
         self.property_indexes = PropertyIndexStore(property_index_max_bytes)
         self.adjacency_indexes = AdjacencyIndexStore(adjacency_index_max_bytes)
@@ -104,6 +111,25 @@ class GraphStateUseCase:
     def writer_lock(self) -> AbstractContextManager[None]:
         """Serialize a complete database mutation with other coordinated writers."""
         return self._writer.hold()
+
+    @contextmanager
+    def cypher_query_slot(self) -> Generator[None, None, None]:
+        """Admit a Cypher statement before it starts allocating query state."""
+        slots = self._cypher_slots
+        if slots is None:
+            yield
+            return
+        if not slots.acquire(blocking=False):
+            raise QueryError(
+                "Too many Cypher queries are running. Retry after a query completes.",
+                category="ResourceExhausted",
+                phase="runtime",
+                detail="ConcurrentQueryLimit",
+            )
+        try:
+            yield
+        finally:
+            slots.release()
 
     def capture_snapshot(self) -> SnapshotManifest:
         """Pin a published snapshot without loading canonical graph tables."""
@@ -281,6 +307,7 @@ class GraphStateUseCase:
         *,
         snapshot: SnapshotManifest,
         rel_type: str,
+        predicates: tuple[ScanPredicate, ...] = (),
     ) -> pa.Table:
         """Load the adjacency-by-source table for a relationship type."""
 
@@ -289,13 +316,14 @@ class GraphStateUseCase:
             for dataset_file in snapshot.adjacency_by_source
             if _adjacency_rel_type_from_file(dataset_file) == rel_type
         )
-        return self._graph_store.load_adjacency_by_source_table(files)
+        return self._graph_store.load_adjacency_by_source_table(files, predicates=predicates)
 
     def load_adjacency_by_dest_table(
         self,
         *,
         snapshot: SnapshotManifest,
         rel_type: str,
+        predicates: tuple[ScanPredicate, ...] = (),
     ) -> pa.Table:
         """Load the adjacency-by-destination table for a relationship type."""
 
@@ -304,7 +332,17 @@ class GraphStateUseCase:
             for dataset_file in snapshot.adjacency_by_dest
             if _adjacency_rel_type_from_file(dataset_file) == rel_type
         )
-        return self._graph_store.load_adjacency_by_dest_table(files)
+        return self._graph_store.load_adjacency_by_dest_table(files, predicates=predicates)
+
+    def has_complete_adjacency(
+        self, snapshot: SnapshotManifest, rel_type: str, *, incoming: bool
+    ) -> bool:
+        """Use a derived read only when the manifest accounts for every edge."""
+        files = snapshot.adjacency_by_dest if incoming else snapshot.adjacency_by_source
+        if sum(file.row_count for file in files) != sum(file.row_count for file in snapshot.edges):
+            return False
+        names = {_adjacency_rel_type_from_file(file) for file in files}
+        return None not in names and rel_type in names and f"`{rel_type}`" not in names
 
     @writer_locked
     def create_node(
@@ -1275,6 +1313,10 @@ class GraphTransactionUseCase:
             node_table=self._state.node_table,
             edge_table=self._state.edge_table if include_edges else EDGE_SCHEMA.empty_table(),
         )
+
+    def cypher_query_slot(self) -> AbstractContextManager[None]:
+        """Share the application's statement limit with explicit transactions."""
+        return self._graph_service.cypher_query_slot()
 
     def borrow_tabular_state(
         self, *, include_edges: bool = True

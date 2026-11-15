@@ -354,10 +354,13 @@ def _register_error_handlers(app: FastAPI) -> None:
         _: Request,
         exc: Exception,
     ) -> JSONResponse:
-        """Translate query and transaction failures into client-visible 400 responses."""
+        """Translate query errors and admission failures into REST responses."""
         typed_exc = cast(QueryError | TransactionError, exc)
+        overloaded = isinstance(typed_exc, QueryError) and typed_exc.category == "ResourceExhausted"
         return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=(
+                status.HTTP_503_SERVICE_UNAVAILABLE if overloaded else status.HTTP_400_BAD_REQUEST
+            ),
             content=_error(
                 type(typed_exc).__name__.upper(),
                 str(typed_exc),

@@ -119,20 +119,26 @@ class GraphRepository:
             schema=NODE_LABEL_SCHEMA,
         )
 
-    def load_adjacency_by_source_table(self, files: tuple[DatasetFile, ...]) -> pa.Table:
+    def load_adjacency_by_source_table(
+        self, files: tuple[DatasetFile, ...], *, predicates: tuple[ScanPredicate, ...] = ()
+    ) -> pa.Table:
         """Load adjacency-by-source tables referenced by ``files`` into one Arrow table."""
 
         return self._parquet.read_dataset_table(
             [self._absolute_location(dataset_file.path) for dataset_file in files],
             schema=ADJACENCY_BY_SOURCE_SCHEMA,
+            predicates=predicates,
         )
 
-    def load_adjacency_by_dest_table(self, files: tuple[DatasetFile, ...]) -> pa.Table:
+    def load_adjacency_by_dest_table(
+        self, files: tuple[DatasetFile, ...], *, predicates: tuple[ScanPredicate, ...] = ()
+    ) -> pa.Table:
         """Load adjacency-by-destination tables referenced by ``files`` into one Arrow table."""
 
         return self._parquet.read_dataset_table(
             [self._absolute_location(dataset_file.path) for dataset_file in files],
             schema=ADJACENCY_BY_SOURCE_SCHEMA,
+            predicates=predicates,
         )
 
     def load_node_property_table(
