@@ -141,6 +141,25 @@ class GraphRepository:
             predicates=predicates,
         )
 
+    @staticmethod
+    def node_property_files(
+        files: tuple[DatasetFile, ...], *, label: str
+    ) -> tuple[DatasetFile, ...]:
+        """Select the immutable property-projection files for a label."""
+        return tuple(item for item in files if _label_from_node_property_file(item) == label)
+
+    @staticmethod
+    def group_node_property_files(
+        files: tuple[DatasetFile, ...],
+    ) -> dict[str, tuple[DatasetFile, ...]]:
+        """Group property-projection files by their manifest label."""
+        by_label: dict[str, list[DatasetFile]] = {}
+        for item in files:
+            label = _label_from_node_property_file(item)
+            if label is not None:
+                by_label.setdefault(label, []).append(item)
+        return {label: tuple(items) for label, items in by_label.items()}
+
     def load_node_property_table(
         self,
         files: tuple[DatasetFile, ...],
@@ -151,13 +170,11 @@ class GraphRepository:
     ) -> pa.Table:
         """Load the property-projection dataset for ``label``."""
 
-        selected_files = tuple(
-            dataset_file
-            for dataset_file in files
-            if _label_from_node_property_file(dataset_file) == label
-        )
         return self._parquet.read_dataset_table(
-            [self._absolute_location(dataset_file.path) for dataset_file in selected_files],
+            [
+                self._absolute_location(item.path)
+                for item in self.node_property_files(files, label=label)
+            ],
             columns=columns,
             predicates=predicates,
         )
@@ -175,8 +192,7 @@ class GraphRepository:
         return self._parquet.iter_dataset_batches(
             [
                 self._absolute_location(item.path)
-                for item in files
-                if _label_from_node_property_file(item) == label
+                for item in self.node_property_files(files, label=label)
             ],
             columns=columns,
             predicates=predicates,
@@ -188,8 +204,7 @@ class GraphRepository:
         return self._parquet.read_dataset_schema(
             [
                 self._absolute_location(item.path)
-                for item in files
-                if _label_from_node_property_file(item) == label
+                for item in self.node_property_files(files, label=label)
             ]
         )
 

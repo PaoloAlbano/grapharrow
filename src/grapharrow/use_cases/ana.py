@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import ExitStack
 from copy import deepcopy
 from threading import RLock
 from typing import Any
@@ -21,6 +22,7 @@ from grapharrow.app import GraphArrowApplication
 from grapharrow.core import property_codec
 from grapharrow.core.temporal import Duration, Instant
 from grapharrow.use_cases import ana_patterns, ana_roles, ana_search
+from grapharrow.use_cases.ana_node_lookup import AnaNodeLookup
 from grapharrow.use_cases.ana_read_cache import AnaReadCache
 from grapharrow.use_cases.ana_resources import AnaLimits, AnaResourceBudget, AnaResources
 from grapharrow.use_cases.ana_runtime import AnaRuntime
@@ -48,29 +50,24 @@ class GraphArrowAgentBackend(AnaRuntime):
         self._call_lock = RLock()
         self.last_fetch = None
         self._owner = self._handle_store.namespace
+        with ExitStack() as leases:
+            self._open_snapshot(leases, resource_budget)
+            self._snapshot_leases = leases.pop_all()
+
+    def _open_snapshot(self, leases: ExitStack, resource_budget: AnaResourceBudget | None) -> None:
+        application = self._application
+        graph = application.use_cases.graph
         # Pin canonical tables and projections together against concurrent vacuum.
-        with application.use_cases.graph.writer_lock():
-            self._snapshot_state: GraphTabularState | None = (
-                application.use_cases.graph.load_tabular_state()
+        with graph.writer_lock():
+            self._snapshot_state: GraphTabularState | None = leases.enter_context(
+                graph.borrow_tabular_state()
             )
-            node_ids = self._state.node_table["node_id"].to_pylist()
-            label_values = self._state.node_table["labels"].to_pylist()
-            labels = dict.fromkeys(label for values in label_values for label in values)
-            self._property_tables = {
-                label: application.use_cases.graph.load_node_property_table(
-                    snapshot=self._state.snapshot, label=label
-                )
-                for label in labels
-            }
-        self._positions = {int(value): index for index, value in enumerate(node_ids)}
-        self._label_ids: dict[str, list[int]] = defaultdict(list)
-        for node_id, labels in zip(
-            node_ids,
-            label_values,
-            strict=True,
-        ):
-            for label in labels:
-                self._label_ids[label].append(node_id)
+            self._property_tables = leases.enter_context(
+                graph.borrow_node_property_tables(snapshot=self._state.snapshot)
+            )
+        state = self._state
+        lookup = application._ana_node_lookups.get_or_create(state.snapshot.nodes, state.node_table)
+        self._node_lookup: AnaNodeLookup | None = lookup
         self._schema_snapshot: SnapshotSchema | None = application._ana_schema_cache.get_or_create(
             self._state.snapshot, self._discover_schema
         )
@@ -83,11 +80,7 @@ class GraphArrowAgentBackend(AnaRuntime):
             settings.ana_adjacency_index_max_bytes_per_session,
             node_count=self._state.node_table.num_rows,
         )
-        self._adjacency = (
-            application.use_cases.graph.adjacency_for_state(self._state)
-            if adjacency_bytes
-            else None
-        )
+        self._adjacency = graph.adjacency_for_state(self._state) if adjacency_bytes else None
         if (
             self._adjacency is not None
             and self._adjacency.reserved_bytes <= settings.ana_adjacency_index_max_bytes_per_session
@@ -110,14 +103,10 @@ class GraphArrowAgentBackend(AnaRuntime):
             resource_budget
             if resource_budget is not None
             else AnaResourceBudget(settings.ana_max_total_bytes),
-            (
-                self._snapshot_state,
-                self._property_tables,
-                self._positions,
-                self._label_ids,
-            ),
+            (self._snapshot_state, self._property_tables),
             shared_state=(self._schema_snapshot, self._schema),
-            reserved_bytes=self._read_cache.max_bytes if self._read_cache is not None else 0,
+            reserved_bytes=lookup.retained_bytes
+            + (self._read_cache.max_bytes if self._read_cache is not None else 0),
         )
         if adjacency_bytes and not self._resources.reserve_snapshot_capacity(adjacency_bytes):
             self._adjacency = None
@@ -204,11 +193,11 @@ class GraphArrowAgentBackend(AnaRuntime):
                 self._resources.close()
                 self.last_fetch = None
                 self._property_tables.clear()
-                self._positions.clear()
-                self._label_ids.clear()
+                self._node_lookup = None
                 self._schema.clear()
                 self._schema_snapshot = None
                 self._snapshot_state = None
+                self._snapshot_leases.close()
                 self._adjacency = None
                 if self._read_cache is not None:
                     self._read_cache.clear()
@@ -219,6 +208,16 @@ class GraphArrowAgentBackend(AnaRuntime):
         if self._snapshot_state is None:
             raise RuntimeError("Graph backend is closed")
         return self._snapshot_state
+
+    @property
+    def _positions(self) -> Mapping[int, int]:
+        assert self._node_lookup is not None
+        return self._node_lookup.positions
+
+    @property
+    def _label_ids(self) -> Mapping[str, tuple[int, ...]]:
+        assert self._node_lookup is not None
+        return self._node_lookup.label_ids
 
     def _entity_query_metadata(self, node_ids: set[int], var: str, label: str) -> dict[str, Any]:
         """Preserve full branch membership separately from limited entity rows."""
@@ -265,7 +264,7 @@ class GraphArrowAgentBackend(AnaRuntime):
         payload.reference = EntityReference(self._owner, str(row["node_id"]))
         return payload
 
-    def _materialize_nodes(self, node_ids: list[int]) -> list[EntityPayload]:
+    def _materialize_nodes(self, node_ids: Sequence[int]) -> list[EntityPayload]:
         if not node_ids:
             return []
         positions = pa.array([self._positions[node_id] for node_id in node_ids], type=pa.int64())
@@ -273,7 +272,7 @@ class GraphArrowAgentBackend(AnaRuntime):
         return [self._node_payload(row) for row in columns.take(positions).to_pylist()]
 
     def _nodes(self, label: str) -> Any:
-        ids = pa.array(self._label_ids.get(label, []), type=pa.int64())
+        ids = pa.array(self._label_ids.get(label, ()), type=pa.int64())
         return self._state.node_table.filter(pc.is_in(self._state.node_table["node_id"], ids))
 
     def _node_search(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -328,7 +327,7 @@ class GraphArrowAgentBackend(AnaRuntime):
             return matches.slice(0, 0)
 
         # Keep canonical node order when a projection has several matches.
-        candidates = pa.array(self._label_ids.get(label, []), type=pa.int64())
+        candidates = pa.array(self._label_ids.get(label, ()), type=pa.int64())
         return pc.filter(candidates, pc.is_in(candidates, matches))
 
     def _search_canonical(self, label: str, prop: str, value: Any) -> Any:
@@ -348,7 +347,7 @@ class GraphArrowAgentBackend(AnaRuntime):
         limit = _int_arg(args, "limit", 50000, min_value=1)
         if limit > 5000 and not args.get("allow_large"):
             raise ValueError("node_scan is capped at 5000 unless allow_large=true")
-        node_ids = self._label_ids.get(label, [])[:limit]
+        node_ids = self._label_ids.get(label, ())[:limit]
         rows = [{var: entity, "__rel_ids": []} for entity in self._materialize_nodes(node_ids)]
         return dict(self._store(rows, focus=var))
 
@@ -357,7 +356,7 @@ class GraphArrowAgentBackend(AnaRuntime):
         alias = str(args.get("alias") or f"{label.lower()}_count")
         return dict(
             self._store(
-                [{alias: len(self._label_ids.get(label, []))}], kind="table", columns=[alias]
+                [{alias: len(self._label_ids.get(label, ()))}], kind="table", columns=[alias]
             )
         )
 
@@ -442,7 +441,7 @@ class GraphArrowAgentBackend(AnaRuntime):
             alternatives=["use a selective node_search"],
         )
         scan_edges = self._traversal_edges(rel_type)
-        targets = set(self._label_ids.get(label, []))
+        targets = set(self._label_ids.get(label, ()))
         output = []
         inputs = [row for row in handle.rows if source in row]
         node_ids = [ana_patterns.source_node_id(row[source], self._owner) for row in inputs]
@@ -557,7 +556,7 @@ class GraphArrowAgentBackend(AnaRuntime):
         return ana_roles.shared_role_aggregate(self, args)
 
     def _label_counts(self, labels: list[str]) -> dict[str, int]:
-        return {label: len(self._label_ids.get(label, [])) for label in labels}
+        return {label: len(self._label_ids.get(label, ())) for label in labels}
 
     def _node_property_samples(self, label: str, prop: str, *, limit: int = 3) -> list[Any]:
         samples = []

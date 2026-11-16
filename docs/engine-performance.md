@@ -201,18 +201,19 @@ checks do not establish production latency or a recommended storage layout.
 
 ## Shared canonical snapshot tables
 
-Planned Cypher MATCH reads can share decoded Arrow node and relationship tables
-within an application. Cache entries are keyed by the ordered immutable
-snapshot files. Queries borrow the tables until their results have been built.
-New publications select their own files. Entries in use keep their cache
-reservation until the last active reader releases them.
+Planned Cypher MATCH reads and ANA workflows can share decoded Arrow node and
+relationship tables within an application. ANA also shares its full per-label
+property projections. Cache entries are keyed by the ordered immutable files
+for each table. Queries borrow tables until their results have been built,
+and ANA workflows borrow tables until they close. A new publication reuses
+entries for files that it still references.
 
-Set GRAPHARROW_SNAPSHOT_TABLE_CACHE_MAX_BYTES to adjust the per-application
+Set `GRAPHARROW_SNAPSHOT_TABLE_CACHE_MAX_BYTES` to adjust the per-application
 budget, which defaults to 67108864 bytes (64 MiB). A value of 0 disables
 sharing. Unused entries are eligible for eviction. A table above the
 available cache budget is read for its caller. The setting controls retained
-canonical tables. Query intermediates, uncached reads and other engine caches
-have their own memory costs.
+tables and label projections. Query intermediates, uncached reads and other
+engine caches have their own memory costs.
 
 ## Selective traversal reads and concurrency limits
 

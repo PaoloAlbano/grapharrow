@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import time
 from collections.abc import Generator, Mapping
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import PurePosixPath
 from threading import BoundedSemaphore
 from typing import Any
@@ -184,7 +185,7 @@ class GraphStateUseCase:
     def borrow_tabular_state(
         self, *, include_edges: bool = True, snapshot: SnapshotManifest | None = None
     ) -> Generator[GraphTabularState, None, None]:
-        """Share canonical buffers for the lifetime of a read-only Cypher query."""
+        """Share canonical buffers until the snapshot reader releases them."""
         self._admin_service.initialize()
         catalog = self._catalog_store.load()
         if snapshot is None:
@@ -221,6 +222,23 @@ class GraphStateUseCase:
             columns=columns,
             predicates=predicates,
         )
+
+    @contextmanager
+    def borrow_node_property_tables(
+        self, *, snapshot: SnapshotManifest
+    ) -> Generator[dict[str, pa.Table], None, None]:
+        """Share full label projections directly from one published manifest."""
+        grouped = self._graph_store.group_node_property_files(snapshot.node_properties)
+        with ExitStack() as leases:
+            yield {
+                label: leases.enter_context(
+                    self.snapshot_tables.borrow(
+                        ("node_properties", files),
+                        partial(self._graph_store.load_node_property_table, files, label=label),
+                    )
+                )
+                for label, files in grouped.items()
+            }
 
     def lookup_node_property_table(
         self,

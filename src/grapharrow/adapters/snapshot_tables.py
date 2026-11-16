@@ -1,4 +1,4 @@
-"""Bounded sharing of immutable canonical Arrow tables across active queries."""
+"""Bounded sharing of immutable Arrow tables across active readers."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import pyarrow as pa  # type: ignore[import-untyped]
 
 from grapharrow.domain import DatasetFile
 
-_TableKey: TypeAlias = tuple[Literal["nodes", "edges"], tuple[DatasetFile, ...]]
+_TableKey: TypeAlias = tuple[Literal["nodes", "edges", "node_properties"], tuple[DatasetFile, ...]]
 
 
 @dataclass(slots=True)

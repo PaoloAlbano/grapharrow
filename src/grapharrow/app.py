@@ -22,6 +22,7 @@ from grapharrow.use_cases import (
     GraphStateUseCase,
     IndexCatalogUseCase,
 )
+from grapharrow.use_cases.ana_node_lookup import AnaNodeLookupCache
 from grapharrow.use_cases.ana_schema_cache import SnapshotSchemaCache
 
 
@@ -65,6 +66,7 @@ class GraphArrowApplication:
     repositories: GraphArrowRepositories
     use_cases: GraphArrowUseCases
     _ana_schema_cache: SnapshotSchemaCache = field(default_factory=SnapshotSchemaCache, repr=False)
+    _ana_node_lookups: AnaNodeLookupCache = field(default_factory=AnaNodeLookupCache, repr=False)
 
 
 def build_application(

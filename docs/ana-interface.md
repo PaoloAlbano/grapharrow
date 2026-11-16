@@ -64,6 +64,7 @@ Use `--no-ana` or `GRAPHARROW_ANA_ENABLED=false` to disable the interface.
 | `GRAPHARROW_ANA_MAX_BYTES_PER_SESSION` | `67108864` | Accounted snapshot, handle, lineage and page bytes (64 MiB) |
 | `GRAPHARROW_ANA_MAX_TOTAL_BYTES` | `536870912` | Shared accounted bytes for the HTTP application (512 MiB) |
 | `GRAPHARROW_ANA_PERSISTENT_SCHEMA_CACHE_ENABLED` | `true` | Reuse a schema cache file on native local storage |
+| `GRAPHARROW_SNAPSHOT_TABLE_CACHE_MAX_BYTES` | `67108864` | Per-application budget for shared Arrow tables used by ANA and Cypher (64 MiB, `0` disables sharing) |
 | `GRAPHARROW_ANA_READ_CACHE_ENABLED` | `false` | Enable workflow-local candidate caching for `entity_resolve` and `value_search` |
 | `GRAPHARROW_ANA_READ_CACHE_MAX_BYTES_PER_SESSION` | `4194304` | Reserved read-cache capacity inside workflow and server byte quotas (4 MiB, minimum 1024 bytes) |
 | `GRAPHARROW_ANA_ADJACENCY_INDEX_MAX_BYTES_PER_SESSION` | `8388608` | Ceiling for the computed adjacency-index reservation; `0` disables it (8 MiB) |
@@ -176,9 +177,18 @@ upstream operation's limit.
 
 The session manager serializes calls within a workflow, isolates owners,
 expires idle sessions on requests and closes backends on deletion/shutdown.
-State is process-local; use one worker. This initial backend loads snapshot
-tables and property projections into memory for each session. Handle composition
-operates on materialized Python rows.
+State is process-local. Use one worker. Workflows borrow immutable canonical
+Arrow tables and per-label property projections from the
+[shared snapshot table cache](engine-performance.md#shared-canonical-snapshot-tables).
+A workflow holds the tables until it closes. The backend reads a private copy
+when a table exceeds the available cache budget. Handle composition operates
+on materialized Python rows.
+
+Workflows reading the same immutable node files also share the node ID and
+label lookup structures, including their byte estimate. The backend builds
+them after releasing the database coordinator. Closing the last workflow
+allows those lookup structures to be collected. A label without a property
+projection in the manifest uses canonical property reads.
 
 Overlapping workflows in one application reuse schema discovery for an identical
 snapshot manifest. Each workflow receives its own schema copy, including nested
@@ -200,8 +210,8 @@ Quotas count retained state. Snapshot admission includes canonical Arrow tables,
 property projections, schema and lookup structures. Handle charges include rows,
 metadata, lineage and the most recent fetched page. Shared objects can be charged
 again across handles; these are approximate accounting bytes, rather than RSS.
-Each workflow is conservatively charged for its schema copy and the complete
-shared in-memory schema entry.
+Each workflow is conservatively charged for its schema copy, the complete
+shared in-memory schema entry, its lookup structures and its borrowed tables.
 A tool exceeding its quota rolls back its new handles and lineage. Existing
 handles and the previous fetched page remain usable. `allow_large` cannot bypass
 server quotas. Delete a workflow to release its resources; idle expiry and
