@@ -661,6 +661,8 @@ def main():
         ).hexdigest(),
     }
     args.output.with_suffix(".summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    passed = counts["passed"] + counts["negative_passed"]
+    print(f"openCypher TCK: {passed}/{len(cases)} ({passed / len(cases):.1%})", flush=True)
 
 
 if __name__ == "__main__":

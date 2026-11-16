@@ -4101,6 +4101,28 @@ def test_optional_match_preserves_a_bound_path_endpoint(tmp_path: Path) -> None:
     assert result.rows == ({"x.name": "Mark"},)
 
 
+@pytest.mark.parametrize("hops", ["*2", "*1..5"])
+def test_optional_bounded_path_between_bound_endpoints(tmp_path: Path, hops: str) -> None:
+    database = Database(tmp_path / "example-db")
+    with database.write_transaction() as session:
+        session.query(
+            "CREATE (s:Start), (a:Middle), (b:Middle), (x:End {n:1}), (:End {n:2}), "
+            "(s)-[:R]->(a)-[:R]->(x), (s)-[:R]->(b)-[:R]->(x)"
+        )
+    with database.read_transaction() as session:
+        bound = "MATCH (s:Start), (x:End) OPTIONAL MATCH "
+        projection = "RETURN x.n AS n ORDER BY n"
+        assert session.query(f"{bound}(s)-[:R{hops}]->(x) {projection}").rows == (
+            {"n": 1},
+            {"n": 1},
+            {"n": 2},
+        )
+        assert session.query(f"{bound}(s)-[:Missing{hops}]->(x) {projection}").rows == (
+            {"n": 1},
+            {"n": 2},
+        )
+
+
 def test_merge_matches_all_relationships_between_disconnected_nodes(tmp_path: Path) -> None:
     database = Database(tmp_path / "example-db")
     with database.write_transaction() as session:

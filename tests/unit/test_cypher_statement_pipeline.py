@@ -23,6 +23,148 @@ def test_syntax_error_reports_compile_phase_and_position(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize(
+    ("expression", "detail", "column"),
+    [
+        (r"'\uH'", "InvalidUnicodeLiteral", 7),
+        (r'"é\U01"', "InvalidUnicodeLiteral", 7),
+        (r"'\u00", "InvalidUnicodeLiteral", 7),
+        (r"'\\\uH'", "InvalidUnicodeLiteral", 7),
+        (r"'\u0041\q'", "UnexpectedSyntax", 7),
+        (r"'\\uH", "UnexpectedSyntax", 7),
+        ("42 — 41", "InvalidUnicodeCharacter", 10),
+        ("42 − 41", "InvalidUnicodeCharacter", 10),
+        ("42 × 41", "InvalidUnicodeCharacter", 10),
+        ("42 @ 41", "UnexpectedSyntax", 10),
+    ],
+)
+def test_unicode_syntax_errors_report_the_offending_token(
+    tmp_path: Path, expression: str, detail: str, column: int
+) -> None:
+    with (
+        Database(tmp_path / "db").read_transaction() as session,
+        pytest.raises(QueryError) as caught,
+    ):
+        session.query(f"// First line\nRETURN {expression}")
+    error = caught.value
+    assert (error.category, error.phase, error.detail) == ("SyntaxError", "compile", detail)
+    assert (error.line, error.column) == (2, column)
+
+
+def test_unicode_escape_above_the_code_point_range(tmp_path: Path) -> None:
+    with (
+        Database(tmp_path / "db").read_transaction() as session,
+        pytest.raises(QueryError) as caught,
+    ):
+        session.query(r"RETURN '\U00110000' AS value")
+    assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+        "SyntaxError",
+        "compile",
+        "InvalidUnicodeLiteral",
+    )
+
+
+def test_unicode_strings_identifiers_and_comments(tmp_path: Path) -> None:
+    with Database(tmp_path / "db").read_transaction() as session:
+        result = session.query(
+            r"WITH '\u01FF \U0001F600 — \\uH' AS café // — \uH"
+            "\n"
+            "RETURN café AS `résultat—`, 42 - 41 AS diff"
+        )
+    assert result.rows == ({"résultat—": "ǿ 😀 — \\uH", "diff": 1},)
+
+
+def test_unicode_dashes_are_allowed_in_relationship_patterns(tmp_path: Path) -> None:
+    db = Database(tmp_path / "db")
+    with db.write_transaction() as session:
+        session.query("CREATE (:Start)-[:R]->(:End)")
+    with db.read_transaction() as session:
+        assert session.query("MATCH (:Start)—[:R]—>(:End) RETURN count(*) AS n").rows == ({"n": 1},)
+
+
+@pytest.mark.parametrize(
+    "marked_relationship",
+    [
+        "-[:R^..]->",
+        "-[r:`REL TYPE`|:OTHER ^..2]->",
+        "-[:R*^-2]->",
+        "<-[:R*1.. ^-2]-",
+    ],
+)
+def test_malformed_relationship_ranges_report_the_offending_position(
+    tmp_path: Path, marked_relationship: str
+) -> None:
+    pattern = f"MATCH (n){marked_relationship}(m) RETURN m"
+    with (
+        Database(tmp_path / "db").read_transaction() as session,
+        pytest.raises(QueryError) as caught,
+    ):
+        session.query(f"MATCH (n:A)\n{pattern.replace('^', '')}")
+    error = caught.value
+    assert (error.category, error.phase, error.detail) == (
+        "SyntaxError",
+        "compile",
+        "InvalidRelationshipPattern",
+    )
+    assert (error.line, error.column) == (2, pattern.index("^"))
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "RETURN [1, ..2] AS values",
+        "RETURN [1]-[x..2]-(3)",
+        "MATCH (n) WHERE (n.age)-[x..2] > 1 RETURN n",
+        "MATCH ()-[:R {p:[1, ..2]}]->() RETURN 1",
+    ],
+)
+def test_list_syntax_errors_keep_their_diagnostic(tmp_path: Path, query: str) -> None:
+    with (
+        Database(tmp_path / "db").read_transaction() as session,
+        pytest.raises(QueryError) as error,
+    ):
+        session.query(query)
+    assert error.value.detail == "UnexpectedSyntax"
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    ["()-[r*]-()-[]-(r)", "(r)-[]-()-[r*]-()", "()-[]-(r)-[r*]-()"],
+)
+def test_binding_conflicts_take_precedence_over_unbounded_expansion(
+    tmp_path: Path, pattern: str
+) -> None:
+    with (
+        Database(tmp_path / "db").read_transaction() as session,
+        pytest.raises(QueryError) as caught,
+    ):
+        session.query(f"MATCH {pattern} RETURN r")
+    assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+        "SyntaxError",
+        "compile",
+        "VariableTypeConflict",
+    )
+
+
+def test_traversal_bounds_preserve_supported_and_unsupported_paths(tmp_path: Path) -> None:
+    db = Database(tmp_path / "db")
+    with db.write_transaction() as session:
+        session.query("CREATE (:A)-[:R]->(:B)")
+    with db.read_transaction() as session:
+        assert session.query("MATCH (:A)-[r:R*1..5]->(:B) RETURN size(r) AS hops").rows == (
+            {"hops": 1},
+        )
+        with pytest.raises(QueryError, match="at most 5 hops"):
+            session.query("MATCH (:A)-[r:R*1..6]->(:B) RETURN r")
+        with pytest.raises(QueryError) as caught:
+            session.query("MATCH (:A)-[r:R*]->(:B) RETURN r")
+        assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+            "UnsupportedFeature",
+            "compile",
+            "UnboundedTraversal",
+        )
+
+
+@pytest.mark.parametrize(
     ("query", "params", "category", "phase"),
     [
         ("WITH 1 AS n RETURN n.value", {}, "TypeError", "compile"),
@@ -53,6 +195,129 @@ def test_invalid_argument_type_reports_category_and_phase(
         phase,
         "InvalidArgumentType",
     )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "MATCH (n) RETURN n SKIP n.count",
+        "MATCH (n) RETURN n LIMIT n.count",
+        "MATCH (n) RETURN n LIMIT $offset + n.count",
+        "MATCH (n) RETURN n LIMIT {value:n.count}",
+        "MATCH (n) WITH n.count AS size LIMIT size RETURN size",
+        "MATCH (n) WITH n SKIP size([x IN [1] | n.count]) RETURN n",
+    ],
+)
+def test_window_rejects_row_references_during_compilation(tmp_path: Path, query: str) -> None:
+    with (
+        Database(tmp_path / "db").read_transaction() as session,
+        pytest.raises(QueryError) as caught,
+    ):
+        session.query(query, {"offset": 1})
+    assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+        "SyntaxError",
+        "compile",
+        "NonConstantExpression",
+    )
+
+
+def test_window_accepts_parameters_and_local_comprehension_bindings(tmp_path: Path) -> None:
+    with Database(tmp_path / "db").read_transaction() as session:
+        result = session.query(
+            "UNWIND [1,2,3,4,5] AS n RETURN n ORDER BY n "
+            "SKIP $offset + 1 LIMIT size([n IN [1,2] | n])",
+            {"offset": 1},
+        )
+    assert result.rows == ({"n": 3}, {"n": 4})
+
+
+def test_nonconstant_window_is_rejected_before_writes(tmp_path: Path) -> None:
+    with Database(tmp_path / "db").write_transaction() as session:
+        with pytest.raises(QueryError) as caught:
+            session.query("CREATE (n:Scratch {count:2}) RETURN n LIMIT n.count")
+        assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+            "SyntaxError",
+            "compile",
+            "NonConstantExpression",
+        )
+        assert session.query("MATCH (n:Scratch) RETURN n").rows == ()
+
+
+@pytest.mark.parametrize("parameters", [{}, {"props": {"name": "test"}}])
+@pytest.mark.parametrize(
+    "query",
+    [
+        "MATCH (n $props) RETURN n",
+        "MATCH ()-[r:R $props]->() RETURN r",
+        "OPTIONAL MATCH (n $props) WITH n RETURN n",
+        "RETURN EXISTS { (:Node $props)-[:R]->() } AS found",
+    ],
+)
+def test_matching_patterns_reject_property_map_parameters(
+    tmp_path: Path, query: str, parameters: dict[str, object]
+) -> None:
+    with (
+        Database(tmp_path / "db").read_transaction() as session,
+        pytest.raises(QueryError) as caught,
+    ):
+        session.query(query, parameters)
+    assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+        "SyntaxError",
+        "compile",
+        "InvalidParameterUse",
+    )
+
+
+@pytest.mark.parametrize("parameters", [{}, {"props": {"name": "test"}}])
+@pytest.mark.parametrize(
+    "query",
+    [
+        "MERGE (n:Scratch $props) RETURN n",
+        "CREATE (a:Scratch), (b:Scratch) MERGE (a)-[r:R $props]->(b) RETURN r",
+    ],
+)
+def test_merge_rejects_property_map_parameters_before_writing(
+    tmp_path: Path, query: str, parameters: dict[str, object]
+) -> None:
+    with Database(tmp_path / "db").write_transaction() as session:
+        with pytest.raises(QueryError) as caught:
+            session.query(query, parameters)
+        assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+            "SyntaxError",
+            "compile",
+            "InvalidParameterUse",
+        )
+        assert session.query("MATCH (n:Scratch) RETURN n").rows == ()
+
+
+def test_create_accepts_property_map_parameters(tmp_path: Path) -> None:
+    with Database(tmp_path / "db").write_transaction() as session:
+        assert session.query(
+            "CREATE (n:A $props) RETURN n.name AS name", {"props": {"name": "test"}}
+        ).rows == ({"name": "test"},)
+        assert session.query(
+            "CREATE (a:A $props)-[r:R $edgeProps]->(:B) RETURN a.name AS name, r.weight AS weight",
+            {"props": {"name": "other"}, "edgeProps": {"weight": 5}},
+        ).rows == ({"name": "other", "weight": 5},)
+        assert session.query(
+            "MATCH (a:A {name:'test'}) CREATE (a)-[:R $edgeProps]->(b:B $props) "
+            "RETURN b.name AS name",
+            {"props": {"name": "target"}, "edgeProps": {"weight": 7}},
+        ).rows == ({"name": "target"},)
+
+
+def test_match_and_merge_accept_parameters_as_individual_property_values(tmp_path: Path) -> None:
+    parameters = {"name": "test", "weight": 5}
+    merge = "MERGE (a:A {name:$name}) MERGE (b:B {name:$name}) MERGE (a)-[:R {weight:$weight}]->(b)"
+    with Database(tmp_path / "db").write_transaction() as session:
+        session.query(merge, parameters)
+        session.query(merge, parameters)
+        rows = session.query(
+            "MATCH (:A {name:$name})-[r:R {weight:$weight}]->(:B {name:$name}) "
+            "RETURN r.weight AS weight",
+            parameters,
+        ).rows
+    assert rows == ({"weight": 5},)
 
 
 @pytest.mark.parametrize("tail", ["RETURN length(p)", "CREATE (:Unexpected)"])

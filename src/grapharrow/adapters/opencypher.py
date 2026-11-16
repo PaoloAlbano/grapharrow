@@ -7,6 +7,7 @@ from typing import cast
 
 from antlr4 import CommonTokenStream, InputStream
 from antlr4.error.ErrorListener import ErrorListener  # type: ignore[import-untyped]
+from antlr4.error.Errors import LexerNoViableAltException  # type: ignore[import-untyped]
 from antlr4.Token import Token  # type: ignore[import-untyped]
 
 from grapharrow.core.errors import QueryError
@@ -16,6 +17,11 @@ from grapharrow.interfaces.opencypher.generated.vendor.opencypher.GraphArrowCyph
 from grapharrow.interfaces.opencypher.generated.vendor.opencypher.GraphArrowCypherParser import (
     GraphArrowCypherParser as CypherParser,
 )
+
+_RELATIONSHIP_DASH = r"[-\u00ad\u2010-\u2015\u2212\ufe58\ufe63\uff0d]"
+_RELATIONSHIP_TAIL = re.compile(rf"[^\[\]]*\]\s*{_RELATIONSHIP_DASH}\s*[>⟩〉﹥＞]?\s*\(")
+_RELATIONSHIP_DETAIL_PREFIX = r"n?(?::n(?:\|:?n)*)?"
+_STRING_ESCAPE = re.compile(r"\\([uU][0-9a-fA-F]{4}|.)", re.DOTALL)
 
 
 class OpenCypherAdapter:
@@ -94,10 +100,68 @@ def _malformed_number(recognizer: object, token: object) -> bool:
     }
 
 
-def _syntax_detail(recognizer: object, token: object) -> str:
+def _malformed_relationship_range(recognizer: CypherParser, token: Token) -> bool:
+    """Recognize a range error before ANTLR has selected a relationship rule."""
+    if token.text not in {"..", "-"}:
+        return False
+    if not _RELATIONSHIP_TAIL.match(token.getInputStream().strdata, token.start):
+        return False
+
+    stream = recognizer.getInputStream()
+    preceding = (
+        previous
+        for index in range(token.tokenIndex - 1, -1, -1)
+        if (previous := stream.get(index)).type != CypherParser.SP
+    )
+    prefix = []
+    for previous in preceding:
+        if previous.text == "[":
+            break
+        if previous.text in {":", "|", "*", ".."}:
+            prefix.append(previous.text)
+        elif previous.type in {
+            CypherParser.DecimalInteger,
+            CypherParser.HexInteger,
+            CypherParser.OctalInteger,
+        }:
+            prefix.append("0")
+        elif previous.type == CypherParser.EscapedSymbolicName or previous.text.isidentifier():
+            prefix.append("n")
+        else:
+            return False
+    dash = next(preceding, None)
+    if dash is None or not re.fullmatch(_RELATIONSHIP_DASH, dash.text):
+        return False
+    left = next(preceding, None)
+    if left is not None and left.text in {"<", "⟨", "〈", "﹤", "＜"}:
+        left = next(preceding, None)
+    if left is None or left.text != ")":
+        return False
+
+    expected = _RELATIONSHIP_DETAIL_PREFIX
+    if token.text == "-":
+        expected += r"\*(?:0?\.\.)?"
+    return re.fullmatch(expected, "".join(reversed(prefix))) is not None
+
+
+def _syntax_detail(recognizer: object, token: object, error: Exception | None) -> str:
+    if isinstance(error, LexerNoViableAltException):
+        stream = error.input
+        fragment = stream.getText(error.startIndex, stream.index)
+        if fragment.startswith(("'", '"')) and any(
+            escape.group(1) in {"u", "U"} for escape in _STRING_ESCAPE.finditer(fragment)
+        ):
+            return "InvalidUnicodeLiteral"
+        if len(fragment) == 1 and not fragment.isascii():
+            return "InvalidUnicodeCharacter"
     if _malformed_number(recognizer, token):
         return "InvalidNumberLiteral"
     if isinstance(recognizer, CypherParser) and isinstance(token, Token):
+        # These dash variants are grammar tokens for relationships only.
+        if not token.text.isascii() and re.fullmatch(_RELATIONSHIP_DASH, token.text):
+            return "InvalidUnicodeCharacter"
+        if _malformed_relationship_range(recognizer, token):
+            return "InvalidRelationshipPattern"
         context = recognizer._ctx
         if isinstance(context, CypherParser.OC_CypherContext) and token.type in {
             CypherParser.RETURN,
@@ -127,7 +191,7 @@ class _RaisingErrorListener(ErrorListener):  # type: ignore[misc]
             f"openCypher syntax error at {line}:{column}: {msg}",
             category="SyntaxError",
             phase="compile",
-            detail=_syntax_detail(recognizer, offendingSymbol),
+            detail=_syntax_detail(recognizer, offendingSymbol, e),
             line=line,
             column=column,
         )

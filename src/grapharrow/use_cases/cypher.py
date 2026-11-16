@@ -45,6 +45,7 @@ from grapharrow.use_cases.cypher_plan import (
     WithProjectPlan,
 )
 from grapharrow.use_cases.cypher_procedures import ReadProcedure
+from grapharrow.use_cases.cypher_validation import reject_property_map_parameter
 from grapharrow.use_cases.cypher_window import check_window_value, limit_optimizations_enabled
 from grapharrow.use_cases.graph import (
     GraphState,
@@ -56,6 +57,7 @@ from grapharrow.use_cases.graph import (
 from grapharrow.use_cases.indexes import IndexCatalogUseCase
 
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_WINDOW_PARAMETER_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+)")
 _INTERNAL_VARIABLE_PREFIX = "__varhop_"
 _FUNCTION_FIELD_PREFIX = "__fn__:"
 _ENTITY_ID_FIELD = "__entity_id"
@@ -4217,6 +4219,7 @@ def _compile_create_patterns(
             params,
             state,
             allow_relationship_variables=False,
+            allow_property_map_parameter=True,
         )
         if isinstance(compiled, PathPattern) and any(
             step.direction == "undirected" for step in compiled.steps
@@ -4279,6 +4282,7 @@ def _compile_create_relationship_patterns(
             params,
             state,
             allow_relationship_variables=False,
+            allow_property_map_parameter=True,
         )
         if not isinstance(compiled, PathPattern) or len(compiled.steps) != 1:
             raise QueryError(
@@ -4442,6 +4446,7 @@ def _compile_pattern_element(
     allow_relationship_variables: bool,
     allow_bidirectional: bool = False,
     allow_ranged_bindings: bool = False,
+    allow_property_map_parameter: bool = False,
     compile_properties: Callable[[Any], dict[str, object]] | None = None,
     defer_unbounded: Callable[[QueryError], None] | None = None,
 ) -> NodePattern | PathPattern:
@@ -4455,7 +4460,9 @@ def _compile_pattern_element(
     if compile_properties is None:
 
         def compile_properties(node: Any) -> dict[str, object]:
-            return _compile_properties(node, params)
+            return _compile_properties(
+                node, params, allow_map_parameter=allow_property_map_parameter
+            )
 
     start_node = _compile_node_pattern(start_ctx, state, compile_properties)
     chains = cast(
@@ -4664,12 +4671,16 @@ def _compile_range_literal(
 def _compile_properties(
     properties_ctx: CypherParser.OC_PropertiesContext | None,
     params: dict[str, object],
+    *,
+    allow_map_parameter: bool = False,
 ) -> dict[str, object]:
     """Compile this Cypher fragment into the internal structures used later."""
     if properties_ctx is None:
         return {}
 
     parameter_ctx = properties_ctx.oC_Parameter()
+    if not allow_map_parameter:
+        reject_property_map_parameter(parameter_ctx)
     if parameter_ctx is not None:
         parameter_value = _resolve_parameter(parameter_ctx.getText(), params)
         if not isinstance(parameter_value, dict):
@@ -5510,11 +5521,12 @@ def _compile_optional_int(
     if clause_ctx is None:
         return None
 
-    value = _compile_value_expression(clause_ctx.oC_Expression(), params)
-    phase: QueryPhase = (
-        "runtime" if clause_ctx.oC_Expression().getText().startswith("$") else "compile"
-    )
-    return check_window_value(value, phase=phase)
+    text = clause_ctx.oC_Expression().getText()
+    if _INTEGER_LITERAL.fullmatch(text):
+        return check_window_value(_parse_value(text, params), phase="compile")
+    if _WINDOW_PARAMETER_RE.fullmatch(text):
+        return check_window_value(_resolve_parameter(text, params), phase="runtime")
+    raise QueryError("SKIP and LIMIT expressions require the expression pipeline.")
 
 
 def _compile_where(
@@ -7031,7 +7043,9 @@ def _match_single_variable_length_path_table(
         )
 
     if result_tables:
-        return tabular.concatenate_tables(result_tables, schema=result_tables[0].schema)
+        result = tabular.concatenate_tables(result_tables, schema=result_tables[0].schema)
+        # The endpoint join consumes its right key. Later pattern joins may need it.
+        return _ensure_join_id_column(result, step.node.variable)
     return _empty_public_path_table(
         start_table=start_table,
         nodes=nodes,
@@ -7706,10 +7720,8 @@ def _build_aggregate_table_from_table(
         if resolved is None:
             resolved = _aggregate_input_array(bindings, item)
         if resolved is None:
-            resolved = _null_array_for_missing_bound_field(bindings, item.variable)
-            if resolved is None:
-                column_name = _binding_column_name(item.variable, source_column)
-                raise QueryError(f"COUNT references an unknown binding: {column_name}")
+            column_name = _binding_column_name(item.variable, source_column)
+            raise QueryError(f"COUNT references an unknown binding: {column_name}")
         resolved_arrays[cache_key] = resolved
         value_aggregation |= _has_encoded_values(resolved) and (
             item.aggregate != "collect" or item.aggregate_distinct
@@ -7717,6 +7729,9 @@ def _build_aggregate_table_from_table(
         temp_name = f"__agg__.{index}"
         aggregate_input_columns[temp_name] = resolved
         function_name = _arrow_group_by_aggregate_name(item)
+        if function_name == "count_distinct" and pa.types.is_null(resolved.type):
+            # Arrow counts NullType as a distinct value, even in only-valid mode.
+            function_name = "count"
         aggregate_specs.append((temp_name, function_name))
         aggregate_output_columns.append((f"{temp_name}_{function_name}", item.expression))
 
@@ -7795,8 +7810,13 @@ def _aggregate_input_array(
             ],
             type=pa.string(),
         )
-    return _resolve_table_field_array(
+    resolved = _resolve_table_field_array(
         bindings, variable=item.variable, field=_aggregate_source_column_name(item)
+    )
+    return (
+        _null_array_for_missing_bound_field(bindings, item.variable)
+        if resolved is None
+        else resolved
     )
 
 
@@ -11795,7 +11815,9 @@ def _decode_string_literal(text: str) -> str:
             try:
                 return chr(int(escaped[1:], 16))
             except ValueError as error:
-                raise QueryError("Invalid Unicode escape in string literal.") from error
+                raise QueryError.syntax(
+                    "Invalid Unicode escape in string literal.", "InvalidUnicodeLiteral"
+                ) from error
         return escapes.get(escaped.lower(), escaped)
 
     return re.sub(r"\\([uU][0-9a-fA-F]{8}|[uU][0-9a-fA-F]{4}|.)", decode, text[1:-1])

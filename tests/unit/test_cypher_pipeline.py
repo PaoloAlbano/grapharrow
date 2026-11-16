@@ -481,14 +481,22 @@ def test_subquery_scope_errors_are_detected(database: Database, query: str) -> N
 
 
 @pytest.mark.parametrize(
-    "query",
+    ("query", "category", "detail"),
     [
-        "CALL { CREATE (:Unexpected) RETURN 1 AS n } RETURN n",
-        "MATCH (p:Person) WHERE EXISTS { CREATE (:Unexpected) RETURN 1 } RETURN p",
+        (
+            "CALL { CREATE (:Unexpected) RETURN 1 AS n } RETURN n",
+            "UnsupportedFeature",
+            "UnsupportedFeature",
+        ),
+        (
+            "MATCH (p:Person) WHERE EXISTS { CREATE (:Unexpected) RETURN 1 } RETURN p",
+            "SyntaxError",
+            "InvalidClauseComposition",
+        ),
     ],
 )
 def test_nested_writes_are_classified_and_rejected_before_execution(
-    database: Database, query: str
+    database: Database, query: str, category: str, detail: str
 ) -> None:
     assert query_requires_write(query)
     with database.read_transaction() as session, pytest.raises(TransactionError):
@@ -496,8 +504,26 @@ def test_nested_writes_are_classified_and_rejected_before_execution(
     with database.write_transaction() as session:
         with pytest.raises(QueryError) as error:
             session.query(query)
-        assert (error.value.category, error.value.phase) == ("UnsupportedFeature", "compile")
+        assert (error.value.category, error.value.phase, error.value.detail) == (
+            category,
+            "compile",
+            detail,
+        )
         assert session.query("MATCH (p:Unexpected) RETURN count(*) AS n").rows == ({"n": 0},)
+
+
+def test_exists_rejects_property_updates_before_execution(database: Database) -> None:
+    with database.write_transaction() as session:
+        with pytest.raises(QueryError) as caught:
+            session.query(
+                "MATCH (p:Person) WHERE EXISTS { MATCH (p)-->(m) SET m.changed=true } RETURN p"
+            )
+        assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+            "SyntaxError",
+            "compile",
+            "InvalidClauseComposition",
+        )
+        assert session.query("MATCH (n) WHERE n.changed IS NOT NULL RETURN n").rows == ()
 
 
 def test_pipeline_reads_transaction_overlay_without_publishing(database: Database) -> None:
@@ -526,6 +552,37 @@ def test_pipeline_reads_transaction_overlay_without_publishing(database: Databas
 def test_opencypher_numeric_literals(database: Database, literal: str, value: Any) -> None:
     with database.read_transaction() as session:
         assert session.query(f"RETURN {literal} AS x").rows == ({"x": value},)
+
+
+@pytest.mark.parametrize("container", ["list", "map"])
+def test_deeply_nested_container_literals(database: Database, container: str) -> None:
+    text, value = "42", 42
+    for _ in range(40):
+        if container == "list":
+            text, value = f"[{text}]", [value]
+        else:
+            text, value = f"{{nested:{text}}}", {"nested": value}
+    with database.read_transaction() as session:
+        assert session.query(f"RETURN {text} AS result").rows == ({"result": value},)
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ("[1, 2] >= [1, null]", None),
+        ("[1, 'a'] >= [1, null]", None),
+        ("[1, null] > [1]", True),
+        ("[1, null] > [2, null]", False),
+        ("[[1, null], 5] < [[1, 2], 6]", None),
+        ("[1, 2] <= [1.0, 2.0]", True),
+        ("[true] < [1]", None),
+    ],
+)
+def test_list_order_comparisons_are_lexicographic(
+    database: Database, expression: str, expected: bool | None
+) -> None:
+    with database.read_transaction() as session:
+        assert session.query(f"RETURN {expression} AS result").rows == ({"result": expected},)
 
 
 @pytest.mark.parametrize(

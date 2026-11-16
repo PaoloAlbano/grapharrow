@@ -92,6 +92,16 @@ uv run pytest
 make test
 ```
 
+### Audit openCypher compatibility
+
+```bash
+make tck
+```
+
+The target caches the corpus pinned by CI and writes the scenario results and
+summary under `.local-notes/tck-local/`. Run a single feature with
+`make tck TCK_ARGS='--match Match7.feature'`.
+
 ### Run lint checks
 
 ```bash

@@ -10,6 +10,34 @@ from grapharrow.core.errors import QueryError, TransactionError
 from grapharrow.use_cases import CypherQueryUseCase, GraphTransactionUseCase
 
 
+@pytest.mark.parametrize(("middle", "count"), [("", 6), ("MATCH () ", 12)])
+def test_with_star_preserves_rows_with_only_anonymous_bindings(
+    tmp_path: Path, middle: str, count: int
+) -> None:
+    with Database(tmp_path / "db").write_transaction() as session:
+        session.query("CREATE (), ()")
+        result = session.query(f"MATCH () CREATE () WITH * {middle}CREATE ()")
+        assert (result.columns, result.rows) == ((), ())
+        assert session.query("MATCH () RETURN count(*) AS total").rows == ({"total": count},)
+        with pytest.raises(QueryError) as caught:
+            session.query("MATCH () RETURN *")
+        assert caught.value.detail == "NoVariablesInScope"
+
+
+@pytest.mark.parametrize("match", ["(entity:A)", "()-[entity:R]->()"])
+def test_parenthesized_set_and_remove_targets(tmp_path: Path, match: str) -> None:
+    db = Database(tmp_path / "db")
+    with db.write_transaction() as session:
+        session.query("CREATE (:A)-[:R]->(:B)")
+        assert session.query(
+            f"MATCH {match} SET ((entity)).name = 'updated' RETURN entity.name AS value"
+        ).rows == ({"value": "updated"},)
+    with db.write_transaction() as session:
+        assert session.query(
+            f"MATCH {match} REMOVE (entity).name RETURN entity.name AS value"
+        ).rows == ({"value": None},)
+
+
 @pytest.mark.parametrize("planner", ["0", "1"])
 @pytest.mark.parametrize(
     "setup",

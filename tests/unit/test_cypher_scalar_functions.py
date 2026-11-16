@@ -9,6 +9,88 @@ from grapharrow import Database
 from grapharrow.core.errors import QueryError
 
 
+@pytest.mark.parametrize(
+    ("query", "function"),
+    [
+        ("MATCH (a) RETURN foo(a)", "foo"),
+        ("MATCH (n) WHERE Missing(n) RETURN n", "Missing"),
+        ("RETURN CASE WHEN true THEN 1 ELSE missing() END", "missing"),
+        ("RETURN math.missing(1)", "math.missing"),
+    ],
+)
+def test_unknown_function_reports_a_compile_time_syntax_error(
+    tmp_path: Path, query: str, function: str
+) -> None:
+    with (
+        Database(tmp_path / "db").read_transaction() as session,
+        pytest.raises(QueryError) as caught,
+    ):
+        session.query(query)
+    assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+        "SyntaxError",
+        "compile",
+        "UnknownFunction",
+    )
+    assert str(caught.value) == f"Unknown function: {function}"
+
+
+@pytest.mark.parametrize("call", ["floor(1.2)", "stDev(1)"])
+def test_unimplemented_builtins_report_unsupported_feature(tmp_path: Path, call: str) -> None:
+    with (
+        Database(tmp_path / "db").read_transaction() as session,
+        pytest.raises(QueryError) as caught,
+    ):
+        session.query(f"RETURN {call}")
+    assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+        "UnsupportedFeature",
+        "compile",
+        "UnsupportedFeature",
+    )
+
+
+def test_unknown_function_rejects_the_statement_before_writing(tmp_path: Path) -> None:
+    with Database(tmp_path / "db").write_transaction() as session:
+        with pytest.raises(QueryError) as caught:
+            session.query("CREATE (:Scratch {value:missing(1)})")
+        assert (caught.value.phase, caught.value.detail) == ("compile", "UnknownFunction")
+        assert session.query("MATCH (n:Scratch) RETURN n").rows == ()
+
+
+def test_function_resolution_is_case_insensitive_for_builtins(tmp_path: Path) -> None:
+    with Database(tmp_path / "db").read_transaction() as session:
+        assert session.query("RETURN ToUpper('abc') AS text, SqRt(4) AS value").rows == (
+            {"text": "ABC", "value": 2.0},
+        )
+
+
+def test_relationship_endpoints_use_stored_direction_and_the_write_overlay(tmp_path: Path) -> None:
+    db = Database(tmp_path / "db")
+    with db.write_transaction() as session:
+        assert session.query(
+            "CREATE (a:A {name:'source'}), (b:B {name:'target'}) "
+            "MERGE (a)-[r:R]-(b) RETURN startNode(r).name AS s, endNode(r).name AS t"
+        ).rows == ({"s": "source", "t": "target"},)
+        assert session.query(
+            "MATCH (a:A)-[r:R]->(:B) SET a.name = 'updated' RETURN startNode(r).name AS s"
+        ).rows == ({"s": "updated"},)
+    with db.read_transaction() as session:
+        assert session.query(
+            "MATCH (:B)<-[r:R]-(:A) RETURN startNode(r).name AS s, endNode(r).name AS t"
+        ).rows == ({"s": "updated", "t": "target"},)
+        assert session.query(
+            "OPTIONAL MATCH ()-[r:Missing]->() RETURN startNode(r) AS s, endNode(null) AS t"
+        ).rows == ({"s": None, "t": None},)
+
+
+def test_relationship_endpoints_require_a_relationship(tmp_path: Path) -> None:
+    with (
+        Database(tmp_path / "db").read_transaction() as session,
+        pytest.raises(QueryError) as caught,
+    ):
+        session.query("RETURN startNode(1)")
+    assert (caught.value.phase, caught.value.detail) == ("compile", "InvalidArgumentType")
+
+
 def test_list_accessors_preserve_nulls_and_nested_values(tmp_path: Path) -> None:
     with Database(tmp_path / "db").read_transaction() as session:
         assert session.query(
@@ -56,6 +138,97 @@ def test_dynamic_invalid_operands(tmp_path: Path, function: str) -> None:
     with Database(tmp_path / "db").read_transaction() as session, pytest.raises(QueryError) as err:
         session.query(f"UNWIND [1] AS x RETURN {function}(x)")
     assert (err.value.phase, err.value.category) == ("runtime", "TypeError")
+
+
+def test_labels_and_type_propagate_literal_parameter_and_optional_nulls(tmp_path: Path) -> None:
+    with Database(tmp_path / "db").read_transaction() as session:
+        result = session.query(
+            "OPTIONAL MATCH (n:Missing) OPTIONAL MATCH ()-[r:Missing]->() "
+            "RETURN labels(n), type(r), labels(null), type(NULL), "
+            "labels($value) AS paramLabels, type($value) AS paramType",
+            {"value": None},
+        )
+    assert result.columns == (
+        "labels(n)",
+        "type(r)",
+        "labels(null)",
+        "type(NULL)",
+        "paramLabels",
+        "paramType",
+    )
+    assert result.rows == (dict.fromkeys(result.columns),)
+
+
+@pytest.mark.parametrize(
+    ("function", "pattern"), [("labels", "(x:Missing)"), ("type", "()-[x:Missing]->()")]
+)
+def test_labels_and_type_handle_literal_null_in_optional_match(
+    tmp_path: Path, function: str, pattern: str
+) -> None:
+    with Database(tmp_path / "db").read_transaction() as session:
+        result = session.query(f"OPTIONAL MATCH {pattern} RETURN {function}(x), {function}(null)")
+    assert result.rows == ({f"{function}(x)": None, f"{function}(null)": None},)
+
+
+@pytest.mark.parametrize("function", ["labels", "type"])
+@pytest.mark.parametrize("value", [1, "text", []])
+def test_labels_and_type_report_invalid_runtime_parameter_values(
+    tmp_path: Path, function: str, value: object
+) -> None:
+    with Database(tmp_path / "db").read_transaction() as session, pytest.raises(QueryError) as err:
+        session.query(f"RETURN {function}($value)", {"value": value})
+    assert (err.value.category, err.value.phase, err.value.detail) == (
+        "TypeError",
+        "runtime",
+        "InvalidArgumentValue",
+    )
+
+
+@pytest.mark.parametrize("function", ["labels", "type"])
+def test_labels_and_type_report_invalid_computed_values(tmp_path: Path, function: str) -> None:
+    with Database(tmp_path / "db").read_transaction() as session, pytest.raises(QueryError) as err:
+        session.query(f"RETURN {function}([null, 1][1])")
+    assert (err.value.category, err.value.phase, err.value.detail) == (
+        "TypeError",
+        "runtime",
+        "InvalidArgumentValue",
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "MATCH (n) RETURN type(n)",
+        "MATCH ()-[r]->() RETURN labels(r)",
+        "RETURN labels(1)",
+        "RETURN type([])",
+    ],
+)
+def test_labels_and_type_reject_known_wrong_types_at_compile_time(
+    tmp_path: Path, query: str
+) -> None:
+    with Database(tmp_path / "db").read_transaction() as session, pytest.raises(QueryError) as err:
+        session.query(query)
+    assert (err.value.category, err.value.phase, err.value.detail) == (
+        "SyntaxError",
+        "compile",
+        "InvalidArgumentType",
+    )
+
+
+def test_labels_and_type_read_graph_bindings_and_optional_relationships(tmp_path: Path) -> None:
+    db = Database(tmp_path / "db")
+    with db.write_transaction() as session:
+        session.query("CREATE (:A {name:'first'})-[:R]->(:B {name:'second'})")
+    with db.read_transaction() as session:
+        result = session.query(
+            "MATCH (n) OPTIONAL MATCH (n)-[r:R]->() "
+            "RETURN n.name AS name, labels(n) AS nodeLabels, type(r) AS relType ORDER BY name"
+        )
+    assert result.rows == (
+        {"name": "first", "nodeLabels": ["A"], "relType": "R"},
+        {"name": "second", "nodeLabels": ["B"], "relType": None},
+    )
 
 
 @pytest.mark.parametrize(

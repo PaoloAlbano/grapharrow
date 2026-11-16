@@ -30,6 +30,7 @@ Row = dict[str, Any]
 Scope = dict[str, str]
 LIST_ACCESSORS = frozenset({"head", "last", "tail"})
 PERCENTILE_FUNCTIONS = frozenset({"percentilecont", "percentiledisc"})
+RELATIONSHIP_ENDPOINT_FUNCTIONS = frozenset({"startnode", "endnode"})
 TYPED_SCALAR_FUNCTIONS = frozenset(
     {
         "ceil",
@@ -41,11 +42,91 @@ TYPED_SCALAR_FUNCTIONS = frozenset(
         "sqrt",
         "substring",
         *LIST_ACCESSORS,
+        *RELATIONSHIP_ENDPOINT_FUNCTIONS,
         *SCALAR_CONVERSIONS,
         *TEMPORAL_ARITIES,
     }
 )
+_SCALAR_FUNCTION_ARITIES = {
+    "abs": 1,
+    "size": 1,
+    "tolower": 1,
+    "toupper": 1,
+    "id": 1,
+    "labels": 1,
+    "type": 1,
+    "keys": 1,
+    "length": 1,
+    "nodes": 1,
+    "relationships": 1,
+}
+_AGGREGATE_FUNCTIONS = PERCENTILE_FUNCTIONS | {"count", "sum", "avg", "min", "max", "collect"}
+# openCypher built-ins that the general expression compiler cannot evaluate yet.
+_UNIMPLEMENTED_BUILTINS = frozenset(
+    {
+        "acos",
+        "allshortestpaths",
+        "asin",
+        "atan",
+        "atan2",
+        "cos",
+        "cot",
+        "degrees",
+        "e",
+        "exists",
+        "exp",
+        "floor",
+        "left",
+        "log",
+        "log10",
+        "ltrim",
+        "pi",
+        "radians",
+        "replace",
+        "right",
+        "round",
+        "rtrim",
+        "shortestpath",
+        "sign",
+        "sin",
+        "stdev",
+        "stdevp",
+        "tan",
+        "trim",
+    }
+)
+_KNOWN_FUNCTIONS = (
+    TYPED_SCALAR_FUNCTIONS
+    | _AGGREGATE_FUNCTIONS
+    | frozenset(_SCALAR_FUNCTION_ARITIES)
+    | _UNIMPLEMENTED_BUILTINS
+    | {"coalesce"}
+)
 _MAX_RANGE_ITEMS = 1 << 20
+_EXPRESSION_WRAPPERS = frozenset(
+    {
+        "oC_Expression",
+        "oC_OrExpression",
+        "oC_XorExpression",
+        "oC_AndExpression",
+        "oC_NotExpression",
+        "oC_ComparisonExpression",
+        "oC_StringListNullPredicateExpression",
+        "oC_AddOrSubtractExpression",
+        "oC_MultiplyDivideModuloExpression",
+        "oC_PowerOfExpression",
+        "oC_UnaryAddOrSubtractExpression",
+        "oC_NonArithmeticOperatorExpression",
+        "oC_Atom",
+        "oC_Literal",
+    }
+)
+_ORDER_COMPARISONS: dict[str, Callable[[Any, Any], bool]] = {
+    "<": operations.lt,
+    "<=": operations.le,
+    ">": operations.gt,
+    ">=": operations.ge,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +141,8 @@ def known_kind(expression: Expression, scope: Scope) -> str:
     """Identify statically known types while leaving parameter values to runtime."""
     if expression.kind == "variable":
         return scope[expression.value]
+    if expression.kind == "function" and expression.value in RELATIONSHIP_ENDPOINT_FUNCTIONS:
+        return "node"
     if expression.kind == "pattern_comprehension":
         return "list"
     if expression.kind in {"list", "map"}:
@@ -87,6 +170,14 @@ def identifier(text: str) -> str:
     return text[1:-1].replace("``", "`") if text.startswith("`") else text
 
 
+def resolve_function_name(invocation: Any) -> str:
+    name: str = invocation.oC_FunctionName().getText()
+    function = name.lower()
+    if function not in _KNOWN_FUNCTIONS:
+        raise QueryError.syntax(f"Unknown function: {name}", "UnknownFunction")
+    return function
+
+
 class ExpressionCompiler:
     def __init__(
         self,
@@ -98,9 +189,24 @@ class ExpressionCompiler:
         self.exists = exists
         self.pattern_comprehension = pattern_comprehension
 
+    def compile_where(self, node: Any, scope: Scope) -> Expression:
+        predicate = self.compile(node.oC_Expression(), scope)
+        if has_aggregate(predicate):
+            raise QueryError.syntax("WHERE cannot contain an aggregate.", "InvalidAggregation")
+        validate_predicate(predicate)
+        return predicate
+
     def compile(self, node: Any, scope: Scope) -> Expression:
         name = rule(node)
         parts = children(node)
+        # Skip precedence rules that contribute no operator without recursing for each rule.
+        while len(parts) == 1 and (
+            (name in _EXPRESSION_WRAPPERS and node.getChildCount() == 1)
+            or name == "oC_ParenthesizedExpression"
+        ):
+            node = parts[0]
+            name = rule(node)
+            parts = children(node)
 
         def build(child: Any) -> Expression:
             return self.compile(child, scope)
@@ -131,10 +237,12 @@ class ExpressionCompiler:
                 while parent is not None and rule(parent) not in {"oC_Where", "oC_ProjectionItem"}:
                     parent = parent.parentCtx
                 if parent is None or rule(parent) != "oC_Where":
-                    raise QueryError("Pattern predicates are only supported in predicate contexts")
+                    raise QueryError.syntax(
+                        "Path patterns require a predicate context.", "UnexpectedSyntax"
+                    )
             return Expression("exists", self.exists(node, scope))
         if name == "oC_FunctionInvocation":
-            function = node.oC_FunctionName().getText().lower()
+            function = resolve_function_name(node)
             arguments = tuple(build(p) for p in node.oC_Expression())
             if function in TYPED_SCALAR_FUNCTIONS:
                 allowed_counts = TEMPORAL_ARITIES.get(
@@ -151,6 +259,12 @@ class ExpressionCompiler:
                 if node.DISTINCT() is not None:
                     raise QueryError.syntax(
                         "DISTINCT requires an aggregation function.", "InvalidArgumentPassingMode"
+                    )
+                if function in RELATIONSHIP_ENDPOINT_FUNCTIONS and known_kind(
+                    arguments[0], scope
+                ) not in {"relationship", "any", "null"}:
+                    raise QueryError.invalid_type(
+                        f"{function}() requires a relationship.", phase="compile"
                     )
                 if function in LIST_ACCESSORS or function == "properties":
                     operand = arguments[0]
@@ -178,51 +292,39 @@ class ExpressionCompiler:
                         )
                 return Expression("function", function, arguments)
             percentile = function in PERCENTILE_FUNCTIONS
-            if percentile or function in {"count", "sum", "avg", "min", "max", "collect"}:
-                if percentile:
-                    if len(arguments) != 2:
-                        raise QueryError.syntax(
-                            f"{function}() requires a value and a percentile.",
-                            "InvalidNumberOfArguments",
-                        )
-                    if any(has_aggregate(argument) for argument in arguments):
-                        raise QueryError.syntax(
-                            "Percentile arguments cannot contain aggregates.", "NestedAggregation"
-                        )
-                    if any(
-                        known_kind(argument, scope) not in {"number", "any", "scalar", "null"}
-                        for argument in arguments
-                    ):
-                        raise QueryError.invalid_type(
-                            f"{function}() requires numeric arguments.", phase="compile"
-                        )
-                elif len(arguments) != 1 or any(has_aggregate(a) for a in arguments):
-                    raise QueryError("Aggregates require one non-aggregate operand")
+            if function in _AGGREGATE_FUNCTIONS:
+                if percentile and len(arguments) != 2:
+                    raise QueryError.syntax(
+                        f"{function}() requires a value and a percentile.",
+                        "InvalidNumberOfArguments",
+                    )
+                if not percentile and len(arguments) != 1:
+                    raise QueryError("Aggregates require one operand")
+                if any(has_aggregate(argument) for argument in arguments):
+                    raise QueryError.syntax(
+                        "Aggregate arguments cannot contain aggregates.", "NestedAggregation"
+                    )
+                if percentile and any(
+                    known_kind(argument, scope) not in {"number", "any", "scalar", "null"}
+                    for argument in arguments
+                ):
+                    raise QueryError.invalid_type(
+                        f"{function}() requires numeric arguments.", phase="compile"
+                    )
                 if any(_contains_rand(argument) for argument in arguments):
                     raise QueryError.syntax(
                         "Project rand() before aggregating its value.", "NonConstantExpression"
                     )
                 return Expression("aggregate", (function, node.DISTINCT() is not None), arguments)
-            arities = {
-                "abs": 1,
-                "size": 1,
-                "tolower": 1,
-                "toupper": 1,
-                "id": 1,
-                "labels": 1,
-                "type": 1,
-                "keys": 1,
-                "length": 1,
-                "nodes": 1,
-                "relationships": 1,
-            }
             if function == "coalesce":
                 if not arguments:
                     raise QueryError("coalesce requires at least one argument")
-            elif function not in arities:
+            elif function not in _SCALAR_FUNCTION_ARITIES:
                 raise QueryError.unsupported(f"Unsupported scalar function: {function}")
-            elif len(arguments) != arities[function]:
-                raise QueryError(f"{function} requires {arities[function]} argument")
+            elif len(arguments) != _SCALAR_FUNCTION_ARITIES[function]:
+                raise QueryError(
+                    f"{function} requires {_SCALAR_FUNCTION_ARITIES[function]} argument"
+                )
             if function == "size" and known_kind(arguments[0], scope) == "path":
                 raise QueryError.invalid_type("size() requires a list or string", phase="compile")
             entity_types = {
@@ -233,8 +335,10 @@ class ExpressionCompiler:
                 "nodes": {"path"},
                 "relationships": {"path"},
             }
-            if function in entity_types and arguments[0].kind == "variable":
-                kind = scope[arguments[0].value]
+            if function in entity_types and (
+                function in {"labels", "type"} or arguments[0].kind == "variable"
+            ):
+                kind = known_kind(arguments[0], scope)
                 if kind not in entity_types[function] | {"any", "null"}:
                     raise QueryError.invalid_type(
                         f"Invalid operand for {function}: {kind}", phase="compile"
@@ -277,11 +381,10 @@ class ExpressionCompiler:
             local = scope | {variable: next(iter(kinds)) if len(kinds) == 1 else "any"}
             where = filtering.oC_Where()
             predicate = (
-                self.compile(where.oC_Expression(), local)
+                self.compile_where(where, local)
                 if where is not None
                 else Expression("literal", True)
             )
-            validate_predicate(predicate)
             if name == "oC_ListComprehension":
                 projection = node.oC_Expression()
                 value = (
@@ -289,8 +392,11 @@ class ExpressionCompiler:
                     if projection is not None
                     else Expression("variable", variable)
                 )
-                if has_aggregate(predicate) or has_aggregate(value):
-                    raise QueryError("List expressions cannot contain aggregates")
+                if has_aggregate(value):
+                    raise QueryError.syntax(
+                        "List comprehension projections cannot contain aggregates.",
+                        "InvalidAggregation",
+                    )
                 return Expression("comprehension", variable, (collection, predicate, value))
             operation = next(c.getText().lower() for c in node.children if c.getText().strip())
             return Expression("quantifier", (operation, variable), (collection, predicate))
@@ -514,6 +620,31 @@ def conjunction(values: list[bool | None]) -> bool | None:
     return False if False in values else None if None in values else True
 
 
+def _ordered_comparison(operator: str, left: Any, right: Any) -> bool | None:
+    if left is None or right is None:
+        return None
+    compare = _ORDER_COMPARISONS[operator]
+    if isinstance(left, list | tuple) and isinstance(right, list | tuple):
+        for first, second in zip(left, right, strict=False):
+            if equal(first, second) is not True:
+                return _ordered_comparison(operator, first, second)
+        return compare(len(left), len(right))
+    if isinstance(left, Instant) and isinstance(right, Instant):
+        if left.kind != right.kind:
+            return None
+        left, right = left.order_key(), right.order_key()
+    if isinstance(left, Duration) or isinstance(right, Duration):
+        return None
+    if type(left) is not type(right) and not (
+        type(left) in {int, float} and type(right) in {int, float}
+    ):
+        return None
+    try:
+        return compare(left, right)
+    except TypeError as error:
+        raise QueryError("Values cannot be compared") from error
+
+
 def property_value(value: Any, key: str) -> Any:
     if value is None:
         return None
@@ -657,11 +788,13 @@ class ExpressionEvaluator:
         *,
         pattern_matches: Callable[[Any, Row], list[Row]] | None = None,
         resolve_entity: Callable[[Any], Any] | None = None,
+        node_by_id: Callable[[int], NodeRecord] | None = None,
         transaction_time: int | None = None,
     ) -> None:
         self.exists = exists
         self.pattern_matches = pattern_matches
         self.resolve_entity = resolve_entity
+        self.node_by_id = node_by_id
         self._statement_time: int | None = None
         self._transaction_time = transaction_time
 
@@ -722,6 +855,11 @@ class ExpressionEvaluator:
             operand = evaluate(args[0])
             if operand is None:
                 return None
+            if value in RELATIONSHIP_ENDPOINT_FUNCTIONS and isinstance(operand, EdgeRecord):
+                if self.resolve_entity is not None:
+                    operand = self.resolve_entity(operand)
+                assert self.node_by_id is not None
+                return self.node_by_id(operand.src_id if value == "startnode" else operand.dst_id)
             if value in {"ceil", "sqrt"} and type(operand) in {int, float}:
                 number = float(operand)
                 if value == "sqrt":
@@ -778,6 +916,13 @@ class ExpressionEvaluator:
                     return list(operand.nodes)
                 if value == "relationships":
                     return list(operand.relationships)
+            if value in {"labels", "type"}:
+                raise QueryError(
+                    f"Invalid operand for {value}",
+                    category="TypeError",
+                    phase="runtime",
+                    detail="InvalidArgumentValue",
+                )
             raise QueryError.invalid_type(f"Invalid operand for {value}", phase="runtime")
         if kind == "aggregate":
             if group is None:
@@ -845,39 +990,8 @@ class ExpressionEvaluator:
                     results.append(
                         None if result is None else result if operator == "=" else not result
                     )
-                elif left is None or right is None:
-                    results.append(None)
                 else:
-                    if isinstance(left, Instant) and isinstance(right, Instant):
-                        if left.kind != right.kind:
-                            results.append(None)
-                            continue
-                        left, right = left.order_key(), right.order_key()
-                    if isinstance(left, Duration) or isinstance(right, Duration):
-                        results.append(None)
-                        continue
-                    if type(left) is bool or type(right) is bool:
-                        if type(left) is not type(right):
-                            results.append(None)
-                            continue
-                    elif not (
-                        type(left) is type(right)
-                        or type(left) in {int, float}
-                        and type(right) in {int, float}
-                    ):
-                        results.append(None)
-                        continue
-                    try:
-                        results.append(
-                            {
-                                "<": operations.lt,
-                                "<=": operations.le,
-                                ">": operations.gt,
-                                ">=": operations.ge,
-                            }[operator](left, right)
-                        )
-                    except TypeError as error:
-                        raise QueryError("Values cannot be compared") from error
+                    results.append(_ordered_comparison(operator, left, right))
             return conjunction(results)
         if kind == "in":
             needle, collection = evaluate(args[0]), evaluate(args[1])

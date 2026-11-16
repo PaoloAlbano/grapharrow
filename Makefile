@@ -4,11 +4,18 @@ PACKAGE ?= grapharrow
 SRC_DIRS := src tests
 ANTLR_JAR ?=
 CYPHER_GENERATED := src/grapharrow/interfaces/opencypher/generated/vendor/opencypher
+# Keep the TCK pins aligned with .github/workflows/opencypher.yml.
+TCK_REVISION := 677cbafabb8c3c5eed458fd3b1ec0daec8d67d23
+TCK_CACHE_DIR := .local-notes/tck-local
+TCK_ARCHIVE := $(TCK_CACHE_DIR)/openCypher-$(TCK_REVISION).tar.gz
+TCK_DIR ?=
+TCK_OUTPUT ?= $(TCK_CACHE_DIR)/cases.jsonl
 
 .PHONY: help sync sync-dev lint format format-check typecheck test test-unit test-interface-comparison test-integration test-integration-live coverage check cli-help server-help bolt-help db-init db-show-catalog db-show-snapshot db-verify db-recover-dry-run db-bulk-add-nodes db-bulk-add-edges db-import-nodes db-import-edges serve bolt benchmark-backends benchmark-cypher-engine benchmark-tabular-json benchmark-ana-sessions clean
 .PHONY: generate-cypher-parser
 .PHONY: benchmark-cypher-columnar
 .PHONY: version
+.PHONY: tck
 
 help:
 	@printf "Available targets:\n"
@@ -24,6 +31,8 @@ help:
 	@printf "  make test-integration Run the integration test suite\n"
 	@printf "  make test-integration-live Run live object-storage integration tests when env vars are configured\n"
 	@printf "  make coverage     Run the test suite with coverage\n"
+	@printf "  make tck          Run the pinned openCypher compatibility audit\n"
+	@printf "  make tck TCK_ARGS='--match Match7.feature'  Audit one feature\n"
 	@printf "  make check        Run lint, typecheck, and tests\n"
 	@printf "  make cli-help     Show the GraphArrow CLI help\n"
 	@printf "  make server-help  Show the HTTP server help (REST and ANA)\n"
@@ -94,6 +103,28 @@ test-integration-live:
 
 coverage:
 	$(UV) run pytest --cov=grapharrow tests
+
+$(TCK_ARCHIVE):
+	@set -eu; \
+	mkdir -p "$(TCK_CACHE_DIR)"; \
+	archive=$$(mktemp "$@.XXXXXXXX"); \
+	trap 'rm -f "$$archive"' 0; \
+	curl -fLsS "https://codeload.github.com/opencypher/openCypher/tar.gz/$(TCK_REVISION)" -o "$$archive"; \
+	tar -tzf "$$archive" >/dev/null; \
+	mv "$$archive" "$@"
+
+tck: $(if $(strip $(TCK_DIR)),,$(TCK_ARCHIVE))
+	@set -eu; \
+	corpus="$(TCK_DIR)"; \
+	if [ -z "$$corpus" ]; then \
+		corpus=$$(mktemp -d "$(TCK_CACHE_DIR)/.corpus.XXXXXXXX"); \
+		trap 'rm -rf "$$corpus"' 0; \
+		tar -xzf "$(TCK_ARCHIVE)" --strip-components=1 -C "$$corpus"; \
+	fi; \
+	PYTHONTZPATH= $(UV) run --locked --python 3.12 \
+		--with gherkin-official==29.0.0 --with tzdata==2026.6 \
+		python .github/audit_opencypher.py --features "$$corpus/tck/features" \
+		--output "$(TCK_OUTPUT)" $(TCK_ARGS)
 
 check: lint typecheck test
 

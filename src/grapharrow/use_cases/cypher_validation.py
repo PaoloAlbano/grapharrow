@@ -10,7 +10,15 @@ from collections.abc import Mapping
 from typing import Any
 
 from grapharrow.core.errors import QueryError
-from grapharrow.use_cases.cypher_expression import children, identifier, rule
+from grapharrow.use_cases.cypher_expression import children, identifier, resolve_function_name, rule
+
+
+def reject_property_map_parameter(parameter: Any) -> None:
+    if parameter is not None:
+        raise QueryError.syntax(
+            "Matching patterns require a literal property map. Use parameters for property values.",
+            "InvalidParameterUse",
+        )
 
 
 def _walk(node: Any) -> Any:
@@ -59,7 +67,9 @@ class LegacyValidator:
             return "bool"
         if name in {"oC_RelationshipsPattern", "oC_PatternPredicate"}:
             if not predicate:
-                raise QueryError("Pattern predicates are only supported in predicate contexts.")
+                raise QueryError.syntax(
+                    "Path patterns require a predicate context.", "UnexpectedSyntax"
+                )
             for part in _walk(node):
                 if rule(part) == "oC_Variable":
                     self.expression(part, scope)
@@ -79,7 +89,7 @@ class LegacyValidator:
         if name in {"oC_PropertyKeyName", "oC_PropertyLookup", "oC_NodeLabels"}:
             return "any"
         if name == "oC_FunctionInvocation":
-            function = node.oC_FunctionName().getText().lower()
+            function = resolve_function_name(node)
             operands = [self.expression(p, scope) for p in node.oC_Expression()]
             allowed = {
                 "id": {"node", "relationship"},
@@ -182,6 +192,8 @@ class LegacyValidator:
                 properties.append(value)
         if validate_properties:
             for value in properties:
+                if not creating:
+                    reject_property_map_parameter(value.oC_Parameter())
                 self.expression(value, scope if creating else visible)
         return visible
 
@@ -189,7 +201,7 @@ class LegacyValidator:
         body = node.oC_ProjectionBody()
         items = body.oC_ProjectionItems()
         output = dict(scope) if items.getText().startswith("*") else {}
-        if items.getText().startswith("*") and not scope:
+        if terminal and items.getText().startswith("*") and not scope:
             raise QueryError.syntax(
                 "A star projection requires visible bindings", "NoVariablesInScope"
             )

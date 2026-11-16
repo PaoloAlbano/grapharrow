@@ -132,6 +132,9 @@ textual spelling over REST.
 Read a node or relationship property by a computed string key with
 `n[$key]` or `r[key]`. Null or missing keys return null.
 
+`startNode(r)` and `endNode(r)` return the endpoint nodes in the stored
+direction of the relationship. A null relationship returns null.
+
 The implemented expression subset includes comparisons, boolean composition,
 `IN`, null checks, property existence checks, `CONTAINS`, `STARTS WITH`,
 `ENDS WITH`, `id`, `labels`, `type`, `keys`, `toLower`, `toUpper`, `size`, `abs`,
@@ -146,6 +149,8 @@ start[, length])` uses zero-based Unicode character positions and returns the
 rest of the string when `length` is omitted. `ceil()` and `sqrt()` return floats.
 The square root of a negative number returns `NaN`. String predicates return
 `null` if either operand is null or a non-string value.
+Ordered comparisons compare lists from left to right and return null when
+the comparison depends on a null element.
 
 `CASE` evaluates only the selected result; `coalesce` stops at the first non-null
 argument. Predicates retain three-valued null semantics. Simple `CASE` compares
@@ -376,6 +381,10 @@ Writing statements can combine successive `CREATE`, `MERGE`, `SET`,
 earlier in the statement. `SET` supports individual properties, property-map
 replacement with `=`, map updates with `+=` and adding node labels.
 Use `REMOVE` to drop properties or labels.
+
+`MATCH` and `MERGE` use explicit property keys, with parameters accepted as
+property values, as in `MERGE (n:Person {name: $name})`. `CREATE` also accepts
+a map parameter for the entire set of properties, as in `CREATE (n:Person $props)`.
 
 ```cypher
 UNWIND [1, 2, 3] AS x

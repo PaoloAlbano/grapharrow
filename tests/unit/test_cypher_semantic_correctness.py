@@ -29,12 +29,8 @@ def database(tmp_path: Path) -> Database:
         "MATCH ()-[r:Missing]->() RETURN labels(r)",
         "MATCH (n:Missing) RETURN unknown.p",
         "MATCH (n) WHERE n.name=unknown RETURN n",
-        "MATCH (n) WHERE (n)-[newRelationship]->() RETURN n",
-        "MATCH (n) RETURN (n)-->()",
-        "MATCH (n) WITH (n)-->() AS x RETURN x",
         "MATCH () RETURN *",
         "MATCH (n) WITH n, count(*) RETURN n",
-        "MATCH (n) RETURN DISTINCT n.name ORDER BY n.p",
         "RETURN false AND 123 AS value",
         "RETURN true OR [] AS value",
         "MATCH (n:Missing) RETURN false AND 'x' AS value",
@@ -46,6 +42,189 @@ def database(tmp_path: Path) -> Database:
 def test_invalid_bindings_and_types_raise_query_error(database: Database, query: str) -> None:
     with database.read_transaction() as session, pytest.raises(QueryError):
         session.query(query)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "MATCH (n) RETURN size((n)-[:R]->()) AS length",
+        "MATCH (n) RETURN (n)-[:R]->()",
+        "MATCH (n) WITH (n)-[:R]->() AS x RETURN x",
+    ],
+)
+def test_pattern_as_read_value_is_a_compile_time_syntax_error(
+    database: Database, query: str
+) -> None:
+    with database.read_transaction() as session, pytest.raises(QueryError) as caught:
+        session.query(query)
+    assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+        "SyntaxError",
+        "compile",
+        "UnexpectedSyntax",
+    )
+
+
+@pytest.mark.parametrize("value", ["(n)-[:R]->()", "head(nodes(head((n)-[:R]->()))).foo"])
+def test_pattern_as_set_value_rejects_the_statement_before_writing(
+    database: Database, value: str
+) -> None:
+    with database.write_transaction() as session:
+        with pytest.raises(QueryError) as caught:
+            session.query(f"CREATE (n:Scratch) SET n.p = {value}")
+        assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+            "SyntaxError",
+            "compile",
+            "UnexpectedSyntax",
+        )
+        assert session.query("MATCH (n:Scratch) RETURN n").rows == ()
+
+
+def test_pattern_predicates_and_comprehensions_remain_available(database: Database) -> None:
+    with database.read_transaction() as session:
+        assert session.query("MATCH (n:A) WHERE (n)-[:R]->() RETURN n.name AS name").rows == (
+            {"name": "B"},
+        )
+        assert session.query(
+            "MATCH (n:A) WITH n WHERE NOT (n)-[:R]->() "
+            "RETURN n.name AS name, size([(n)<-[:R]-() | 1]) AS incoming"
+        ).rows == ({"name": "C", "incoming": 1},)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "MATCH (n) WHERE (n)-[newRelationship]->() RETURN n",
+        "MATCH (n) WHERE (n)-[r:R*0..2]->(a {p:1}) RETURN n",
+        "MATCH (n) WITH n WHERE (n)-[:R]->(`_anon_0`) RETURN n",
+    ],
+)
+def test_pattern_predicate_variables_must_already_be_bound(database: Database, query: str) -> None:
+    with database.read_transaction() as session, pytest.raises(QueryError) as caught:
+        session.query(query)
+    assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+        "SyntaxError",
+        "compile",
+        "UndefinedVariable",
+    )
+
+
+def test_pattern_predicates_accept_bound_variables_and_exists_accepts_locals(
+    database: Database,
+) -> None:
+    with database.read_transaction() as session:
+        assert session.query(
+            "MATCH (n:A)-[r:R]->(m:A) WITH n, r, m WHERE (n)-[r]->(m) RETURN n.name AS name"
+        ).rows == ({"name": "B"},)
+        assert session.query(
+            "MATCH (n:A) WHERE EXISTS { MATCH (n)-[:R]->(m) WHERE m.p = 1 } RETURN n.name AS name"
+        ).rows == ({"name": "B"},)
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "RETURN DISTINCT n.name ORDER BY n.p",
+        "WITH DISTINCT n.name AS name ORDER BY n.p RETURN name",
+        "RETURN DISTINCT n.name AS name, count(*) AS total ORDER BY n.p",
+    ],
+)
+def test_order_by_rejects_bindings_outside_the_projection(database: Database, tail: str) -> None:
+    with database.read_transaction() as session, pytest.raises(QueryError) as caught:
+        session.query(f"MATCH (n:A) {tail}")
+    assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+        "SyntaxError",
+        "compile",
+        "UndefinedVariable",
+    )
+
+
+@pytest.mark.parametrize("key", ["n.name", "name"])
+def test_distinct_can_order_by_projected_values(database: Database, key: str) -> None:
+    with database.read_transaction() as session:
+        assert session.query(
+            f"MATCH (n:A) RETURN DISTINCT n.name AS name ORDER BY {key} DESC"
+        ).rows == ({"name": "C"}, {"name": "B"})
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "CREATE (n:Scratch {name:'x', p:1}) RETURN DISTINCT n.name ORDER BY n.p",
+        "MATCH (n:A) WITH DISTINCT n.name AS name ORDER BY n.p CREATE (:Scratch {name:name})",
+    ],
+)
+def test_distinct_order_by_rejects_out_of_scope_values_before_writing(
+    database: Database, query: str
+) -> None:
+    with database.write_transaction() as session:
+        with pytest.raises(QueryError) as caught:
+            session.query(query)
+        assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+            "SyntaxError",
+            "compile",
+            "UndefinedVariable",
+        )
+        assert session.query("MATCH (n:Scratch) RETURN n").rows == ()
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "RETURN n.p + count(*) AS score",
+        "WITH n.p + count(*) AS score RETURN score",
+        "RETURN n.p + 1 AS key, n.p + 1 + count(*) AS score",
+        "WITH n.p + 1 AS key, n.p + 1 + count(*) AS score RETURN score",
+        "RETURN n.p + 1 AS key, count(*) AS total ORDER BY n.p + 1 + count(*)",
+        "WITH n.p + 1, count(*) AS total ORDER BY n.p + 1 + count(*) RETURN *",
+    ],
+)
+def test_ambiguous_aggregation_reports_grouping_error(database: Database, tail: str) -> None:
+    with database.read_transaction() as session, pytest.raises(QueryError) as caught:
+        session.query(f"MATCH (n:A) {tail}")
+    assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+        "SyntaxError",
+        "compile",
+        "AmbiguousAggregationExpression",
+    )
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "RETURN n.p AS key, n.p + count(*) AS score ORDER BY key",
+        "WITH n.p AS key, n.p + count(*) AS score ORDER BY n.p + count(*) RETURN key, score",
+        "WITH n.p AS key RETURN key, key + count(*) AS score ORDER BY key",
+    ],
+)
+def test_aggregation_accepts_projected_grouping_keys(database: Database, tail: str) -> None:
+    with database.read_transaction() as session:
+        result = session.query(f"MATCH (n:A) {tail}")
+    assert result.rows == ({"key": 1, "score": 2}, {"key": 2, "score": 3})
+
+
+def test_aggregation_accepts_complex_grouping_key_projected_in_advance(database: Database) -> None:
+    with database.read_transaction() as session:
+        result = session.query(
+            "MATCH (n:A) WITH n.p + 1 AS key "
+            "RETURN key, count(*) AS total ORDER BY key + count(*) DESC"
+        )
+    assert result.rows == ({"key": 3, "total": 1}, {"key": 2, "total": 1})
+
+
+def test_count_distinct_ignores_missing_properties(database: Database) -> None:
+    with database.read_transaction() as session:
+        assert session.query(
+            "MATCH (n:A) RETURN count(DISTINCT n.absent) AS value, count(n.absent) AS total"
+        ).rows == ({"value": 0, "total": 0},)
+        assert session.query(
+            "MATCH (n:A) RETURN n.name AS name, count(DISTINCT n.absent) AS total ORDER BY name"
+        ).rows == ({"name": "B", "total": 0}, {"name": "C", "total": 0})
+
+
+def test_with_still_requires_alias_when_sort_is_valid(database: Database) -> None:
+    with database.read_transaction() as session, pytest.raises(QueryError) as caught:
+        session.query("MATCH (n:A) WITH n.p + 1, count(*) AS total ORDER BY total RETURN total")
+    assert (caught.value.phase, caught.value.detail) == ("compile", "NoExpressionAlias")
 
 
 @pytest.mark.parametrize(
@@ -66,6 +245,11 @@ def test_invalid_bindings_and_types_raise_query_error(database: Database, query:
             "WITH name, min(value) AS p ORDER BY sum(value) RETURN name, p",
             "UndefinedVariable",
         ),
+        ("MATCH (n:A) RETURN count(*) AS total ORDER BY n.p + count(*)", "UndefinedVariable"),
+        (
+            "MATCH (n:A) WITH count(*) AS total ORDER BY n.p + count(*) RETURN total",
+            "UndefinedVariable",
+        ),
     ],
 )
 def test_order_by_rejects_new_aggregate(database: Database, query: str, detail: str) -> None:
@@ -84,6 +268,75 @@ def test_order_by_accepts_projected_aggregation(database: Database, sort_key: st
             f"MATCH (n:A) WITH n.name AS name, min(n.p) AS p ORDER BY {sort_key} RETURN name, p"
         )
     assert result.rows == ({"name": "C", "p": 1}, {"name": "B", "p": 2})
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "MATCH (n) WHERE count(n) > 10 RETURN n",
+        "OPTIONAL MATCH (n) WHERE count(*) > 0 RETURN n",
+        "MATCH (n) WITH n WHERE count(*) > 0 RETURN n",
+        "MATCH (n) RETURN [x IN [1, 2, 3] | count(*)]",
+        "RETURN [x IN [1] WHERE count(*) > 0 | x] AS result",
+        "RETURN any(x IN [1] WHERE count(*) > 0) AS result",
+    ],
+)
+def test_aggregation_is_rejected_in_where_and_list_projections(
+    database: Database, query: str
+) -> None:
+    with database.read_transaction() as session, pytest.raises(QueryError) as caught:
+        session.query(query)
+    assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+        "SyntaxError",
+        "compile",
+        "InvalidAggregation",
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "RETURN count(count(*))",
+        "MATCH (n) RETURN max(DISTINCT (sum(n.p) + 1)) AS value",
+        "MATCH (n) RETURN count(percentileCont(n.p, 0.5)) AS value",
+    ],
+)
+def test_nested_aggregation_has_a_compile_time_diagnostic(database: Database, query: str) -> None:
+    with database.read_transaction() as session, pytest.raises(QueryError) as caught:
+        session.query(query)
+    assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+        "SyntaxError",
+        "compile",
+        "NestedAggregation",
+    )
+
+
+def test_where_aggregation_rejects_the_statement_before_writing(database: Database) -> None:
+    with database.write_transaction() as session:
+        with pytest.raises(QueryError) as caught:
+            session.query("CREATE (n:Scratch) WITH n WHERE count(*) > 0 RETURN n")
+        assert (caught.value.category, caught.value.phase, caught.value.detail) == (
+            "SyntaxError",
+            "compile",
+            "InvalidAggregation",
+        )
+        assert session.query("MATCH (n:Scratch) RETURN n").rows == ()
+
+
+def test_where_and_later_aggregates_accept_a_projected_aggregate(database: Database) -> None:
+    with database.read_transaction() as session:
+        assert session.query(
+            "MATCH (n:A) WITH count(n) AS total WHERE total > 1 RETURN sum(total) AS value"
+        ).rows == ({"value": 2},)
+
+
+def test_aggregates_can_supply_list_inputs_and_case_conditions(database: Database) -> None:
+    with database.read_transaction() as session:
+        assert session.query(
+            "UNWIND [1, 2] AS n RETURN [x IN collect(n) | x + 1] AS values, "
+            "any(x IN collect(n) WHERE x = 2) AS matched, "
+            "CASE WHEN count(*) > 1 THEN true ELSE false END AS enough"
+        ).rows == ({"values": [2, 3], "matched": True, "enough": True},)
 
 
 @pytest.mark.parametrize(

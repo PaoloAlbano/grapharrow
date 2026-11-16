@@ -41,10 +41,10 @@ from grapharrow.use_cases.cypher_expression import (
     rule,
     sort_key,
     truth,
-    validate_predicate,
 )
 from grapharrow.use_cases.cypher_path import PathValue
 from grapharrow.use_cases.cypher_procedures import ReadProcedure
+from grapharrow.use_cases.cypher_validation import LegacyValidator
 from grapharrow.use_cases.cypher_window import (
     check_window_value,
     limit_optimizations_enabled,
@@ -164,6 +164,8 @@ def needs_pipeline(tree: Any, source: str, parameters: Mapping[str, object] | No
             "coalesce",
             *TYPED_SCALAR_FUNCTIONS,
             *PERCENTILE_FUNCTIONS,
+            "labels",
+            "type",
             "with",
             "union",
             "call",
@@ -200,13 +202,13 @@ def needs_pipeline(tree: Any, source: str, parameters: Mapping[str, object] | No
             for part in walk(node)
         ):
             return True
+        if (
+            name in {"oC_Return", "oC_With"}
+            and node.oC_ProjectionBody().DISTINCT() is not None
+            and node.oC_ProjectionBody().oC_Order() is not None
+        ):
+            return True
         if not updating:
-            if (
-                name == "oC_Return"
-                and node.oC_ProjectionBody().DISTINCT() is not None
-                and node.oC_ProjectionBody().oC_Order() is not None
-            ):
-                return True
             if name == "oC_With":
                 return True
             if name == "oC_PowerOfExpression" and len(children(node)) > 1:
@@ -241,12 +243,18 @@ def needs_pipeline(tree: Any, source: str, parameters: Mapping[str, object] | No
             node.oC_RegularQuery() is not None or node.oC_ExistentialBody() is not None
         ):
             return True
-        if (
-            name == "oC_FunctionInvocation"
-            and node.oC_FunctionName().getText().lower()
-            in TYPED_SCALAR_FUNCTIONS | PERCENTILE_FUNCTIONS | {"coalesce"}
-        ):
-            return True
+        if name == "oC_FunctionInvocation":
+            function = node.oC_FunctionName().getText().lower()
+            if function in TYPED_SCALAR_FUNCTIONS | PERCENTILE_FUNCTIONS | {"coalesce"}:
+                return True
+            if function in {"labels", "type"}:
+                operands = node.oC_Expression()
+                if len(operands) == 1:
+                    argument = operands[0].getText()
+                    if argument.lower() in {"null", "true", "false"} or not (
+                        core._IDENTIFIER_RE.fullmatch(argument)
+                    ):
+                        return True
         if name == "oC_MultiPartQuery" and len(node.oC_With()) > 1:
             return True
         if name == "oC_With" and node.oC_ProjectionBody().oC_ProjectionItems().getText().startswith(
@@ -619,8 +627,7 @@ class ReadCompiler:
                 visible[alias] = "any"
         predicate = None
         if items is not None and items.oC_Where() is not None:
-            predicate = self.expressions.compile(items.oC_Where().oC_Expression(), visible)
-            validate_predicate(predicate)
+            predicate = self.expressions.compile_where(items.oC_Where(), visible)
         return ProcedureStage(procedure, arguments, tuple(yielded), predicate, standalone), visible
 
     def match(
@@ -660,25 +667,31 @@ class ReadCompiler:
             self.validate_path_bindings(parts, scope)
         multiple_paths = sum(bool(element.oC_PatternElementChain()) for element, _ in parts) > 1
         if multiple_paths:
-            from grapharrow.use_cases.cypher_validation import LegacyValidator
-
             # Diagnose binding conflicts before attempting to compile expansions.
             LegacyValidator(self.parameters).pattern(
                 pattern, {}, creating=False, validate_properties=False
             )
         for element, alias in parts:
-            compiled = core._compile_pattern_element(
-                element,
-                self.parameters,
-                self.state,
-                allow_relationship_variables=True,
-                allow_bidirectional=True,
-                allow_ranged_bindings=True,
-                compile_properties=compile_properties,
-                defer_unbounded=self.deferred_traversal_errors.append
-                if alias is not None
-                else None,
-            )
+            try:
+                compiled = core._compile_pattern_element(
+                    element,
+                    self.parameters,
+                    self.state,
+                    allow_relationship_variables=True,
+                    allow_bidirectional=True,
+                    allow_ranged_bindings=True,
+                    compile_properties=compile_properties,
+                    defer_unbounded=self.deferred_traversal_errors.append
+                    if alias is not None
+                    else None,
+                )
+            except QueryError as error:
+                if error.detail == "UnboundedTraversal" and not multiple_paths:
+                    # The range compiler can fail before bindings in the rest of the path are seen.
+                    LegacyValidator(self.parameters).pattern(
+                        element, {}, creating=False, validate_properties=False
+                    )
+                raise
 
             if isinstance(compiled, core.NodePattern):
                 compiled = replace(compiled, variable=identifier(compiled.variable))
@@ -788,22 +801,21 @@ class ReadCompiler:
             if isinstance(p, core.PathPattern):
                 for s in p.steps:
                     prepare(s.properties)
-        predicate = (
-            None if where is None else self.expressions.compile(where.oC_Expression(), visible)
-        )
-        if predicate is not None and has_aggregate(predicate):
-            raise QueryError("MATCH WHERE cannot contain an aggregate")
-        if predicate is not None:
-            validate_predicate(predicate)
-            if predicate.kind == "variable" and visible[predicate.value] in {
+        predicate = None if where is None else self.expressions.compile_where(where, visible)
+        if (
+            predicate is not None
+            and predicate.kind == "variable"
+            and visible[predicate.value]
+            in {
                 "node",
                 "relationship",
                 "relationship_list",
                 "path",
-            }:
-                raise QueryError.invalid_type(
-                    "A predicate must evaluate to a boolean or null", phase="compile"
-                )
+            }
+        ):
+            raise QueryError.invalid_type(
+                "A predicate must evaluate to a boolean or null", phase="compile"
+            )
         return MatchStage(patterns, bindings, predicate, optional, tuple(paths)), visible
 
     @staticmethod
@@ -864,9 +876,11 @@ class ReadCompiler:
     ) -> tuple[ProjectionStage, Scope]:
         body = node.oC_ProjectionBody()
         projection = body.oC_ProjectionItems()
+        order = body.oC_Order()
+        missing_alias = False
         items: list[tuple[str, Expression]] = []
         if projection.getText().startswith("*"):
-            if not scope:
+            if terminal and not scope:
                 raise QueryError.syntax(
                     "A star projection requires visible bindings", "NoVariablesInScope"
                 )
@@ -878,8 +892,10 @@ class ReadCompiler:
                 name = identifier(alias.getText())
             elif expression.kind == "variable":
                 name = expression.value
-            elif terminal:
+            elif terminal or order is not None:
+                # A grouped sort can diagnose an ambiguous key before the missing alias.
                 name = item.oC_Expression().getText()
+                missing_alias = not terminal
             else:
                 raise QueryError.syntax(
                     "WITH expressions require an explicit alias", "NoExpressionAlias"
@@ -893,34 +909,32 @@ class ReadCompiler:
                 "Projection defines the same output name more than once", "ColumnNameConflict"
             )
         grouping = tuple(expression for _, expression in items if not has_aggregate(expression))
+        simple_grouping = tuple(
+            g for g in grouping if g.kind in {"variable", "property", "literal"}
+        )
         aggregated = any(has_aggregate(expression) for _, expression in items)
         if aggregated:
             for _, expression in items:
                 if has_aggregate(expression) and not _grouping_valid(
-                    expression,
-                    tuple(g for g in grouping if g.kind in {"variable", "property", "literal"}),
-                    set(),
+                    expression, simple_grouping, set()
                 ):
-                    raise QueryError(
-                        "Aggregation references an expression outside the grouping keys"
+                    raise QueryError.syntax(
+                        "Aggregation references an expression outside the grouping keys",
+                        "AmbiguousAggregationExpression",
                     )
         projected = {name: expression_kind(expression, scope) for name, expression in items}
         output = projected if terminal else globals | projected
         predicate = None
         where = node.oC_Where() if not terminal else None
         if where is not None:
-            predicate = self.expressions.compile(where.oC_Expression(), scope | output)
+            predicate = self.expressions.compile_where(where, scope | output)
             if (aggregated or body.DISTINCT() is not None) and not _grouping_valid(
                 predicate, tuple(e for _, e in items), set(output)
             ):
                 raise QueryError(
                     "WITH WHERE references a non-projected value after aggregation or DISTINCT"
                 )
-            if has_aggregate(predicate):
-                raise QueryError("WITH WHERE must reference projected aggregates by alias")
-            validate_predicate(predicate)
         ordering = []
-        order = body.oC_Order()
         if order is not None:
             projected_aggregates = [
                 e for _, item in items for e in _expression_nodes(item) if e.kind == "aggregate"
@@ -948,25 +962,39 @@ class ReadCompiler:
                         "ORDER BY cannot introduce a non-projected aggregate", "InvalidAggregation"
                     )
                 if restrict_order_scope and not _grouping_valid(
-                    expression,
-                    tuple(
-                        e
-                        for _, e in items
-                        if e.kind in {"variable", "property", "literal", "aggregate"}
-                    ),
-                    sort_aliases,
+                    expression, simple_grouping, sort_aliases
                 ):
-                    raise QueryError(
+                    message = (
                         "ORDER BY references a non-projected value after aggregation or DISTINCT"
                     )
+                    if has_aggregate(expression) and _grouping_valid(
+                        expression, grouping, sort_aliases
+                    ):
+                        raise QueryError.syntax(
+                            "ORDER BY aggregation uses a complex grouping key",
+                            "AmbiguousAggregationExpression",
+                        )
+                    raise QueryError.syntax(message, "UndefinedVariable")
                 ordering.append(
                     (expression, part.DESC() is not None or part.DESCENDING() is not None)
                 )
 
+        if missing_alias:
+            raise QueryError.syntax(
+                "WITH expressions require an explicit alias", "NoExpressionAlias"
+            )
+
         def window(part: Any) -> Expression | None:
             if part is None:
                 return None
-            expression = self.expressions.compile(part.oC_Expression(), {})
+            try:
+                expression = self.expressions.compile(part.oC_Expression(), {})
+            except QueryError as error:
+                if error.detail == "UndefinedVariable":
+                    raise QueryError.syntax(
+                        "SKIP and LIMIT cannot depend on row variables.", "NonConstantExpression"
+                    ) from None
+                raise
             if has_aggregate(expression):
                 raise QueryError("SKIP and LIMIT cannot contain aggregates")
             if expression.kind == "literal" and not expression.parameter:
@@ -1014,7 +1042,9 @@ class ReadCompiler:
         regular = node.oC_RegularQuery() if rule(node) == "oC_ExistentialSubquery" else None
         if regular is not None:
             if contains_updates(regular):
-                raise QueryError.unsupported("EXISTS subqueries cannot write")
+                raise QueryError.syntax(
+                    "EXISTS subqueries cannot write", "InvalidClauseComposition"
+                )
             return self.regular(regular, scope, globals=scope)
         body = node.oC_ExistentialBody() if rule(node) == "oC_ExistentialSubquery" else None
         stages: list[Stage] = []
@@ -1043,8 +1073,10 @@ class ReadCompiler:
                 .oC_Match()
             )
             stage, visible = self.match(match.oC_Pattern(), None, False, scope)
-            if any(name not in scope and not name.startswith("_anon_") for name in stage.bindings):
-                raise QueryError("Pattern predicates cannot introduce named variables")
+            if visible.keys() - scope.keys():
+                raise QueryError.syntax(
+                    "Pattern predicates cannot introduce named variables", "UndefinedVariable"
+                )
             stages.append(stage)
         return ReadQuery((ReadBranch(dict(scope), tuple(stages), visible),), False, None)
 
@@ -1122,6 +1154,7 @@ class ReadRuntime:
         self.evaluator = ExpressionEvaluator(
             lambda query, row: bool(self.rows(query, [row])),
             pattern_matches=lambda comprehension, row: self.match(comprehension.match, [row]),
+            node_by_id=self._node_by_id,
             transaction_time=graph.transaction_time_ns
             if isinstance(graph, GraphTransactionUseCase)
             else None,
@@ -1138,6 +1171,11 @@ class ReadRuntime:
             self._nodes = {node.node_id: node for node in self._state.nodes}
             self._edges = {edge.edge_id: edge for edge in self._state.edges}
         return self._state
+
+    def _node_by_id(self, node_id: int) -> NodeRecord:
+        if self._state is None:
+            _ = self.state
+        return self._nodes[node_id]
 
     def execute(self, query: ReadQuery) -> QueryResult:
         if os.environ.get("GRAPHARROW_DISABLE_CYPHER_COLUMNAR", "").lower() not in {"1", "true"}:

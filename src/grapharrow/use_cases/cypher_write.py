@@ -34,6 +34,7 @@ from grapharrow.use_cases.cypher_pipeline import (
     union_parts,
     validate_union_columns,
 )
+from grapharrow.use_cases.cypher_validation import reject_property_map_parameter
 from grapharrow.use_cases.graph import GraphTransactionUseCase, QueryResult
 
 
@@ -195,9 +196,13 @@ class WriteCompiler(ReadCompiler):
             )
         return expression
 
-    def properties(self, node: Any, scope: Scope) -> Expression | None:
+    def properties(self, node: Any, scope: Scope, *, merge: bool) -> Expression | None:
         properties = node.oC_Properties()
-        return None if properties is None else self.value(properties, scope)
+        if properties is None:
+            return None
+        if merge:
+            reject_property_map_parameter(properties.oC_Parameter())
+        return self.value(properties, scope)
 
     def pattern(self, parts: list[Any], scope: Scope, *, merge: bool) -> tuple[CreateStage, Scope]:
         nodes: dict[str, WriteNode] = {}
@@ -222,7 +227,10 @@ class WriteCompiler(ReadCompiler):
                 )
             if name not in nodes:
                 nodes[name] = WriteNode(
-                    name, bound, labels, self.properties(node, scope if merge else visible)
+                    name,
+                    bound,
+                    labels,
+                    self.properties(node, scope if merge else visible, merge=merge),
                 )
             if variable is not None:
                 visible[name] = "node"
@@ -277,7 +285,7 @@ class WriteCompiler(ReadCompiler):
                         right,
                         identifier(types.oC_RelTypeName(0).getText()),
                         "incoming" if incoming else "outgoing" if outgoing else "undirected",
-                        self.properties(detail, scope),
+                        self.properties(detail, scope, merge=merge),
                     )
                 )
                 left = right
@@ -300,14 +308,14 @@ class WriteCompiler(ReadCompiler):
         prop = node.oC_PropertyExpression()
         labels = _labels(node.oC_NodeLabels())
         if prop is not None:
-            variable = prop.oC_Atom().oC_Variable()
-            if variable is None or len(prop.oC_PropertyLookup()) != 1:
+            target = self.expressions.compile(prop.oC_Atom(), scope)
+            if target.kind != "variable" or len(prop.oC_PropertyLookup()) != 1:
                 raise QueryError.unsupported(
                     "Updating a property requires a single entity binding."
                 )
+            name = target.value
         else:
-            variable = node.oC_Variable()
-        name = identifier(variable.getText())
+            name = identifier(node.oC_Variable().getText())
         if name not in scope:
             raise QueryError.syntax(f"Unknown variable: {name}", "UndefinedVariable")
         allowed = {"node", "any", "null"} if labels else {"node", "relationship", "any", "null"}
@@ -338,6 +346,7 @@ class WriteRuntime(ReadRuntime):
             self.evaluator.exists,
             pattern_matches=self.evaluator.pattern_matches,
             resolve_entity=self.live,
+            node_by_id=self.nodes.__getitem__,
             transaction_time=self.graph.transaction_time_ns,
         )
 
