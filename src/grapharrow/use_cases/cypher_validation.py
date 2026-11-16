@@ -10,7 +10,13 @@ from collections.abc import Mapping
 from typing import Any
 
 from grapharrow.core.errors import QueryError
-from grapharrow.use_cases.cypher_expression import children, identifier, resolve_function_name, rule
+from grapharrow.use_cases.cypher_expression import (
+    children,
+    identifier,
+    resolve_function_name,
+    rule,
+    unwrap_expression,
+)
 
 
 def reject_property_map_parameter(parameter: Any) -> None:
@@ -48,8 +54,7 @@ class LegacyValidator:
         self.parameters = parameters
 
     def expression(self, node: Any, scope: dict[str, str], *, predicate: bool = False) -> str:
-        name = rule(node)
-        parts = children(node)
+        node, name, parts = unwrap_expression(node)
         if name == "oC_Variable":
             variable = identifier(node.getText())
             if variable not in scope:

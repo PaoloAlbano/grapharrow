@@ -133,12 +133,20 @@ def build_application(
         cypher=cypher_use_case,
         indexes=index_use_case,
     )
+    local_root = repositories.snapshot.writer.local_root
+    schema_cache_disk = None
+    if local_root is not None and resolved_settings.ana_persistent_schema_cache_enabled:
+        schema_cache_disk = (
+            local_root / ".grapharrow-cache" / "ana-schema.json",
+            resolved_filesystem,
+        )
     return GraphArrowApplication(
         settings=resolved_settings,
         layout=layout,
         adapters=adapters,
         repositories=repositories,
         use_cases=use_cases,
+        _ana_schema_cache=SnapshotSchemaCache(disk=schema_cache_disk),
     )
 
 

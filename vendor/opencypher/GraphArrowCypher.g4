@@ -29,3 +29,9 @@ oC_ExistentialSubquery
 oC_ExistentialBody
     : (oC_ReadingClause | oC_With) (SP? (oC_ReadingClause | oC_With))*
     ;
+
+// Factor the optional alias out of the shared expression prefix. This avoids
+// predicting both alternatives through arbitrarily nested expressions.
+oC_ProjectionItem
+    : oC_Expression (SP AS SP oC_Variable)?
+    ;

@@ -1,7 +1,8 @@
 # Release builds consume the verified wheel; local builds create it from source.
+ARG PYTHON_VERSION=3.13
 ARG DISTRIBUTION_SOURCE=wheel-builder
 
-FROM python:3.12-slim AS wheel-builder
+FROM python:${PYTHON_VERSION}-slim-trixie AS wheel-builder
 WORKDIR /build
 RUN pip install --no-cache-dir uv==0.8.12
 COPY pyproject.toml uv.lock README.md LICENSE THIRD_PARTY_NOTICES.md ./
@@ -14,7 +15,7 @@ COPY dist/*.whl dist/runtime-requirements.txt /dist/
 
 FROM ${DISTRIBUTION_SOURCE} AS distribution
 
-FROM python:3.12-slim AS runtime
+FROM python:${PYTHON_VERSION}-slim-trixie AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     GRAPHARROW_DATABASE_PATH=/data/grapharrow \

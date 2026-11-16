@@ -34,6 +34,11 @@ class GraphArrowCypherVisitor(ParseTreeVisitor):
         return self.visitChildren(ctx)
 
 
+    # Visit a parse tree produced by GraphArrowCypherParser#oC_ProjectionItem.
+    def visitOC_ProjectionItem(self, ctx:GraphArrowCypherParser.OC_ProjectionItemContext):
+        return self.visitChildren(ctx)
+
+
     # Visit a parse tree produced by GraphArrowCypherParser#oC_Cypher.
     def visitOC_Cypher(self, ctx:GraphArrowCypherParser.OC_CypherContext):
         return self.visitChildren(ctx)
@@ -166,11 +171,6 @@ class GraphArrowCypherVisitor(ParseTreeVisitor):
 
     # Visit a parse tree produced by GraphArrowCypherParser#oC_ProjectionItems.
     def visitOC_ProjectionItems(self, ctx:GraphArrowCypherParser.OC_ProjectionItemsContext):
-        return self.visitChildren(ctx)
-
-
-    # Visit a parse tree produced by GraphArrowCypherParser#oC_ProjectionItem.
-    def visitOC_ProjectionItem(self, ctx:GraphArrowCypherParser.OC_ProjectionItemContext):
         return self.visitChildren(ctx)
 
 

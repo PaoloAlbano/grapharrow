@@ -208,7 +208,8 @@ retained state, not a complete CPU or process-memory boundary.
 
 ## Docker
 
-Build the runtime image once:
+The runtime image uses Python 3.13 on Debian Trixie slim by default. Run the
+following commands to build it and create the database volume.
 
 ```sh
 docker build -t grapharrow:local .

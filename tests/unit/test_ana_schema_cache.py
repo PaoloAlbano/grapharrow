@@ -1,13 +1,16 @@
 """Schema reuse must preserve per-workflow isolation, admission, and cleanup."""
 
 import gc
+import json
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 from typing import Any
 
 import pytest
 
+from grapharrow.app import build_application
 from grapharrow.use_cases.ana import GraphArrowAgentBackend
 from grapharrow.use_cases.ana_resources import AnaResourceBudget
 from tests.ana_support import load_grapharrow
@@ -16,7 +19,9 @@ from tests.ana_support import load_grapharrow
 def test_concurrent_workflows_discover_once_and_release_the_cache(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    app = load_grapharrow(tmp_path / "shared-schema")
+    monkeypatch.setenv("GRAPHARROW_ANA_PERSISTENT_SCHEMA_CACHE_ENABLED", "false")
+    root = tmp_path / "shared-schema"
+    app = load_grapharrow(root)
     original = GraphArrowAgentBackend._discover_schema
     calls = []
 
@@ -50,6 +55,7 @@ def test_concurrent_workflows_discover_once_and_release_the_cache(
     assert not app._ana_schema_cache._entries
     with GraphArrowAgentBackend(app):
         assert len(calls) == 2
+    assert not (root / ".grapharrow-cache").exists()
 
 
 def test_native_schema_response_mutation_does_not_cross_workflows(tmp_path: Path) -> None:
@@ -107,3 +113,99 @@ def test_failed_discovery_does_not_poison_or_charge_the_cache(
         assert backend.call("schema_overview", {})["labels"]
     assert calls == 2
     assert budget.used_bytes == 0
+
+
+def test_local_schema_cache_reuses_exact_tool_results_after_reopening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "reopened-schema"
+    app = load_grapharrow(root)
+    calls = [
+        ("schema_overview", {}),
+        ("schema_describe_label", {"label": "Person"}),
+        ("schema_describe_relationship", {"relationship_type": "WORKS"}),
+    ]
+    with GraphArrowAgentBackend(app) as first:
+        expected = [first.call(tool, args) for tool, args in calls]
+        snapshot_bytes = first.resource_usage["snapshot_bytes"]
+    assert (root / ".grapharrow-cache" / "ana-schema.json").is_file()
+    assert not app._ana_schema_cache._entries
+
+    def unexpected_discovery(backend: GraphArrowAgentBackend) -> dict[str, Any]:
+        pytest.fail("Reopened database should reuse its persisted schema")
+
+    monkeypatch.setattr(GraphArrowAgentBackend, "_discover_schema", unexpected_discovery)
+    with GraphArrowAgentBackend(build_application(root)) as reopened:
+        assert [reopened.call(tool, args) for tool, args in calls] == expected
+        assert reopened.resource_usage["snapshot_bytes"] == snapshot_bytes
+
+
+@pytest.mark.parametrize("damage", ["malformed", "checksum", "unsupported-version", "unwritable"])
+def test_local_schema_cache_falls_back_when_unusable(tmp_path: Path, damage: str) -> None:
+    root = tmp_path / "unusable-schema"
+    app = load_grapharrow(root)
+    with GraphArrowAgentBackend(app) as first:
+        expected = deepcopy(first._schema)
+
+    cache = root / ".grapharrow-cache" / "ana-schema.json"
+    original = cache.read_bytes()
+    if damage == "malformed":
+        cache.write_text("{", encoding="utf-8")
+    elif damage == "unwritable":
+        cache.unlink()
+        cache.mkdir()
+    else:
+        payload = json.loads(original)
+        if damage == "checksum":
+            payload["schema"]["labels"] = ["Wrong"]
+        else:
+            payload["version"] += 1
+        cache.write_text(json.dumps(payload), encoding="utf-8")
+
+    with GraphArrowAgentBackend(build_application(root)) as reopened:
+        assert reopened._schema == expected
+    if damage != "unwritable":
+        assert cache.read_bytes() == original
+
+
+def test_slow_schema_cache_write_allows_commit_and_vacuum(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "concurrent-schema"
+    reader_app = load_grapharrow(root)
+    writer_app = build_application(root)
+    cache = root / ".grapharrow-cache" / "ana-schema.json"
+    writing = Event()
+    resume = Event()
+    replace = reader_app.adapters.filesystem.replace_json
+
+    def pause_replace(path: str | Path, payload: object) -> None:
+        assert path == cache
+        writing.set()
+        assert resume.wait(timeout=20)
+        replace(path, payload)
+
+    monkeypatch.setattr(reader_app.adapters.filesystem, "replace_json", pause_replace)
+
+    def commit_and_vacuum() -> None:
+        writer_app.use_cases.graph.create_node(labels=("Project",), properties={"code": "new"})
+        writer_app.use_cases.admin.vacuum()
+        with GraphArrowAgentBackend(writer_app) as current:
+            assert current.call("schema_describe_label", {"label": "Project"})["count"] == 1
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        old_workflow = pool.submit(GraphArrowAgentBackend, reader_app)
+        try:
+            assert writing.wait(timeout=10)
+            pool.submit(commit_and_vacuum).result(timeout=10)
+            current_cache = cache.read_bytes()
+        finally:
+            resume.set()
+        with old_workflow.result(timeout=10) as old:
+            assert "Project" not in old._schema["labels"]
+            assert old.call("schema_describe_label", {"label": "Person"})["count"] == 6
+
+    assert cache.read_bytes() != current_cache
+    with GraphArrowAgentBackend(build_application(root)) as reopened:
+        assert reopened.call("schema_describe_label", {"label": "Project"})["count"] == 1
+    assert cache.read_bytes() == current_cache

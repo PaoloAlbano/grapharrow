@@ -63,6 +63,7 @@ Use `--no-ana` or `GRAPHARROW_ANA_ENABLED=false` to disable the interface.
 | `GRAPHARROW_ANA_MAX_ROWS_PER_SESSION` | `100000` | Sum of rows retained across workflow handles |
 | `GRAPHARROW_ANA_MAX_BYTES_PER_SESSION` | `67108864` | Accounted snapshot, handle, lineage and page bytes (64 MiB) |
 | `GRAPHARROW_ANA_MAX_TOTAL_BYTES` | `536870912` | Shared accounted bytes for the HTTP application (512 MiB) |
+| `GRAPHARROW_ANA_PERSISTENT_SCHEMA_CACHE_ENABLED` | `true` | Reuse a schema cache file on native local storage |
 | `GRAPHARROW_ANA_READ_CACHE_ENABLED` | `false` | Enable workflow-local candidate caching for `entity_resolve` and `value_search` |
 | `GRAPHARROW_ANA_READ_CACHE_MAX_BYTES_PER_SESSION` | `4194304` | Reserved read-cache capacity inside workflow and server byte quotas (4 MiB, minimum 1024 bytes) |
 | `GRAPHARROW_ANA_ADJACENCY_INDEX_MAX_BYTES_PER_SESSION` | `8388608` | Ceiling for the computed adjacency-index reservation; `0` disables it (8 MiB) |
@@ -186,12 +187,21 @@ can be collected when workflows release their references. A changed snapshot
 gets a separate entry. Workflow setup pins canonical and property tables together
 under the database coordinator before discovering or reusing the schema.
 
+Native local databases also reuse the observed schema across workflow and process
+restarts. Workflow setup checks one atomically replaced file at
+`.grapharrow-cache/ana-schema.json` against the pinned manifest's canonical node
+and edge file identities. A missing, unreadable, corrupt or stale file triggers
+schema discovery. Cache writes occur outside the database coordinator and the
+snapshot commit. The file can be deleted at any time. Remote storage uses the
+in-memory cache. Set `GRAPHARROW_ANA_PERSISTENT_SCHEMA_CACHE_ENABLED=false` before
+opening the database to skip the cache file.
+
 Quotas count retained state. Snapshot admission includes canonical Arrow tables,
 property projections, schema and lookup structures. Handle charges include rows,
 metadata, lineage and the most recent fetched page. Shared objects can be charged
 again across handles; these are approximate accounting bytes, rather than RSS.
 Each workflow is conservatively charged for its schema copy and the complete
-shared schema entry. The cache is scoped to one application instance.
+shared in-memory schema entry.
 A tool exceeding its quota rolls back its new handles and lineage. Existing
 handles and the previous fetched page remain usable. `allow_large` cannot bypass
 server quotas. Delete a workflow to release its resources; idle expiry and

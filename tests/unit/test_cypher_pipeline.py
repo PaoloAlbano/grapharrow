@@ -555,15 +555,23 @@ def test_opencypher_numeric_literals(database: Database, literal: str, value: An
 
 
 @pytest.mark.parametrize("container", ["list", "map"])
-def test_deeply_nested_container_literals(database: Database, container: str) -> None:
+@pytest.mark.parametrize("projection", ["return", "unaliased-return", "with"])
+def test_deeply_nested_container_literals(
+    database: Database, container: str, projection: str
+) -> None:
     text, value = "42", 42
     for _ in range(40):
         if container == "list":
             text, value = f"[{text}]", [value]
         else:
             text, value = f"{{nested:{text}}}", {"nested": value}
+    query, column = {
+        "return": (f"RETURN {text} AS result", "result"),
+        "unaliased-return": (f"RETURN {text}", text),
+        "with": (f"WITH {text} AS result RETURN result", "result"),
+    }[projection]
     with database.read_transaction() as session:
-        assert session.query(f"RETURN {text} AS result").rows == ({"result": value},)
+        assert session.query(query).rows == ({column: value},)
 
 
 @pytest.mark.parametrize(

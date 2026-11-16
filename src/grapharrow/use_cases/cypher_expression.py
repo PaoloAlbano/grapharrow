@@ -166,6 +166,20 @@ def children(node: Any) -> list[Any]:
     return [child for child in node.children or [] if hasattr(child, "getRuleIndex")]
 
 
+def unwrap_expression(node: Any) -> tuple[Any, str, list[Any]]:
+    """Skip grammar rules that add neither an operator nor an operand."""
+    name = rule(node)
+    parts = children(node)
+    while len(parts) == 1 and (
+        (name in _EXPRESSION_WRAPPERS and node.getChildCount() == 1)
+        or name == "oC_ParenthesizedExpression"
+    ):
+        node = parts[0]
+        name = rule(node)
+        parts = children(node)
+    return node, name, parts
+
+
 def identifier(text: str) -> str:
     return text[1:-1].replace("``", "`") if text.startswith("`") else text
 
@@ -197,16 +211,7 @@ class ExpressionCompiler:
         return predicate
 
     def compile(self, node: Any, scope: Scope) -> Expression:
-        name = rule(node)
-        parts = children(node)
-        # Skip precedence rules that contribute no operator without recursing for each rule.
-        while len(parts) == 1 and (
-            (name in _EXPRESSION_WRAPPERS and node.getChildCount() == 1)
-            or name == "oC_ParenthesizedExpression"
-        ):
-            node = parts[0]
-            name = rule(node)
-            parts = children(node)
+        node, name, parts = unwrap_expression(node)
 
         def build(child: Any) -> Expression:
             return self.compile(child, scope)

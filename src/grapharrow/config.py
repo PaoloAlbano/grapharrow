@@ -33,6 +33,7 @@ class GraphArrowSettings(BaseSettings):
     ana_max_rows_per_session: int = Field(default=100_000, gt=0)
     ana_max_bytes_per_session: int = Field(default=64 * 1024 * 1024, gt=0)
     ana_max_total_bytes: int = Field(default=512 * 1024 * 1024, gt=0)
+    ana_persistent_schema_cache_enabled: bool = Field(default=True)
     ana_read_cache_enabled: bool = Field(default=False)
     ana_read_cache_max_bytes_per_session: int = Field(default=4 * 1024 * 1024, ge=1024)
     ana_adjacency_index_max_bytes_per_session: int = Field(default=8 * 1024 * 1024, ge=0)
