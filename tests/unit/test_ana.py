@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from typing import Any
 
+import anyio
 import pyarrow as pa
 import pytest
 from fastapi.testclient import TestClient
@@ -14,6 +17,7 @@ from neo4j import GraphDatabase  # noqa: E402
 from grapharrow.ana.sessions import SessionNotFound
 from grapharrow.app import GraphArrowApplication, build_application  # noqa: E402
 from grapharrow.config import GraphArrowSettings  # noqa: E402
+from grapharrow.interfaces.ana import _TOOL_RESPONSE
 from grapharrow.interfaces.rest import create_rest_app  # noqa: E402
 from grapharrow.use_cases.ana import (  # noqa: E402
     GraphArrowAgentBackend,
@@ -456,6 +460,59 @@ def test_short_handles_resolve_only_with_their_session_context(http_app: Any) ->
             ).status_code
             == 400
         )
+
+
+@pytest.mark.parametrize("phase", ["discovery", "tool", "response"])
+def test_ana_liveness_stays_available_with_the_worker_busy(
+    http_app: Any, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    started, resume = Event(), Event()
+
+    def pause(original: Any) -> Any:
+        def blocked(*args: Any, **kwargs: Any) -> Any:
+            started.set()
+            assert resume.wait(timeout=10)
+            return original(*args, **kwargs)
+
+        return blocked
+
+    async def limit_worker_threads() -> None:
+        anyio.to_thread.current_default_thread_limiter().total_tokens = 1
+
+    with TestClient(http_app) as client, ThreadPoolExecutor(max_workers=2) as pool:
+        assert client.portal is not None
+        client.portal.call(limit_worker_threads)
+        if phase == "discovery":
+            monkeypatch.setattr(
+                GraphArrowAgentBackend,
+                "_discover_schema",
+                pause(GraphArrowAgentBackend._discover_schema),
+            )
+            pending = pool.submit(
+                client.post, "/sessions", headers={"Authorization": "Bearer " + "a" * 32}
+            )
+        else:
+            headers = _session(client)
+            if phase == "tool":
+                monkeypatch.setattr(
+                    GraphArrowAgentBackend, "call", pause(GraphArrowAgentBackend.call)
+                )
+            else:
+                monkeypatch.setattr(_TOOL_RESPONSE, "dump_json", pause(_TOOL_RESPONSE.dump_json))
+            pending = pool.submit(
+                client.post,
+                "/tools/call",
+                headers=headers,
+                json={"tool": "count_nodes", "args": {"label": "Device"}},
+            )
+        try:
+            assert started.wait(timeout=5)
+            health = pool.submit(client.get, "/health").result(timeout=3)
+            assert health.json() == {"status": "ok"}
+            assert not pending.done()
+        finally:
+            resume.set()
+        assert pending.result(timeout=5).status_code == (201 if phase == "discovery" else 200)
 
 
 def test_http_paginated_workflow_and_rest_coexist(http_app: Any) -> None:

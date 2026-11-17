@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter
 from starlette.concurrency import run_in_threadpool
 
 from grapharrow.ana.auth import (
@@ -23,6 +23,8 @@ from grapharrow.ana.sessions import (
 from grapharrow.app import GraphArrowApplication
 from grapharrow.use_cases.ana import SUPPORTED_ANA_TOOLS, GraphArrowAgentBackend
 from grapharrow.use_cases.ana_resources import AnaQuotaExceeded, AnaResourceBudget
+
+_TOOL_RESPONSE = TypeAdapter(dict[str, Any])
 
 
 class ToolCallRequest(BaseModel):
@@ -87,7 +89,7 @@ def install_ana_routes(app: FastAPI, application: GraphArrowApplication) -> None
     callable_names = {spec["function"]["name"] for spec in specs(True)}
 
     @router.get("/health")
-    def health() -> dict[str, str]:
+    async def health() -> dict[str, str]:
         return {"status": "ok"}
 
     @router.get("/tools")
@@ -133,13 +135,12 @@ def install_ana_routes(app: FastAPI, application: GraphArrowApplication) -> None
         response.headers["X-ANA-Session"] = token
         return {"session_id": token, "idle_timeout_s": config.idle_timeout_s}
 
-    @router.post("/tools/call")
+    @router.post("/tools/call", response_model=dict[str, Any])
     def call_tool(
         request: ToolCallRequest,
-        response: Response,
         principal: Annotated[Principal, Depends(authenticate)],
         session_id: str | None = Header(default=None, alias="X-ANA-Session"),
-    ) -> dict[str, Any]:
+    ) -> Response:
         if not session_id:
             raise HTTPException(status_code=401, detail="X-ANA-Session is required")
         if request.tool not in callable_names or not permitted(principal, request.tool):
@@ -162,9 +163,14 @@ def install_ana_routes(app: FastAPI, application: GraphArrowApplication) -> None
                 detail=str(exc),
                 headers={"X-ANA-Session": session_id, "Cache-Control": "no-store"},
             ) from exc
-        response.headers["X-ANA-Session"] = session_id
-        response.headers["Cache-Control"] = "no-store"
-        return {"tool": request.tool, "result": result}
+        # Encode large result pages in the same worker as tool execution.
+        return Response(
+            content=_TOOL_RESPONSE.dump_json(
+                {"tool": request.tool, "result": result}, by_alias=True
+            ),
+            media_type="application/json",
+            headers={"X-ANA-Session": session_id, "Cache-Control": "no-store"},
+        )
 
     @router.delete("/sessions/current", status_code=204)
     def delete_session(

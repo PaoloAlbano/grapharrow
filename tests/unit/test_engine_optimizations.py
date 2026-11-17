@@ -1,6 +1,7 @@
 """Guard optimized reads, bounded execution, and immutable file reuse."""
 
 import gc
+import json
 import random
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -16,6 +17,7 @@ from grapharrow.adapters.property_index import PropertyIndexStore
 from grapharrow.adapters.query_cache import CypherParseCache
 from grapharrow.app import build_application
 from grapharrow.core.errors import QueryError
+from grapharrow.domain import DatasetFile
 from grapharrow.repositories.graph import NodeRecord, _node_property_table
 from grapharrow.use_cases.ana import GraphArrowAgentBackend
 from grapharrow.use_cases.ana_patterns import aggregate_rows, finish_pattern
@@ -217,7 +219,6 @@ def test_declared_index_shared_by_ana_cypher_and_new_snapshots(tmp_path: Path) -
 
 
 def test_index_bounds_eviction_types_and_oversized_fallback() -> None:
-    from grapharrow.domain import DatasetFile
 
     files = (
         DatasetFile(
@@ -271,6 +272,90 @@ def test_publication_reuses_unaffected_files_and_vacuum_keeps_them(tmp_path: Pat
     compacted = reopened.use_cases.admin.compact()
     assert compacted.edges != after.edges
     assert reopened.use_cases.admin.verify(verify_checksums=True).ok
+
+
+def test_persisted_adjacency_order_and_reuse(tmp_path: Path) -> None:
+    root = tmp_path / "typed-adjacency"
+    app = build_application(root)
+    graph = app.use_cases.graph
+    _, nodes = graph.create_nodes_bulk(
+        table=pa.table({"name": ["A", "B", "C"]}), default_labels=("Person",)
+    )
+    a, b, c = (node.node_id for node in nodes)
+    _, edges = graph.create_edges_bulk(
+        table=pa.table(
+            {
+                "src_id": [c, b, b, b, b, a],
+                "dst_id": [b, a, c, b, c, c],
+                "rel_type": ["R", "S", "R", "R", "R", "R"],
+            }
+        )
+    )
+    initial = app.repositories.snapshot.load_manifest()
+
+    def by_type(files: tuple[DatasetFile, ...]) -> dict[str, DatasetFile]:
+        return {Path(file.path).parent.name: file for file in files}
+
+    checks = (
+        (initial.adjacency_by_source, [5, 3, 2, 4, 0], a, c),
+        (initial.adjacency_by_dest, [3, 0, 5, 2, 4], b, c),
+    )
+    for files, order, low, high in checks:
+        assert [Path(file.path).parent.name for file in files] == ["R", "S"]
+        file = by_type(files)["R"]
+        table = app.adapters.parquet.read_table(root / file.path)
+        assert table.column_names == ["src_id", "dst_id", "edge_id"]
+        assert table.to_pylist() == [
+            {"src_id": edges[i].src_id, "dst_id": edges[i].dst_id, "edge_id": edges[i].edge_id}
+            for i in order
+        ]
+        assert (file.min_key, file.max_key, file.row_count) == (low, high, len(order))
+
+    graph.create_edge(src_id=a, dst_id=a, rel_type="R", properties={})
+    appended = app.repositories.snapshot.load_manifest()
+    for old_files, new_files in (
+        (initial.adjacency_by_source, appended.adjacency_by_source),
+        (initial.adjacency_by_dest, appended.adjacency_by_dest),
+    ):
+        assert by_type(new_files)["S"] == by_type(old_files)["S"]
+        new_r = by_type(new_files)["R"]
+        table = app.adapters.parquet.read_table(root / new_r.path)
+        assert table["edge_id"][0].as_py() > edges[-1].edge_id
+        assert new_r.row_count == 6
+
+    graph.delete_entities_batch(node_ids=(), edge_ids=(edges[1].edge_id,))
+    deleted = app.repositories.snapshot.load_manifest()
+    assert deleted.adjacency_by_source == (by_type(appended.adjacency_by_source)["R"],)
+    assert deleted.adjacency_by_dest == (by_type(appended.adjacency_by_dest)["R"],)
+    app.use_cases.admin.vacuum()
+    assert app.use_cases.admin.verify(verify_checksums=True).ok
+
+
+def test_persisted_adjacency_backfills_legacy_snapshot_with_unchanged_edges(tmp_path: Path) -> None:
+    root = tmp_path / "legacy-adjacency"
+    app = load_grapharrow(root)
+    initial = app.repositories.snapshot.load_manifest()
+    path = root / app.repositories.snapshot.load_current_pointer().manifest_path
+    payload = json.loads(path.read_bytes())
+    payload["files"].pop("adjacency_by_dest")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    app.use_cases.graph.create_node(labels=("Other",), properties={})
+    rebuilt = app.repositories.snapshot.load_manifest()
+    assert rebuilt.edges == initial.edges
+    assert rebuilt.adjacency_by_source == initial.adjacency_by_source
+    for old, new in zip(initial.adjacency_by_dest, rebuilt.adjacency_by_dest, strict=True):
+        assert old.path != new.path
+        assert (old.row_count, old.min_key, old.max_key) == (
+            new.row_count,
+            new.min_key,
+            new.max_key,
+        )
+        assert app.adapters.parquet.read_table(root / new.path).equals(
+            app.adapters.parquet.read_table(root / old.path), check_metadata=True
+        )
+    app.use_cases.admin.vacuum()
+    assert app.use_cases.admin.verify(verify_checksums=True).ok
 
 
 @pytest.mark.parametrize(
@@ -361,8 +446,6 @@ def test_property_updates_keep_topology_and_label_files(tmp_path: Path) -> None:
 
 
 def test_oversized_index_is_not_rebuilt_on_every_query() -> None:
-    from grapharrow.domain import DatasetFile
-
     files = (
         DatasetFile(
             path="derived/node_properties/Item/one.parquet", kind="node_properties", row_count=100

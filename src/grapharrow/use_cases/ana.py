@@ -20,8 +20,8 @@ from grapharrow.ana.values import _int_arg, _primary_label
 from grapharrow.ana.values import equal as _property_equal
 from grapharrow.app import GraphArrowApplication
 from grapharrow.core import property_codec
-from grapharrow.core.temporal import Duration, Instant
 from grapharrow.use_cases import ana_patterns, ana_roles, ana_search
+from grapharrow.use_cases.ana_edge_statistics import schema_property_type as _property_type
 from grapharrow.use_cases.ana_node_lookup import AnaNodeLookup
 from grapharrow.use_cases.ana_read_cache import AnaReadCache
 from grapharrow.use_cases.ana_resources import AnaLimits, AnaResourceBudget, AnaResources
@@ -581,80 +581,114 @@ class GraphArrowAgentBackend(AnaRuntime):
                 break
         return samples
 
-    def _discover_schema(self) -> dict[str, Any]:
+    def _discover_schema(
+        self, node_properties: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
+        nodes = self._state.node_table
+        node_labels = None
+        if node_properties is None:
+            node_labels = nodes["labels"].to_pylist()
+            node_properties = self._discover_node_properties(node_labels)
+
+        edges = self._state.edge_table
+        patterns = _arrow_label_relationships(nodes, edges)
+        if patterns is None:
+            if node_labels is None:
+                node_labels = nodes["labels"].to_pylist()
+            labels_by_id = dict(zip(nodes["node_id"].to_pylist(), node_labels, strict=True))
+            patterns = _python_label_relationships(
+                labels_by_id, edges["rel_type"].to_pylist(), edges
+            )
+
+        relationship_types, relationship_properties = (
+            self._application._ana_schema_cache.edge_statistics.discover(edges)
+        )
+        return {
+            "labels": sorted(self._label_ids),
+            "relationship_types": relationship_types,
+            "node_properties": node_properties,
+            "relationship_properties": relationship_properties,
+            "label_relationships": [
+                {"source_label": src, "relationship_type": rel, "target_label": dst}
+                for src, rel, dst in patterns
+            ],
+        }
+
+    def _discover_node_properties(self, node_labels: list[list[str]]) -> list[dict[str, Any]]:
         node_props: dict[tuple[str, str], set[str]] = defaultdict(set)
-        edge_props: dict[tuple[str, str], set[str]] = defaultdict(set)
         node_values: dict[tuple[str, str], int] = defaultdict(int)
-        edge_values: dict[tuple[str, str], int] = defaultdict(int)
-        relationship_counts: dict[str, int] = defaultdict(int)
-        patterns = set()
-        labels_by_id = {}
-        for node_id, labels, raw in zip(
-            self._state.node_table["node_id"].to_pylist(),
-            self._state.node_table["labels"].to_pylist(),
-            self._state.node_table["properties_json"].to_pylist(),
-            strict=True,
+        for labels, raw in zip(
+            node_labels, self._state.node_table["properties_json"].to_pylist(), strict=True
         ):
-            labels_by_id[node_id] = labels
             if raw == "{}":
                 continue
-            for prop, value in property_codec.loads(raw).items():
+            for prop, value in property_codec.loads_for_schema(raw).items():
                 property_type = _property_type(value)
                 for label in labels:
                     node_props[label, prop].add(property_type)
                     if value is not None:
                         node_values[label, prop] += 1
-        edges = self._state.edge_table
-        for rel, source, target, raw in zip(
-            edges["rel_type"].to_pylist(),
-            edges["src_id"].to_pylist(),
-            edges["dst_id"].to_pylist(),
-            edges["properties_json"].to_pylist(),
+        return [
+            {
+                "nodeLabels": [label],
+                "propertyName": prop,
+                "propertyTypes": sorted(types),
+                "mandatory": node_values[label, prop] == len(self._label_ids[label]),
+            }
+            for (label, prop), types in sorted(node_props.items())
+        ]
+
+
+def _arrow_label_relationships(
+    nodes: pa.Table, edges: pa.Table
+) -> list[tuple[str, str, str]] | None:
+    """Find distinct directed label triples for nodes with at most one label."""
+    if not edges.num_rows:
+        return []
+    node_labels = nodes["labels"]
+    lengths = pc.list_value_length(node_labels)
+    if pc.any(pc.greater(lengths, 1)).as_py():
+        return None
+
+    labeled = pc.equal(lengths, 1)
+    ids = nodes["node_id"].filter(labeled)
+    if not len(ids):
+        return []
+    labels = pc.list_flatten(node_labels.filter(labeled))
+    distinct_labels = pc.unique(labels)
+    if len(distinct_labels) == 1:
+        label = distinct_labels[0].as_py()
+        # Require both endpoints to belong to labeled nodes.
+        known = pc.and_(
+            pc.is_in(edges["src_id"], value_set=ids),
+            pc.is_in(edges["dst_id"], value_set=ids),
+        )
+        rel_types = pc.unique(edges["rel_type"].filter(known)).to_pylist()
+        return [(label, rel, label) for rel in sorted(rel_types)]
+
+    sources = pc.take(labels, pc.index_in(edges["src_id"], value_set=ids))
+    targets = pc.take(labels, pc.index_in(edges["dst_id"], value_set=ids))
+    triples = pa.table({"src": sources, "rel": edges["rel_type"], "dst": targets})
+    triples = triples.filter(pc.and_(pc.is_valid(sources), pc.is_valid(targets)))
+    unique = triples.group_by(["src", "rel", "dst"]).aggregate([])
+    return sorted(
+        zip(
+            unique["src"].to_pylist(),
+            unique["rel"].to_pylist(),
+            unique["dst"].to_pylist(),
             strict=True,
-        ):
-            relationship_counts[rel] += 1
-            if raw != "{}":
-                for prop, value in property_codec.loads(raw).items():
-                    edge_props[rel, prop].add(_property_type(value))
-                    if value is not None:
-                        edge_values[rel, prop] += 1
-            for src in labels_by_id.get(source, []):
-                for dst in labels_by_id.get(target, []):
-                    patterns.add((src, rel, dst))
-        return {
-            "labels": sorted(self._label_ids),
-            "relationship_types": sorted(relationship_counts),
-            "node_properties": [
-                {
-                    "nodeLabels": [label],
-                    "propertyName": prop,
-                    "propertyTypes": sorted(types),
-                    "mandatory": node_values[label, prop] == len(self._label_ids[label]),
-                }
-                for (label, prop), types in sorted(node_props.items())
-            ],
-            "relationship_properties": [
-                {
-                    "relType": rel,
-                    "propertyName": prop,
-                    "propertyTypes": sorted(types),
-                    "mandatory": edge_values[rel, prop] == relationship_counts[rel],
-                }
-                for (rel, prop), types in sorted(edge_props.items())
-            ],
-            "label_relationships": [
-                {"source_label": src, "relationship_type": rel, "target_label": dst}
-                for src, rel, dst in sorted(patterns)
-            ],
-        }
+        )
+    )
 
 
-def _property_type(value: Any) -> str:
-    if isinstance(value, Instant):
-        return value.type_name
-    if isinstance(value, Duration):
-        return "Duration"
-    if isinstance(value, list):
-        element = _property_type(next((item for item in value if item is not None), None))
-        return f"List<{element}>"
-    return {bool: "Boolean", int: "Integer", float: "Float", str: "String"}.get(type(value), "Any")
+def _python_label_relationships(
+    labels_by_id: Mapping[int, list[str]], rel_types: list[str], edges: pa.Table
+) -> list[tuple[str, str, str]]:
+    patterns = set()
+    for rel, source, target in zip(
+        rel_types, edges["src_id"].to_pylist(), edges["dst_id"].to_pylist(), strict=True
+    ):
+        for src in labels_by_id.get(source, ()):
+            for dst in labels_by_id.get(target, ()):
+                patterns.add((src, rel, dst))
+    return sorted(patterns)

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import cast
 
 import pyarrow as pa  # type: ignore[import-untyped]
+import pyarrow.compute as pc  # type: ignore[import-untyped]
 
 from grapharrow.adapters import FileSystemAdapter, ParquetAdapter, PyArrowTabularAdapter
 from grapharrow.core import DatabaseLayout, Location, property_codec
@@ -343,8 +344,10 @@ class GraphRepository:
         if not same_nodes:
             self._parquet.write_table(_nodes_table(nodes), staged_nodes_path)
             self._filesystem.copy_file(staged_nodes_path, final_nodes_path)
+        edge_table = None
         if not same_edges:
-            self._parquet.write_table(_edges_table(edges), staged_edges_path)
+            edge_table = _edges_table(edges)
+            self._parquet.write_table(edge_table, staged_edges_path)
             self._filesystem.copy_file(staged_edges_path, final_edges_path)
         node_groups = _unchanged_node_groups(previous_nodes, nodes)
         edge_groups = _unchanged_edge_groups(previous_edges, edges)
@@ -365,22 +368,12 @@ class GraphRepository:
             reuse_files=previous_snapshot.node_properties if previous_snapshot is not None else (),
             unchanged=node_groups,
         )
-        adjacency_files = self._persist_adjacency_by_source(
+        adjacency_files, adjacency_by_dest_files = self._persist_adjacency(
             snapshot_id=snapshot_id,
-            edges=edges,
+            relationship_types={edge.rel_type for edge in edges},
+            edge_table=edge_table,
             staged_dir=staged_dir,
-            reuse_files=previous_snapshot.adjacency_by_source
-            if previous_snapshot is not None
-            else (),
-            unchanged=topology_groups,
-        )
-        adjacency_by_dest_files = self._persist_adjacency_by_dest(
-            snapshot_id=snapshot_id,
-            edges=edges,
-            staged_dir=staged_dir,
-            reuse_files=previous_snapshot.adjacency_by_dest
-            if previous_snapshot is not None
-            else (),
+            previous_snapshot=previous_snapshot,
             unchanged=topology_groups,
         )
         edge_property_files = self._persist_edge_property_tables(
@@ -508,127 +501,94 @@ class GraphRepository:
             )
         return tuple(dataset_files)
 
-    def _persist_adjacency_by_source(
+    def _persist_adjacency(
         self,
         *,
         snapshot_id: SnapshotId,
-        edges: list[EdgeRecord],
+        relationship_types: set[str],
+        edge_table: pa.Table | None,
         staged_dir: Location,
-        reuse_files: tuple[DatasetFile, ...] = (),
-        unchanged: set[str] | None = None,
-    ) -> tuple[DatasetFile, ...]:
-        """Write one adjacency-by-source dataset per relationship type for typed traversals."""
-        dataset_files: list[DatasetFile] = []
-        by_type: dict[str, list[EdgeRecord]] = {}
-        for edge in edges:
-            by_type.setdefault(edge.rel_type, []).append(edge)
+        previous_snapshot: SnapshotManifest | None,
+        unchanged: set[str],
+    ) -> tuple[tuple[DatasetFile, ...], tuple[DatasetFile, ...]]:
+        """Reuse intact indexes and build missing directions from canonical Arrow data."""
+        by_source: dict[str, list[DatasetFile]] = {}
+        by_dest: dict[str, list[DatasetFile]] = {}
+        if previous_snapshot is not None:
+            for files, grouped in (
+                (previous_snapshot.adjacency_by_source, by_source),
+                (previous_snapshot.adjacency_by_dest, by_dest),
+            ):
+                for dataset in files:
+                    rel_type = Path(dataset.path).parent.name
+                    if rel_type in unchanged:
+                        grouped.setdefault(rel_type, []).append(dataset)
 
-        for rel_type, typed_edges in sorted(by_type.items()):
-            reused = tuple(item for item in reuse_files if Path(item.path).parent.name == rel_type)
-            if unchanged is not None and rel_type in unchanged and reused:
-                dataset_files.extend(reused)
-                continue
-            final_path = self._join(
-                self._layout.adjacency_by_source_dir,
-                rel_type,
-                f"snapshot-{snapshot_id.value:06d}.parquet",
-            )
-            staged_path = self._join(
-                staged_dir,
-                "derived",
-                "adjacency",
-                "by_source",
-                rel_type,
-                f"snapshot-{snapshot_id.value:06d}.parquet",
-            )
-            self._filesystem.create_dir(self._parent(staged_path))
-            self._filesystem.create_dir(self._parent(final_path))
-            sorted_edges = sorted(
-                typed_edges,
-                key=lambda item: (item.src_id, item.dst_id, item.edge_id),
-            )
-            table = pa.Table.from_pylist(
-                [
-                    {"src_id": edge.src_id, "dst_id": edge.dst_id, "edge_id": edge.edge_id}
-                    for edge in sorted_edges
-                ],
-                schema=ADJACENCY_BY_SOURCE_SCHEMA,
-            )
-            self._parquet.write_table(table, staged_path)
-            self._filesystem.copy_file(staged_path, final_path)
-            dataset_files.append(
-                _dataset_file_for(
-                    path=final_path,
-                    layout=self._layout,
-                    filesystem=self._filesystem,
-                    kind="adjacency_by_source",
-                    row_count=len(sorted_edges),
-                    min_key=min((edge.src_id for edge in sorted_edges), default=None),
-                    max_key=max((edge.src_id for edge in sorted_edges), default=None),
-                )
-            )
-        return tuple(dataset_files)
+        missing = relationship_types - (by_source.keys() & by_dest.keys())
+        if missing:
+            if edge_table is None:
+                # Older manifests may lack a direction even when canonical edges are unchanged.
+                assert previous_snapshot is not None
+                edge_table = self.load_edge_table(previous_snapshot.edges)
+            if missing != relationship_types:
+                edge_table = edge_table.select(
+                    [*ADJACENCY_BY_SOURCE_SCHEMA.names, "rel_type"]
+                ).filter(pc.is_in(edge_table["rel_type"], value_set=pa.array(list(missing))))
+            for rel_type, endpoints in _adjacency_rows_by_type(edge_table, missing):
+                if rel_type not in by_source:
+                    by_source[rel_type] = [
+                        self._write_adjacency(
+                            endpoints, rel_type, snapshot_id, staged_dir, by_source=True
+                        )
+                    ]
+                if rel_type not in by_dest:
+                    by_dest[rel_type] = [
+                        self._write_adjacency(
+                            endpoints, rel_type, snapshot_id, staged_dir, by_source=False
+                        )
+                    ]
+        ordered_types = sorted(relationship_types)
+        return (
+            tuple(dataset for rel_type in ordered_types for dataset in by_source[rel_type]),
+            tuple(dataset for rel_type in ordered_types for dataset in by_dest[rel_type]),
+        )
 
-    def _persist_adjacency_by_dest(
+    def _write_adjacency(
         self,
-        *,
+        endpoints: pa.Table,
+        rel_type: str,
         snapshot_id: SnapshotId,
-        edges: list[EdgeRecord],
         staged_dir: Location,
-        reuse_files: tuple[DatasetFile, ...] = (),
-        unchanged: set[str] | None = None,
-    ) -> tuple[DatasetFile, ...]:
-        """Write one adjacency-by-destination dataset per relationship type."""
-        dataset_files: list[DatasetFile] = []
-        by_type: dict[str, list[EdgeRecord]] = {}
-        for edge in edges:
-            by_type.setdefault(edge.rel_type, []).append(edge)
-
-        for rel_type, typed_edges in sorted(by_type.items()):
-            reused = tuple(item for item in reuse_files if Path(item.path).parent.name == rel_type)
-            if unchanged is not None and rel_type in unchanged and reused:
-                dataset_files.extend(reused)
-                continue
-            final_path = self._join(
-                self._layout.adjacency_by_dest_dir,
-                rel_type,
-                f"snapshot-{snapshot_id.value:06d}.parquet",
-            )
-            staged_path = self._join(
-                staged_dir,
-                "derived",
-                "adjacency",
-                "by_dest",
-                rel_type,
-                f"snapshot-{snapshot_id.value:06d}.parquet",
-            )
-            self._filesystem.create_dir(self._parent(staged_path))
-            self._filesystem.create_dir(self._parent(final_path))
-            sorted_edges = sorted(
-                typed_edges,
-                key=lambda item: (item.dst_id, item.src_id, item.edge_id),
-            )
-            table = pa.Table.from_pylist(
-                [
-                    {"src_id": edge.src_id, "dst_id": edge.dst_id, "edge_id": edge.edge_id}
-                    for edge in sorted_edges
-                ],
-                schema=ADJACENCY_BY_SOURCE_SCHEMA,
-            )
-            self._parquet.write_table(table, staged_path)
-            self._filesystem.copy_file(staged_path, final_path)
-            dataset_files.append(
-                _dataset_file_for(
-                    path=final_path,
-                    layout=self._layout,
-                    filesystem=self._filesystem,
-                    kind="adjacency_by_dest",
-                    row_count=len(sorted_edges),
-                    min_key=min((edge.dst_id for edge in sorted_edges), default=None),
-                    max_key=max((edge.dst_id for edge in sorted_edges), default=None),
-                )
-            )
-        return tuple(dataset_files)
+        *,
+        by_source: bool,
+    ) -> DatasetFile:
+        primary, secondary = ("src_id", "dst_id") if by_source else ("dst_id", "src_id")
+        direction = "by_source" if by_source else "by_dest"
+        final_dir = (
+            self._layout.adjacency_by_source_dir
+            if by_source
+            else self._layout.adjacency_by_dest_dir
+        )
+        filename = f"snapshot-{snapshot_id.value:06d}.parquet"
+        final_path = self._join(final_dir, rel_type, filename)
+        staged_path = self._join(staged_dir, "derived", "adjacency", direction, rel_type, filename)
+        self._filesystem.create_dir(self._parent(staged_path))
+        self._filesystem.create_dir(self._parent(final_path))
+        table = endpoints.sort_by(
+            [(primary, "ascending"), (secondary, "ascending"), ("edge_id", "ascending")]
+        )
+        self._parquet.write_table(table, staged_path)
+        self._filesystem.copy_file(staged_path, final_path)
+        keys = table[primary]
+        return _dataset_file_for(
+            path=final_path,
+            layout=self._layout,
+            filesystem=self._filesystem,
+            kind="adjacency_by_source" if by_source else "adjacency_by_dest",
+            row_count=table.num_rows,
+            min_key=keys[0].as_py(),
+            max_key=keys[-1].as_py(),
+        )
 
     def _persist_node_property_tables(
         self,
@@ -785,6 +745,26 @@ def _unchanged_topology_groups(
     for edge in current:
         after.setdefault(edge.rel_type, []).append((edge.edge_id, edge.src_id, edge.dst_id))
     return {kind for kind, records in after.items() if before.get(kind) == records}
+
+
+def _adjacency_rows_by_type(
+    edges: pa.Table, relationship_types: set[str]
+) -> Generator[tuple[str, pa.Table], None, None]:
+    """Group topology columns once so both directions can sort the same rows."""
+    columns = ADJACENCY_BY_SOURCE_SCHEMA.names
+    if len(relationship_types) == 1:
+        yield next(iter(relationship_types)), edges.select(columns)
+        return
+    rows = edges.select([*columns, "rel_type"]).sort_by([("rel_type", "ascending")])
+    kinds = rows["rel_type"]
+    boundaries = pc.indices_nonzero(
+        pc.not_equal(kinds.slice(0, len(kinds) - 1), kinds.slice(1))
+    ).to_pylist()
+    endpoints = rows.select(columns)
+    start = 0
+    for stop in [*(index + 1 for index in boundaries), rows.num_rows]:
+        yield kinds[start].as_py(), endpoints.slice(start, stop - start)
+        start = stop
 
 
 def _nodes_table(records: list[NodeRecord]) -> pa.Table:

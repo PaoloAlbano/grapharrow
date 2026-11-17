@@ -148,7 +148,10 @@ def build_application(
         adapters=adapters,
         repositories=repositories,
         use_cases=use_cases,
-        _ana_schema_cache=SnapshotSchemaCache(disk=schema_cache_disk),
+        _ana_schema_cache=SnapshotSchemaCache(
+            disk=schema_cache_disk,
+            edge_stats_max_bytes=resolved_settings.ana_edge_schema_cache_max_bytes,
+        ),
     )
 
 

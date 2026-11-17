@@ -13,10 +13,11 @@ from typing import Any
 from weakref import WeakValueDictionary
 
 from grapharrow.adapters.filesystem import FileSystemAdapter
-from grapharrow.domain import SnapshotManifest
+from grapharrow.domain import DatasetFile, SnapshotManifest
+from grapharrow.use_cases.ana_edge_statistics import EdgePropertyStatisticsCache
 
 # Bump this when the format or meaning of the observed schema changes.
-_FORMAT_VERSION = 1
+_FORMAT_VERSION = 2
 _SCHEMA_FIELDS = {
     "labels",
     "relationship_types",
@@ -28,6 +29,15 @@ _SCHEMA_FIELDS = {
 
 def _digest(value: object) -> str:
     return sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _files_key(files: tuple[DatasetFile, ...]) -> str:
+    return _digest(
+        [
+            (file.kind, file.path, file.row_count, file.checksum_algorithm, file.checksum)
+            for file in files
+        ]
+    )
 
 
 def _compact_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -57,13 +67,22 @@ class SnapshotSchema:
 class SnapshotSchemaCache:
     """Keep weak entries in memory and optionally persist one entry per local database."""
 
-    def __init__(self, disk: tuple[Path, FileSystemAdapter] | None = None) -> None:
+    def __init__(
+        self,
+        disk: tuple[Path, FileSystemAdapter] | None = None,
+        *,
+        edge_stats_max_bytes: int = 0,
+    ) -> None:
         self._disk = disk
+        edge_disk = (disk[0].with_name("ana-edge-schema.json"), disk[1]) if disk else None
+        self.edge_statistics = EdgePropertyStatisticsCache(edge_disk, edge_stats_max_bytes)
         self._entries: WeakValueDictionary[SnapshotManifest, SnapshotSchema] = WeakValueDictionary()
         self._lock = Lock()
 
     def get_or_create(
-        self, snapshot: SnapshotManifest, discover: Callable[[], dict[str, Any]]
+        self,
+        snapshot: SnapshotManifest,
+        discover: Callable[[list[dict[str, Any]] | None], dict[str, Any]],
     ) -> SnapshotSchema:
         with self._lock:
             entry = self._entries.get(snapshot)
@@ -74,37 +93,42 @@ class SnapshotSchemaCache:
             return entry
 
     def _load(
-        self, snapshot: SnapshotManifest, discover: Callable[[], dict[str, Any]]
+        self,
+        snapshot: SnapshotManifest,
+        discover: Callable[[list[dict[str, Any]] | None], dict[str, Any]],
     ) -> dict[str, Any]:
         if self._disk is None:
-            return discover()
-        files = (*snapshot.nodes, *snapshot.edges)
-        if any(not file.checksum or not file.checksum_algorithm for file in files):
-            return discover()
-        key = _digest(
-            [
-                (file.kind, file.path, file.row_count, file.checksum_algorithm, file.checksum)
-                for file in files
-            ]
-        )
+            return discover(None)
+        if any(
+            not file.checksum or not file.checksum_algorithm
+            for file in (*snapshot.nodes, *snapshot.edges)
+        ):
+            return discover(None)
+        nodes_key = _files_key(snapshot.nodes)
+        edges_key = _files_key(snapshot.edges)
         path, filesystem = self._disk
+        node_properties = None
         with suppress(OSError, ValueError, RecursionError):
             cached = filesystem.read_json(path)
             if (
                 isinstance(cached, dict)
                 and cached.get("version") == _FORMAT_VERSION
-                and cached.get("key") == key
+                and cached.get("nodes_key") == nodes_key
             ):
                 schema = cached.get("schema")
+                cached_edges_key = cached.get("edges_key")
                 if (
                     isinstance(schema, dict)
                     and schema.keys() == _SCHEMA_FIELDS
                     and all(isinstance(value, list) for value in schema.values())
-                    and cached.get("checksum") == _digest(schema)
+                    and isinstance(cached_edges_key, str)
+                    and cached.get("checksum") == _digest((nodes_key, cached_edges_key, schema))
                 ):
-                    return schema
+                    if cached_edges_key == edges_key:
+                        return schema
+                    node_properties = schema["node_properties"]
 
-        schema = discover()
+        schema = discover(node_properties)
         # Independent readers can replace this file concurrently. Every cache hit
         # verifies its key, even when an older workflow was the last to write.
         with suppress(OSError, ValueError):
@@ -112,9 +136,10 @@ class SnapshotSchemaCache:
                 path,
                 {
                     "version": _FORMAT_VERSION,
-                    "key": key,
+                    "nodes_key": nodes_key,
+                    "edges_key": edges_key,
                     "schema": schema,
-                    "checksum": _digest(schema),
+                    "checksum": _digest((nodes_key, edges_key, schema)),
                 },
             )
         return schema

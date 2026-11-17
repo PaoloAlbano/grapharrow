@@ -63,7 +63,8 @@ Use `--no-ana` or `GRAPHARROW_ANA_ENABLED=false` to disable the interface.
 | `GRAPHARROW_ANA_MAX_ROWS_PER_SESSION` | `100000` | Sum of rows retained across workflow handles |
 | `GRAPHARROW_ANA_MAX_BYTES_PER_SESSION` | `67108864` | Accounted snapshot, handle, lineage and page bytes (64 MiB) |
 | `GRAPHARROW_ANA_MAX_TOTAL_BYTES` | `536870912` | Shared accounted bytes for the HTTP application (512 MiB) |
-| `GRAPHARROW_ANA_PERSISTENT_SCHEMA_CACHE_ENABLED` | `true` | Reuse a schema cache file on native local storage |
+| `GRAPHARROW_ANA_PERSISTENT_SCHEMA_CACHE_ENABLED` | `true` | Reuse schema cache files on native local storage |
+| `GRAPHARROW_ANA_EDGE_SCHEMA_CACHE_MAX_BYTES` | `1048576` | Budget for the relationship statistics cache (1 MiB, `0` disables it) |
 | `GRAPHARROW_SNAPSHOT_TABLE_CACHE_MAX_BYTES` | `67108864` | Per-application budget for shared Arrow tables used by ANA and Cypher (64 MiB, `0` disables sharing) |
 | `GRAPHARROW_ANA_READ_CACHE_ENABLED` | `false` | Enable workflow-local candidate caching for `entity_resolve` and `value_search` |
 | `GRAPHARROW_ANA_READ_CACHE_MAX_BYTES_PER_SESSION` | `4194304` | Reserved read-cache capacity inside workflow and server byte quotas (4 MiB, minimum 1024 bytes) |
@@ -184,6 +185,10 @@ A workflow holds the tables until it closes. The backend reads a private copy
 when a table exceeds the available cache budget. Handle composition operates
 on materialized Python rows.
 
+HTTP workflow setup, tool execution and tool result encoding run in worker
+threads. The lightweight `/health` endpoint runs on the event loop and can
+respond while the worker pool is busy.
+
 Workflows reading the same immutable node files also share the node ID and
 label lookup structures, including their byte estimate. The backend builds
 them after releasing the database coordinator. Closing the last workflow
@@ -200,11 +205,22 @@ under the database coordinator before discovering or reusing the schema.
 Native local databases also reuse the observed schema across workflow and process
 restarts. Workflow setup checks one atomically replaced file at
 `.grapharrow-cache/ana-schema.json` against the pinned manifest's canonical node
-and edge file identities. A missing, unreadable, corrupt or stale file triggers
-schema discovery. Cache writes occur outside the database coordinator and the
-snapshot commit. The file can be deleted at any time. Remote storage uses the
-in-memory cache. Set `GRAPHARROW_ANA_PERSISTENT_SCHEMA_CACHE_ENABLED=false` before
-opening the database to skip the cache file.
+and edge file identities. When only the edge files change, ANA reuses verified
+node property statistics. A second file, `.grapharrow-cache/ana-edge-schema.json`,
+stores relationship property statistics in stable ranges of 4096 edge IDs.
+Discovery checks each range against canonical edge data and decodes properties
+for ranges without matching statistics. It derives directed label relationships
+from the pinned snapshot in Arrow for graphs with at most one label per node,
+and uses Python for multi-label graphs. When upgrading a database with a cached
+schema, the range cache is populated the next time discovery runs.
+
+Discovery recomputes unavailable statistics when either cache file is missing,
+unreadable, corrupt or unsupported, or when the relationship statistics file
+exceeds its budget. Cache writes occur outside the database coordinator and the
+snapshot commit. Both files can be deleted at any time. Remote storage uses
+the in-memory schema cache. Set
+`GRAPHARROW_ANA_PERSISTENT_SCHEMA_CACHE_ENABLED=false` before opening the
+database to disable both files.
 
 Quotas count retained state. Snapshot admission includes canonical Arrow tables,
 property projections, schema and lookup structures. Handle charges include rows,

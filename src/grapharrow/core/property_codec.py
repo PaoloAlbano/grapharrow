@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
+
+import orjson
 
 from grapharrow.core.temporal import Duration, Instant, TemporalResult
 
@@ -64,6 +66,30 @@ def loads(payload: str, *, public: bool = False) -> Any:
             parent = parent[part]
         parent[path[-1]] = temporal
     return value
+
+
+def loads_for_schema(payload: str) -> Any:
+    """Decode canonical property objects quickly while preserving observed types."""
+    if payload.startswith("{"):
+        try:
+            properties = orjson.loads(payload)
+            if not _has_ambiguous_float(properties.values()):
+                return properties
+        except (orjson.JSONDecodeError, RecursionError):
+            pass
+    return loads(payload)
+
+
+def _has_ambiguous_float(values: Iterable[Any]) -> bool:
+    # orjson can promote integers outside its native range to float.
+    for value in values:
+        if type(value) is float and abs(value) >= 2**63:
+            return True
+        if isinstance(value, list) and _has_ambiguous_float(value):
+            return True
+        if isinstance(value, dict) and _has_ambiguous_float(value.values()):
+            return True
+    return False
 
 
 class _TemporalProperty(Exception):
