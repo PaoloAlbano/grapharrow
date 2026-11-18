@@ -49,6 +49,7 @@ class SnapshotManifest:
     adjacency_by_source: tuple[DatasetFile, ...] = field(default_factory=tuple)
     adjacency_by_dest: tuple[DatasetFile, ...] = field(default_factory=tuple)
     edge_properties: tuple[DatasetFile, ...] = field(default_factory=tuple)
+    catalog_path: str | None = None
 
     @classmethod
     def empty(

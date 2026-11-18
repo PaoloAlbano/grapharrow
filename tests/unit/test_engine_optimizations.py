@@ -16,9 +16,10 @@ import pytest
 from grapharrow.adapters.property_index import PropertyIndexStore
 from grapharrow.adapters.query_cache import CypherParseCache
 from grapharrow.app import build_application
-from grapharrow.core.errors import QueryError
+from grapharrow.core.errors import NotFoundError, QueryError
+from grapharrow.core.temporal import Duration
 from grapharrow.domain import DatasetFile
-from grapharrow.repositories.graph import NodeRecord, _node_property_table
+from grapharrow.repositories.graph import NodeRecord, _edges_table, _node_property_table
 from grapharrow.use_cases.ana import GraphArrowAgentBackend
 from grapharrow.use_cases.ana_patterns import aggregate_rows, finish_pattern
 from tests.ana_support import load_grapharrow
@@ -313,6 +314,7 @@ def test_persisted_adjacency_order_and_reuse(tmp_path: Path) -> None:
 
     graph.create_edge(src_id=a, dst_id=a, rel_type="R", properties={})
     appended = app.repositories.snapshot.load_manifest()
+    assert appended.edge_properties[-1] == initial.edge_properties[-1]
     for old_files, new_files in (
         (initial.adjacency_by_source, appended.adjacency_by_source),
         (initial.adjacency_by_dest, appended.adjacency_by_dest),
@@ -355,6 +357,125 @@ def test_persisted_adjacency_backfills_legacy_snapshot_with_unchanged_edges(tmp_
             app.adapters.parquet.read_table(root / old.path), check_metadata=True
         )
     app.use_cases.admin.vacuum()
+    assert app.use_cases.admin.verify(verify_checksums=True).ok
+
+
+@pytest.mark.parametrize("by_reference", [False, True])
+def test_single_edge_append_reuses_canonical_buffers(tmp_path: Path, by_reference: bool) -> None:
+    app = build_application(tmp_path / "edge-append")
+    graph = app.use_cases.graph
+    _, nodes = graph.create_nodes_bulk(
+        table=pa.table({"name": ["Alice", "Bob"]}), default_labels=("Person",)
+    )
+    src, dst = (node.node_id for node in nodes)
+    graph.create_edge(
+        src_id=src,
+        dst_id=dst,
+        rel_type="KNOWS",
+        properties={"elapsed": Duration(1, 2, 3), "weight": 1},
+    )
+    previous = graph.load_state()
+    properties = {"elapsed": Duration(0, 0, 5), "weight": 1.0}
+
+    with (
+        patch.object(graph, "load_state", return_value=previous),
+        patch.object(app.repositories.graph, "load_edge_table") as reload_edge_table,
+        patch("grapharrow.use_cases.graph._edges_table", wraps=_edges_table) as encode,
+    ):
+        if by_reference:
+            published, edge = graph.create_edge_by_reference(
+                source_label="Person",
+                source_key="name",
+                source_value="Alice",
+                target_label="Person",
+                target_key="name",
+                target_value="Bob",
+                rel_type="KNOWS",
+                properties=properties,
+            )
+        else:
+            published, edge = graph.create_edge(
+                src_id=src, dst_id=dst, rel_type="KNOWS", properties=properties
+            )
+
+    encode.assert_called_once_with([edge])
+    reload_edge_table.assert_not_called()
+    before_values = previous.edge_table["properties_json"].chunk(0).buffers()[2]
+    after_values = published.edge_table["properties_json"].chunk(0).buffers()[2]
+    assert before_values.address == after_values.address
+    expected = _edges_table([*previous.edges, edge])
+    assert published.edge_table.equals(expected, check_metadata=True)
+    assert app.repositories.graph.load_edge_table(published.snapshot.edges).equals(
+        expected, check_metadata=True
+    )
+    assert app.use_cases.admin.verify(verify_checksums=True).ok
+
+
+def test_set_many_edge_properties_keeps_order_without_fragmenting_columns(tmp_path: Path) -> None:
+    from grapharrow.use_cases import GraphTransactionUseCase
+
+    app = build_application(tmp_path / "edge-set")
+    graph = app.use_cases.graph
+    _, node = graph.create_node(labels=(), properties={})
+    _, edges = graph.create_edges_bulk(
+        table=pa.table(
+            {
+                "src_id": [node.node_id] * 300,
+                "dst_id": [node.node_id] * 300,
+                "rel_type": ["R"] * 300,
+                "value": list(range(300)),
+            }
+        )
+    )
+    transaction = GraphTransactionUseCase(graph)
+    updated = transaction.update_properties_batch(
+        node_updates=(),
+        edge_updates=tuple(
+            (edge.edge_id, "value", -position)
+            for position, edge in enumerate(edges)
+            if position % 2
+        ),
+    )
+    assert updated.edge_table["properties_json"].num_chunks == 1
+    assert updated.edge_table.equals(_edges_table(list(updated.edges)))
+    assert [edge.properties["value"] for edge in updated.edges] == [
+        -position if position % 2 else position for position in range(300)
+    ]
+    assert transaction.commit().edge_table is updated.edge_table
+
+
+def test_delete_many_edges_keeps_order_and_empty_schema(tmp_path: Path) -> None:
+    from grapharrow.use_cases import GraphTransactionUseCase
+
+    app = build_application(tmp_path / "bulk-delete")
+    graph = app.use_cases.graph
+    _, node = graph.create_node(labels=(), properties={})
+    _, edges = graph.create_edges_bulk(
+        table=pa.table(
+            {
+                "src_id": [node.node_id] * 600,
+                "dst_id": [node.node_id] * 600,
+                "rel_type": ["R"] * 600,
+                "value": list(range(600)),
+            }
+        )
+    )
+    transaction = GraphTransactionUseCase(graph)
+    before = transaction.load_state()
+    with pytest.raises(NotFoundError, match="Relationship does not exist: 601"):
+        transaction.delete_entities_batch(node_ids=(), edge_ids=(edges[0].edge_id, 601))
+    assert transaction.load_state() is before
+    updated = transaction.delete_entities_batch(
+        node_ids=(), edge_ids=tuple(edge.edge_id for edge in edges[::2])
+    )
+    assert updated.node_table is before.node_table
+    assert updated.edge_table.equals(_edges_table(list(edges[1::2])))
+    empty = transaction.delete_entities_batch(
+        node_ids=(), edge_ids=tuple(edge.edge_id for edge in edges[1::2])
+    )
+    assert empty.edge_table.num_rows == 0
+    assert empty.edge_table.schema.equals(before.edge_table.schema, check_metadata=True)
+    assert transaction.commit().edge_table is empty.edge_table
     assert app.use_cases.admin.verify(verify_checksums=True).ok
 
 

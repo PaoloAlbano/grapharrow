@@ -79,7 +79,9 @@ def test_database_initialize_bootstraps_layout_and_catalog(tmp_path: Path) -> No
     assert database.layout.staged_dir.exists()
     assert database.layout.data_dir.exists()
     assert database.layout.derived_dir.exists()
-    assert database.layout.current_catalog_path.exists()
+    assert not database.layout.current_catalog_path.exists()
+    assert manifest.catalog_path is not None
+    assert (database.path / manifest.catalog_path).exists()
     assert database.layout.current_snapshot_path.exists()
     assert current_snapshot.snapshot_id == SnapshotId(1)
     assert manifest.snapshot_id == SnapshotId(1)

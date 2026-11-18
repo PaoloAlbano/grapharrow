@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
+from uuid import uuid4
 
 from grapharrow.adapters import FileSystemAdapter
 from grapharrow.adapters.writer import WriterCoordinator, writer_locked
@@ -16,6 +18,8 @@ from grapharrow.domain import (
     LabelId,
     RelationshipTypeDefinition,
     RelationshipTypeId,
+    SnapshotId,
+    SnapshotManifest,
     VersionedCatalog,
 )
 from grapharrow.domain.catalog import (
@@ -27,6 +31,7 @@ from grapharrow.domain.catalog import (
     PropertyDefinition,
     PropertyOwnerKind,
 )
+from grapharrow.repositories.snapshot import SnapshotRepository
 
 
 class CatalogRepository:
@@ -36,11 +41,13 @@ class CatalogRepository:
         self,
         layout: DatabaseLayout,
         filesystem: FileSystemAdapter | None = None,
+        snapshot_store: SnapshotRepository | None = None,
     ) -> None:
         """Describe special object lifecycle or protocol behavior for this type."""
         self._layout = layout
         self._filesystem = filesystem or FileSystemAdapter()
-        self._writer = WriterCoordinator(layout.root, self._filesystem)
+        self._snapshots = snapshot_store or SnapshotRepository(layout, self._filesystem)
+        self._writer = self._snapshots.writer
 
     @property
     def writer(self) -> WriterCoordinator:
@@ -53,83 +60,107 @@ class CatalogRepository:
 
         return self._layout
 
-    def exists(self) -> bool:
-        """Report whether a current catalog pointer exists."""
+    def stage(self, catalog: VersionedCatalog) -> str:
+        """Write an immutable candidate and return its database-relative path."""
+        path = f"catalog/catalog-{catalog.version.value:06d}-{uuid4().hex}.json"
+        self._filesystem.write_json(self._absolute_path(path), self._serialize_catalog(catalog))
+        return path
 
-        return self._filesystem.exists(self._layout.current_catalog_path)
+    def bootstrap_snapshot(self) -> SnapshotManifest:
+        """Return a captured snapshot, creating the database atomically on first use."""
+        pointer = self._snapshots.try_load_current_pointer()
+        if pointer is not None:
+            return self._snapshots.load_at(pointer)
+        with self._writer.hold():
+            if self._snapshots.try_load_current_pointer() is None:
+                catalog = VersionedCatalog.empty(version=CatalogVersion(1))
+                if self._filesystem.exists(self._layout.current_catalog_path):
+                    catalog = self.load()
+                initial = SnapshotManifest.empty(
+                    snapshot_id=SnapshotId(1), catalog_version=catalog.version
+                )
+                try:
+                    self._snapshots.publish(replace(initial, catalog_path=self.stage(catalog)))
+                except WriteConflictError:
+                    # A different process installed the initial snapshot.
+                    pass
+            return self._snapshots.load_manifest()
 
     @writer_locked
-    def write(self, catalog: VersionedCatalog) -> str | Path:
-        """Persist ``catalog`` and update the current catalog pointer."""
-
-        self._layout.ensure_base_directories()
-
-        catalog_path = self._catalog_version_path(catalog.version)
-        if self.exists():
-            current = self.load()
-            if catalog == current:
-                return catalog_path
-            if catalog.version.value <= current.version.value:
+    def write(
+        self, catalog: VersionedCatalog, *, base: SnapshotManifest | None = None
+    ) -> str | Path:
+        """Publish a catalog-only commit using the same head as graph mutations."""
+        if base is None and (pointer := self._snapshots.try_load_current_pointer()) is not None:
+            base = self._snapshots.load_at(pointer)
+        if base is None:
+            manifest = SnapshotManifest.empty(
+                snapshot_id=SnapshotId(1), catalog_version=catalog.version
+            )
+        else:
+            if catalog.version.value <= base.catalog_version.value:
+                if catalog == self.load_for_snapshot(base):
+                    return self._absolute_path(self._snapshot_catalog_path(base))
                 raise WriteConflictError("Catalog changed. Reload it before writing a new version.")
-        payload = self._serialize_catalog(catalog)
-        self._filesystem.write_json(catalog_path, payload)
+            next_id = SnapshotId(base.snapshot_id.value + 1)
+            manifest = replace(
+                base,
+                snapshot_id=next_id,
+                parent_snapshot_id=base.snapshot_id,
+                commit_txid=next_id.value,
+                created_at=datetime.now(UTC).isoformat(timespec="seconds"),
+                catalog_version=catalog.version,
+            )
+        path = self.stage(catalog)
+        self._snapshots.publish(replace(manifest, catalog_path=path), base=base)
+        return self._absolute_path(path)
 
-        pointer = {
-            "version": catalog.version.value,
-            "path": self._layout.relative_path(catalog_path),
-        }
-        self._filesystem.replace_json(self._layout.current_catalog_path, pointer)
-        return catalog_path
+    def load_for_snapshot(self, manifest: SnapshotManifest) -> VersionedCatalog:
+        """Read the exact catalog selected by a captured graph manifest."""
+        catalog = self._read(self._snapshot_catalog_path(manifest))
+        if catalog.version != manifest.catalog_version:
+            raise CatalogError("Catalog version does not match the snapshot.")
+        return catalog
 
     def load(self, version: CatalogVersion | None = None) -> VersionedCatalog:
-        """Load the current catalog or a specific catalog version."""
-
-        catalog_path = self._resolve_catalog_path(version)
-        if not self._filesystem.exists(catalog_path):
-            raise CatalogError(f"Catalog file does not exist: {catalog_path}")
-
-        payload = cast(dict[str, Any], self._filesystem.read_json(catalog_path))
-        return self._deserialize_catalog(payload)
-
-    def bootstrap(self) -> VersionedCatalog:
-        """Ensure an empty initial catalog exists and return it."""
-
-        if self.exists():
-            return self.load()
-
-        with self._writer.hold():
-            if self.exists():
-                return self.load()
-            catalog = VersionedCatalog.empty(version=CatalogVersion(1))
-            self.write(catalog)
-            return catalog
-
-    def _catalog_version_path(self, version: CatalogVersion) -> str | Path:
-        """Handle this internal helper step for the surrounding public workflow."""
-        if isinstance(self._layout.root, Path):
-            catalog_dir = cast(Path, self._layout.catalog_dir)
-            return catalog_dir / f"catalog-{version.value:06d}.json"
-        return f"{self._layout.catalog_dir}/catalog-{version.value:06d}.json"
-
-    def _resolve_catalog_path(self, version: CatalogVersion | None) -> str | Path:
-        """Resolve this reference into the concrete value used later in the flow."""
+        """Load the head catalog or a catalog from published snapshot history."""
+        pointer = self._snapshots.try_load_current_pointer()
+        if pointer is not None:
+            if version is None:
+                return self.load_for_snapshot(self._snapshots.load_at(pointer))
+            for _, manifest in self._snapshots.history():
+                if manifest.catalog_version == version:
+                    return self.load_for_snapshot(manifest)
+                if manifest.catalog_version.value < version.value:
+                    break
+            raise CatalogError(f"Catalog version does not exist: {version.value}")
+        # A standalone catalog from the legacy layout has no snapshot head.
         if version is not None:
-            return self._catalog_version_path(version)
-
-        if not self._filesystem.exists(self._layout.current_catalog_path):
-            raise CatalogError("Current catalog pointer does not exist.")
-
-        pointer = cast(
-            dict[str, Any],
-            self._filesystem.read_json(self._layout.current_catalog_path),
-        )
-        relative_path = pointer.get("path")
+            return self._read(f"catalog/catalog-{version.value:06d}.json")
+        try:
+            legacy_pointer = cast(
+                dict[str, Any], self._filesystem.read_json(self._layout.current_catalog_path)
+            )
+        except FileNotFoundError as exc:
+            raise CatalogError("Current catalog does not exist.") from exc
+        relative_path = legacy_pointer.get("path")
         if not isinstance(relative_path, str):
             raise CatalogError("Current catalog pointer is invalid.")
+        return self._read(relative_path)
 
-        if isinstance(self._layout.root, Path):
-            return self._layout.root / relative_path
-        return f"{str(self._layout.root).rstrip('/')}/{relative_path}"
+    def _read(self, path: str) -> VersionedCatalog:
+        try:
+            payload = cast(dict[str, Any], self._filesystem.read_json(self._absolute_path(path)))
+        except FileNotFoundError as exc:
+            raise CatalogError(f"Catalog file does not exist: {path}") from exc
+        return self._deserialize_catalog(payload)
+
+    def _snapshot_catalog_path(self, manifest: SnapshotManifest) -> str:
+        return manifest.catalog_path or f"catalog/catalog-{manifest.catalog_version.value:06d}.json"
+
+    def _absolute_path(self, relative: str) -> str | Path:
+        root = self._layout.root
+        return root / relative if isinstance(root, Path) else f"{root.rstrip('/')}/{relative}"
 
     def _serialize_catalog(self, catalog: VersionedCatalog) -> dict[str, Any]:
         """Handle this internal helper step for the surrounding public workflow."""

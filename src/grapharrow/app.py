@@ -92,14 +92,18 @@ def build_application(
         opencypher=OpenCypherAdapter(),
         tabular=PyArrowTabularAdapter(),
     )
+    snapshot_store = SnapshotRepository(layout=layout, filesystem=adapters.filesystem)
     repositories = GraphArrowRepositories(
-        catalog=CatalogRepository(layout=layout, filesystem=adapters.filesystem),
-        snapshot=SnapshotRepository(layout=layout, filesystem=adapters.filesystem),
+        catalog=CatalogRepository(
+            layout=layout, filesystem=adapters.filesystem, snapshot_store=snapshot_store
+        ),
+        snapshot=snapshot_store,
         graph=GraphRepository(
             layout=layout,
             parquet_adapter=adapters.parquet,
             tabular_adapter=adapters.tabular,
             filesystem=adapters.filesystem,
+            edge_parquet_range_size=resolved_settings.edge_parquet_range_size,
         ),
     )
     admin_use_case = DatabaseAdminUseCase(
@@ -110,7 +114,6 @@ def build_application(
         filesystem=adapters.filesystem,
     )
     graph_use_case = GraphStateUseCase(
-        admin_service=admin_use_case,
         catalog_store=repositories.catalog,
         snapshot_store=repositories.snapshot,
         graph_store=repositories.graph,

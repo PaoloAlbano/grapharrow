@@ -86,9 +86,10 @@ def test_catalog_store_bootstrap_creates_the_initial_catalog(tmp_path: Path) -> 
     layout = DatabaseLayout(root=tmp_path / "example-db")
     store = CatalogRepository(layout=layout)
 
-    catalog = store.bootstrap()
+    snapshot = store.bootstrap_snapshot()
+    catalog = store.load_for_snapshot(snapshot)
 
     assert catalog.version == CatalogVersion(1)
-    assert store.exists() is True
-    assert isinstance(layout.current_catalog_path, Path)
-    assert layout.current_catalog_path.exists()
+    assert not layout.current_catalog_path.exists()
+    assert snapshot.catalog_path is not None
+    assert (layout.root / snapshot.catalog_path).exists()

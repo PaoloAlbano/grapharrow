@@ -122,7 +122,7 @@ def test_ana_can_read_a_snapshot_without_property_projections(
     app = load_grapharrow(tmp_path / "legacy-projections")
     manifest = app.repositories.snapshot.load_manifest()
     legacy = replace(manifest, node_properties=())
-    monkeypatch.setattr(app.repositories.snapshot, "load_manifest", lambda: legacy)
+    monkeypatch.setattr(app.repositories.snapshot, "load_at", lambda pointer: legacy)
     with GraphArrowAgentBackend(app) as backend:
         assert not backend._property_tables
         assert fetch(backend, "node_search", {"label": "Person", "value": "Alice"})["rows"] == [

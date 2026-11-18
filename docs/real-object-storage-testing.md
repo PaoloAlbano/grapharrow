@@ -89,6 +89,16 @@ Examples:
 These settings are optional. If they are not present, GraphArrow continues to rely on the default
 credential mechanisms provided by the provider SDK integration inside Arrow.
 
+Install the provider SDK extras before running cloud-backed GraphArrow:
+
+```sh
+uv sync --locked --extra cloud
+```
+
+Use `--extra s3`, `--extra azure`, or `--extra gcs` to install one provider.
+Data I/O uses Arrow; database pointer operations use the optional Python SDKs.
+See [Dependencies and Installation](dependency-compatibility.md).
+
 ## Running the Tests
 
 Run the normal live integration target:
@@ -100,7 +110,7 @@ make test-integration-live
 Or run the file directly:
 
 ```bash
-uv run pytest -m "integration and live_storage" tests/integration/test_live_object_storage.py
+uv run --extra cloud pytest -m "integration and live_storage" tests/integration/test_live_object_storage.py
 ```
 
 If a provider-specific environment variable is missing, the corresponding test is skipped.

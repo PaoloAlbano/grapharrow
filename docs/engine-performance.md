@@ -152,11 +152,37 @@ by the current manifest, even when its filename contains an older snapshot
 ID. Compaction deliberately rewrites all datasets and rebuilds projections.
 The manifest format and publication pointer protocol are unchanged.
 
-This reduces Parquet writes and checksum work. A changed canonical node or
-edge dataset is still rewritten in full, and write use cases still load and
-validate the graph. This is not a row-level delta storage format or a WAL.
-Writer coordination and recovery limits remain described in
+Write use cases still load and validate the graph. Canonical nodes and
+adjacency datasets can require a full rebuild when their inputs change.
+Writer coordination and recovery limits are described in
 [Transactions and Sessions](transactions.md).
+
+### Canonical edge ranges
+
+New databases store canonical edges in Parquet files covering 32,768 edge
+IDs per range by default. Use compaction to convert a single-file database
+to the default range layout.
+
+```sh
+grapharrow compact ./my-database
+```
+
+The first default range covers IDs 1 through 32,768. Boundaries are stable
+when edges are removed. Each write reuses the files whose canonical rows
+match the updated table and writes one file for each changed nonempty range.
+The manifest records the layout through the referenced paths.
+
+Set `GRAPHARROW_EDGE_PARQUET_RANGE_SIZE` before the first edge write or at
+compaction to select a different width. Use `0` for a single canonical edge
+file. With the setting unset, compaction keeps the width of an existing
+partitioned database.
+
+Edge property projections follow the same ranges, grouped by relationship
+type. All files for a relationship type share an Arrow schema. Homogeneous
+scalar properties use native columns, while heterogeneous values use the
+typed property codec. A point update with the same schema can reuse
+projections for the other ranges. A change to the columns or their encoding
+rebuilds the projection for that relationship type.
 
 ## Cypher syntax reuse
 
@@ -230,3 +256,37 @@ statement fails before it starts reading the graph. REST reports HTTP 503 and
 Bolt reports resource exhaustion. The default of `0` disables the concurrency
 limit. Separate processes have separate limits. A statement slot limits
 concurrency and leaves the memory of each statement workload-dependent.
+
+
+## Selective relationship property updates
+
+An eligible autocommit `MATCH ()-[r:TYPE]->() WHERE id(r) = $id SET ...`
+reads the canonical ID range containing the relationship and its typed property
+projection. It replaces those two immutable files and publishes the resulting
+snapshot through the normal atomic database pointer. Unchanged canonical ranges,
+nodes, catalog and adjacency files are retained.
+
+This path accepts constant scalar assignments to existing properties with the
+same Python types, directed one-hop patterns without endpoint filters, and
+simple relationship-property returns. A missing relationship leaves the snapshot
+unchanged. Result windows such as `LIMIT 0` apply after the mutation. Result
+construction must succeed before any files are written. Concurrent callers on
+one server remain serialized by the writer coordinator; a competing external
+commit still produces a write conflict.
+
+Queries with broader read dependencies, constraints, new or removed properties,
+type changes, unsupported projection layouts, complex return expressions, and
+explicit transactions retain the complete transaction path. The selective path
+does not infer safety from the final record diff and does not automatically
+rebase a prepared write. It avoids complete graph materialization only for the
+certified query shape. Large scans, other write shapes and ANA workflow opening
+retain their existing memory requirements.
+
+
+## Sequential integrity checks
+
+Snapshot publication and administrative checksum verification hash stored objects
+through a sequential input stream in 1 MiB blocks. This bounds the checksum
+buffer and avoids issuing a remote range GET for every 8 KiB of an object.
+Extension-based decompression is disabled so the digest always describes the
+stored bytes. The checksum algorithm and manifest format remain SHA-256.

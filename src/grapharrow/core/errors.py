@@ -103,3 +103,7 @@ class TransactionError(GraphArrowError):
 
 class WriteConflictError(TransactionError):
     """The database changed after a writer captured its base state."""
+
+
+class CommitOutcomeUnknownError(StorageError):
+    """The head update could not be confirmed or safely ruled out."""

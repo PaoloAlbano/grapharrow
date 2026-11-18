@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
+from uuid import uuid4
 
 from grapharrow.adapters import FileSystemAdapter
 from grapharrow.adapters.writer import WriterCoordinator, writer_locked
 from grapharrow.core import DatabaseLayout
-from grapharrow.core.errors import StorageError, WriteConflictError
+from grapharrow.core.errors import CommitOutcomeUnknownError, StorageError, WriteConflictError
 from grapharrow.domain import CatalogVersion, CurrentSnapshotPointer, DatasetFile, SnapshotId
 from grapharrow.domain.snapshot import ChecksumAlgorithm, DatasetKind, SnapshotManifest
 
@@ -43,126 +46,159 @@ class SnapshotRepository:
         return self._filesystem.exists(self._layout.current_snapshot_path)
 
     @writer_locked
-    def write_manifest(self, manifest: SnapshotManifest) -> str | Path:
-        """Persist a snapshot manifest without publishing it."""
-
-        self._layout.ensure_base_directories()
-        self.validate_manifest(manifest)
-
-        manifest_path = self._manifest_path(manifest.snapshot_id)
-        if self._filesystem.exists(manifest_path) and self.current_exists():
-            current = self.load_current_pointer()
-            if manifest.snapshot_id.value <= current.snapshot_id.value:
-                if self.load_manifest(manifest.snapshot_id) != manifest:
-                    raise WriteConflictError("Published snapshot manifests cannot be overwritten.")
-                return manifest_path
-        payload = self._serialize_manifest(manifest)
-        self._filesystem.write_json(manifest_path, payload)
-        return manifest_path
-
-    @writer_locked
-    def stage_manifest(
-        self,
-        manifest: SnapshotManifest,
-        *,
-        staged_relative_path: str,
-    ) -> str | Path:
-        """Persist a candidate manifest inside a staged transaction directory."""
-
-        self._layout.ensure_base_directories()
-        self.validate_manifest(manifest)
-        staged_dir = (
-            self._layout.root / staged_relative_path
-            if isinstance(self._layout.root, Path)
-            else f"{str(self._layout.root).rstrip('/')}/{staged_relative_path}"
-        )
-        self._filesystem.create_dir(staged_dir)
-        manifest_path = (
-            staged_dir / "manifest.json"
-            if isinstance(staged_dir, Path)
-            else f"{staged_dir.rstrip('/')}/manifest.json"
-        )
-        payload = self._serialize_manifest(manifest)
-        self._filesystem.write_json(manifest_path, payload)
-        return manifest_path
-
-    @writer_locked
     def publish(
         self,
         manifest: SnapshotManifest,
         *,
-        staged_relative_path: str | None = None,
+        base: SnapshotManifest | None = None,
     ) -> CurrentSnapshotPointer:
-        """Persist and publish a snapshot as the current reader-visible state."""
-
-        if self.current_exists():
-            current = self.load_current_pointer()
-            if manifest == self.load_manifest():
-                return current
+        """Publish a complete immutable snapshot with a conditional head update."""
+        self._layout.ensure_base_directories()
+        self.validate_manifest(manifest)
+        head = self._filesystem.read_pointer(self._layout.current_snapshot_path)
+        revision = None
+        parent_path = None
+        if head is not None:
+            payload, revision = head
+            current = self._deserialize_pointer(cast(dict[str, Any], payload))
+            parent_path = current.manifest_path
+            if base is None or base.snapshot_id != current.snapshot_id:
+                current_manifest = self.load_at(current)
+                if manifest == current_manifest:
+                    return current
+                if base is not None:
+                    raise WriteConflictError("Database changed. Retry from the current snapshot.")
+                base = current_manifest
             if (
-                manifest.parent_snapshot_id is not None
-                and manifest.parent_snapshot_id != current.snapshot_id
-                or manifest.snapshot_id.value <= current.snapshot_id.value
+                manifest.snapshot_id.value != current.snapshot_id.value + 1
+                or manifest.parent_snapshot_id not in (None, current.snapshot_id)
             ):
-                raise WriteConflictError("Snapshot changed. Retry from the current snapshot.")
-        if staged_relative_path is not None:
-            staged_manifest_path = self.stage_manifest(
-                manifest,
-                staged_relative_path=staged_relative_path,
-            )
-            manifest_path = self._manifest_path(manifest.snapshot_id)
-            self._filesystem.copy_file(staged_manifest_path, manifest_path)
-        else:
-            manifest_path = self.write_manifest(manifest)
+                raise WriteConflictError("Database changed. Retry from the current snapshot.")
+            manifest = replace(manifest, parent_snapshot_id=current.snapshot_id)
+            if manifest.catalog_path is None and manifest.catalog_version == base.catalog_version:
+                manifest = replace(manifest, catalog_path=base.catalog_path)
+        elif base is not None:
+            raise WriteConflictError("The base snapshot is no longer available.")
+
+        manifest_path = self._absolute_path(
+            f"manifests/snapshot-{manifest.snapshot_id.value:06d}-{uuid4().hex}.json"
+        )
+        payload = self._serialize_manifest(manifest)
+        payload["parent_manifest_path"] = parent_path
+        self._filesystem.write_json(manifest_path, payload)
+        prior_files = set(_dataset_paths(base)) if base is not None else set()
+        new_files = [
+            self._absolute_path(path)
+            for path in _dataset_paths(manifest)
+            if path not in prior_files
+        ]
+        if manifest.catalog_path is not None and (
+            base is None or manifest.catalog_path != base.catalog_path
+        ):
+            new_files.append(self._absolute_path(manifest.catalog_path))
+        self._filesystem.sync_commit_files(self._layout.root, [*new_files, manifest_path])
         pointer = CurrentSnapshotPointer(
             snapshot_id=manifest.snapshot_id,
             manifest_path=self._layout.relative_path(manifest_path),
             commit_txid=manifest.commit_txid,
             created_at=manifest.created_at,
         )
-        self._filesystem.replace_json(
-            self._layout.current_snapshot_path,
-            self._serialize_pointer(pointer),
-        )
+        try:
+            published = self._filesystem.replace_pointer(
+                self._layout.current_snapshot_path, self._serialize_pointer(pointer), revision
+            )
+        except Exception as exc:
+            if self._writer.local_root is not None:
+                raise
+            # A network error can arrive after the server commits the PUT.
+            self._check_publication(pointer, cause=exc)
+        else:
+            if not published:
+                # SDKs may retry a PUT whose response was lost and receive a failed condition.
+                self._check_publication(pointer)
         return pointer
 
+    def _check_publication(
+        self, candidate: CurrentSnapshotPointer, *, cause: Exception | None = None
+    ) -> None:
+        try:
+            for path, snapshot in self.history():
+                if snapshot.snapshot_id == candidate.snapshot_id:
+                    if path == candidate.manifest_path:
+                        return
+                    raise WriteConflictError("Database changed. Retry from the current snapshot.")
+                if snapshot.snapshot_id.value < candidate.snapshot_id.value:
+                    break
+        except WriteConflictError:
+            raise
+        except Exception as exc:
+            if cause is None:
+                cause = exc
+        message = f"Commit outcome could not be confirmed: {candidate.manifest_path}."
+        raise CommitOutcomeUnknownError(message) from cause
+
     def load_manifest(self, snapshot_id: SnapshotId | None = None) -> SnapshotManifest:
-        """Load a specific snapshot manifest or the current one."""
+        """Load the head or a published snapshot from its commit ancestry."""
+        if snapshot_id is None:
+            return self.load_at(self.load_current_pointer())
+        for _, manifest in self.history():
+            if manifest.snapshot_id == snapshot_id:
+                return manifest
+            if manifest.snapshot_id.value < snapshot_id.value:
+                break
+        raise StorageError(f"Snapshot manifest does not exist: {snapshot_id.value}")
 
-        manifest_path = self._resolve_manifest_path(snapshot_id)
-        if not self._filesystem.exists(manifest_path):
-            raise StorageError(f"Snapshot manifest does not exist: {manifest_path}")
+    def history(
+        self, pointer: CurrentSnapshotPointer | None = None
+    ) -> Iterator[tuple[str, SnapshotManifest]]:
+        """Follow the published chain, excluding all failed commit attempts."""
+        pointer = pointer or self.load_current_pointer()
+        path: str | None = pointer.manifest_path
+        expected_id: SnapshotId | None = pointer.snapshot_id
+        while path is not None:
+            manifest, parent = self._load_entry(path)
+            if manifest.snapshot_id != expected_id:
+                raise StorageError("Snapshot ancestry does not match the published head.")
+            yield path, manifest
+            if parent is not None and _is_legacy_manifest_path(parent):
+                if not self._filesystem.exists(self._absolute_path(parent)):
+                    # Legacy vacuum could prune published ancestors before this format existed.
+                    return
+            path = parent
+            expected_id = manifest.parent_snapshot_id
 
-        payload = cast(dict[str, Any], self._filesystem.read_json(manifest_path))
-        return self._deserialize_manifest(payload)
+    def load_at(self, pointer: CurrentSnapshotPointer) -> SnapshotManifest:
+        """Load the exact manifest referenced by an already captured pointer."""
+        manifest, _ = self._load_entry(pointer.manifest_path)
+        if manifest.snapshot_id != pointer.snapshot_id:
+            raise StorageError("Snapshot manifest does not match the published head.")
+        return manifest
+
+    def _load_entry(self, path: str) -> tuple[SnapshotManifest, str | None]:
+        try:
+            payload = cast(dict[str, Any], self._filesystem.read_json(self._absolute_path(path)))
+        except FileNotFoundError as exc:
+            raise StorageError(f"Snapshot manifest does not exist: {path}") from exc
+        manifest = self._deserialize_manifest(payload)
+        parent = payload.get("parent_manifest_path")
+        if "parent_manifest_path" not in payload and manifest.parent_snapshot_id is not None:
+            parent = f"manifests/snapshot-{manifest.parent_snapshot_id.value:06d}.json"
+        return manifest, parent
 
     def load_current_pointer(self) -> CurrentSnapshotPointer:
-        """Load the current snapshot pointer."""
-
-        if not self._filesystem.exists(self._layout.current_snapshot_path):
+        """Load the current snapshot pointer with a single read."""
+        pointer = self.try_load_current_pointer()
+        if pointer is None:
             raise StorageError("Current snapshot pointer does not exist.")
+        return pointer
 
-        payload = cast(
-            dict[str, Any],
-            self._filesystem.read_json(self._layout.current_snapshot_path),
-        )
-        return self._deserialize_pointer(payload)
-
-    def bootstrap(self, *, catalog_version: CatalogVersion) -> SnapshotManifest:
-        """Ensure an initial empty snapshot exists and return it."""
-
-        if self.current_exists():
-            return self.load_manifest()
-
-        with self._writer.hold():
-            if self.current_exists():
-                return self.load_manifest()
-            manifest = SnapshotManifest.empty(
-                snapshot_id=SnapshotId(1),
-                catalog_version=catalog_version,
-            )
-            self.publish(manifest)
-            return manifest
+    def try_load_current_pointer(self) -> CurrentSnapshotPointer | None:
+        """Return the current pointer, or None if the database has no head yet."""
+        head = self._filesystem.read_pointer(self._layout.current_snapshot_path)
+        if head is None:
+            return None
+        payload, _ = head
+        return self._deserialize_pointer(cast(dict[str, Any], payload))
 
     def validate_manifest(self, manifest: SnapshotManifest) -> None:
         """Validate that a manifest is structurally coherent before publication."""
@@ -203,22 +239,9 @@ class SnapshotRepository:
                         f"{dataset_file.path}."
                     )
 
-    def _manifest_path(self, snapshot_id: SnapshotId) -> str | Path:
-        """Return the stable manifest filename for a given snapshot id."""
-        if isinstance(self._layout.root, Path):
-            manifests_dir = cast(Path, self._layout.manifests_dir)
-            return manifests_dir / f"snapshot-{snapshot_id.value:06d}.json"
-        return f"{self._layout.manifests_dir}/snapshot-{snapshot_id.value:06d}.json"
-
-    def _resolve_manifest_path(self, snapshot_id: SnapshotId | None) -> str | Path:
-        """Resolve either an explicit snapshot id or the current pointer to a manifest path."""
-        if snapshot_id is not None:
-            return self._manifest_path(snapshot_id)
-
-        pointer = self.load_current_pointer()
-        if isinstance(self._layout.root, Path):
-            return self._layout.root / pointer.manifest_path
-        return f"{str(self._layout.root).rstrip('/')}/{pointer.manifest_path}"
+    def _absolute_path(self, relative: str) -> str | Path:
+        root = self._layout.root
+        return root / relative if isinstance(root, Path) else f"{root.rstrip('/')}/{relative}"
 
     def _serialize_pointer(self, pointer: CurrentSnapshotPointer) -> dict[str, Any]:
         """Serialize the reader-visible current snapshot pointer to JSON."""
@@ -258,6 +281,7 @@ class SnapshotRepository:
             "commit_txid": manifest.commit_txid,
             "created_at": manifest.created_at,
             "catalog_version": manifest.catalog_version.value,
+            "catalog_path": manifest.catalog_path,
             "files": {
                 "nodes": [self._serialize_dataset_file(item) for item in manifest.nodes],
                 "edges": [self._serialize_dataset_file(item) for item in manifest.edges],
@@ -314,6 +338,7 @@ class SnapshotRepository:
             commit_txid=commit_txid,
             created_at=created_at,
             catalog_version=catalog_version,
+            catalog_path=payload.get("catalog_path"),
             nodes=self._deserialize_dataset_files(files.get("nodes", [])),
             edges=self._deserialize_dataset_files(files.get("edges", [])),
             node_labels=self._deserialize_dataset_files(files.get("node_labels", [])),
@@ -343,6 +368,23 @@ class SnapshotRepository:
             )
             for item in payload
         )
+
+
+def _dataset_paths(manifest: SnapshotManifest) -> Iterator[str]:
+    for files in (
+        manifest.nodes,
+        manifest.edges,
+        manifest.node_labels,
+        manifest.node_properties,
+        manifest.adjacency_by_source,
+        manifest.adjacency_by_dest,
+        manifest.edge_properties,
+    ):
+        yield from (file.path for file in files)
+
+
+def _is_legacy_manifest_path(relative: str) -> bool:
+    return Path(relative).stem.count("-") == 1
 
 
 __all__ = ["SnapshotRepository"]

@@ -725,9 +725,23 @@ class CypherQueryUseCase:
                     isinstance(compiled, CompiledMatchMergeQuery)
                     and len(compiled.match_patterns) > 1
                 )
-                if not multi_hop_create and not multipart_match_merge:
+                row_dependent_set = isinstance(compiled, CompiledMatchSetQuery) and any(
+                    isinstance(item, SetMapReferenceMergeItem)
+                    or (
+                        isinstance(item, SetPropertyItem)
+                        and isinstance(item.value, PropertyReferenceValue)
+                    )
+                    for item in compiled.set_items
+                )
+                if not multi_hop_create and not multipart_match_merge and not row_dependent_set:
                     LegacyValidator(params).validate(tree)
                     with _query_phase("runtime"):
+                        if isinstance(compiled, CompiledMatchSetQuery):
+                            from grapharrow.use_cases.cypher_point_set import try_point_set
+
+                            result = try_point_set(self, compiled)
+                            if result is not None:
+                                return result
                         return self._execute_write(
                             lambda executor: executor._execute_compiled(compiled)
                         )
@@ -12991,6 +13005,8 @@ def _can_use_edge_property_projection(
     }
     if step.properties:
         property_fields.update(step.properties)
+    if property_fields.intersection({"edge_id", "src_id", "dst_id"}):
+        return False
     return bool(property_fields or requested_fields.intersection({"id", "source", "target"}))
 
 
@@ -13014,7 +13030,7 @@ def _can_project_requested_edge_fields(
 ) -> bool:
     """Check whether the optimized or semantically valid path applies here."""
     required_columns = {"edge_id", "src_id", "dst_id"}
-    if not required_columns.issubset(set(property_table.column_names)):
+    if any(property_table.column_names.count(column) != 1 for column in required_columns):
         return False
 
     required_fields = set(step.properties)

@@ -50,6 +50,19 @@ uv sync --locked
 make sync-dev
 ```
 
+Cloud SDKs are optional. For object storage, install the matching extra:
+
+```bash
+uv sync --locked --extra s3     # or --extra azure, --extra gcs, --extra cloud
+# From a release wheel:
+pip install './grapharrow-<version>-py3-none-any.whl[s3]'
+```
+
+The `cloud` extra includes all three providers. The Python package keeps these
+SDKs optional; the default Docker image includes them for all providers. SDKs are
+imported only when their provider is used. See
+[Dependencies and Installation](docs/dependency-compatibility.md) for details.
+
 ### Start authenticated HTTP and Bolt servers
 
 First follow [Prepare a local configuration](docs/server-configuration.md#prepare-a-local-configuration)

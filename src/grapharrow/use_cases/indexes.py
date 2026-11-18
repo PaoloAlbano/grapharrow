@@ -22,7 +22,8 @@ class IndexCatalogUseCase:
     def list_indexes(self) -> tuple[IndexDefinition, ...]:
         """Return the index declarations stored in the current catalog."""
 
-        return self._catalog_store.bootstrap().indexes
+        snapshot = self._catalog_store.bootstrap_snapshot()
+        return self._catalog_store.load_for_snapshot(snapshot).indexes
 
     @writer_locked
     def create_index(
@@ -50,7 +51,8 @@ class IndexCatalogUseCase:
             property_names=normalized_properties,
         )
 
-        catalog = self._catalog_store.bootstrap()
+        base = self._catalog_store.bootstrap_snapshot()
+        catalog = self._catalog_store.load_for_snapshot(base)
         existing = self._find_existing_index(
             catalog.indexes,
             name=normalized_name,
@@ -78,7 +80,7 @@ class IndexCatalogUseCase:
             version=CatalogVersion(catalog.version.value + 1),
             indexes=(*catalog.indexes, index),
         )
-        self._catalog_store.write(next_catalog)
+        self._catalog_store.write(next_catalog, base=base)
         return index
 
     @writer_locked
@@ -89,7 +91,8 @@ class IndexCatalogUseCase:
         if not normalized_name:
             raise CatalogError("Index name cannot be empty.")
 
-        catalog = self._catalog_store.bootstrap()
+        base = self._catalog_store.bootstrap_snapshot()
+        catalog = self._catalog_store.load_for_snapshot(base)
         removed: IndexDefinition | None = None
         remaining: list[IndexDefinition] = []
         for index in catalog.indexes:
@@ -108,7 +111,7 @@ class IndexCatalogUseCase:
             version=CatalogVersion(catalog.version.value + 1),
             indexes=tuple(remaining),
         )
-        self._catalog_store.write(next_catalog)
+        self._catalog_store.write(next_catalog, base=base)
         return removed
 
     def _validate_index_request(

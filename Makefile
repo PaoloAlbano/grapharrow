@@ -80,7 +80,7 @@ format-check:
 	$(UV) run ruff format --check .
 
 typecheck:
-	$(UV) run mypy src
+	$(UV) run --all-extras mypy src
 
 generate-cypher-parser:
 	@test -n "$(ANTLR_JAR)" || (echo "Set ANTLR_JAR to the ANTLR 4.13.2 complete JAR path"; exit 1)
@@ -99,7 +99,7 @@ test-integration:
 	$(UV) run pytest -m integration tests/integration
 
 test-integration-live:
-	$(UV) run pytest -m "integration and live_storage" tests/integration
+	$(UV) run --extra cloud pytest -m "integration and live_storage" tests/integration
 
 coverage:
 	$(UV) run pytest --cov=grapharrow tests

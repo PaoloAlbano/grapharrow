@@ -82,6 +82,7 @@ class MergeStage:
 @dataclass(frozen=True)
 class SetStage:
     items: tuple[PropertyUpdate, ...]
+    reuse_edge_table: bool = True
 
 
 @dataclass(frozen=True)
@@ -170,7 +171,8 @@ class WriteCompiler(ReadCompiler):
             return SetStage(tuple(self.set_item(p, scope) for p in node.oC_SetItem())), scope
         if kind == "oC_Remove":
             return SetStage(
-                tuple(self.set_item(p, scope, remove=True) for p in node.oC_RemoveItem())
+                tuple(self.set_item(p, scope, remove=True) for p in node.oC_RemoveItem()),
+                reuse_edge_table=False,
             ), scope
 
         targets = tuple(self.value(p, scope) for p in node.oC_Expression())
@@ -399,6 +401,7 @@ class WriteRuntime(ReadRuntime):
     def execute_branch(self, branch: WriteBranch) -> list[Row]:
         rows: list[Row] = [{}]
         for stage in branch.stages:
+            deleted_edge_ids = None
             if isinstance(stage, CreateStage):
                 rows = [self.create(stage, row) for row in rows]
             elif isinstance(stage, MergeStage):
@@ -407,13 +410,16 @@ class WriteRuntime(ReadRuntime):
                 for row in rows:
                     self.set_items(stage.items, row)
             elif isinstance(stage, DeleteStage):
-                self.delete(stage, rows)
+                deleted_edge_ids = self.delete(stage, rows)
             else:
                 rows = self.apply_stage(stage, rows, {})
                 continue
             previous = self.graph.load_state()
             state = self.graph.replace_records(
-                tuple(self.nodes.values()), tuple(self.edges.values())
+                tuple(self.nodes.values()),
+                tuple(self.edges.values()),
+                edge_property_update=isinstance(stage, SetStage) and stage.reuse_edge_table,
+                deleted_edge_ids=deleted_edge_ids,
             )
             if state is not previous:
                 self._state = None
@@ -601,7 +607,7 @@ class WriteRuntime(ReadRuntime):
             else:
                 self.edges[entity.edge_id] = replace(entity, properties=properties)
 
-    def delete(self, stage: DeleteStage, rows: list[Row]) -> None:
+    def delete(self, stage: DeleteStage, rows: list[Row]) -> set[int] | None:
         nodes: set[int] = set()
         edges: set[int] = set()
         for row in rows:
@@ -631,6 +637,7 @@ class WriteRuntime(ReadRuntime):
             self.edges.pop(edge_id, None)
         for node_id in nodes:
             self.nodes.pop(node_id, None)
+        return edges if not nodes else None
 
 
 class MergeAdjacency:

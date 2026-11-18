@@ -1,8 +1,7 @@
 # Transactions, Sessions and Write Visibility
 
 GraphArrow publishes graph state through snapshot manifests and a current
-snapshot pointer. Session behavior depends on the interface; the names of
-embedded helper methods do not imply identical semantics to Bolt transactions.
+snapshot pointer. Session behavior depends on the interface.
 
 | Interface | Read visibility | Write behavior |
 | --- | --- | --- |
@@ -12,6 +11,7 @@ embedded helper methods do not imply identical semantics to Bolt transactions.
 | MCP Cypher `query` / `write_cypher` | Current published state per call | `query` rejects writes; successful `write_cypher` calls publish |
 | Bolt autocommit | Current published state for the statement | Successful write statements publish |
 | Bolt explicit transaction | Transaction-local state, including its own writes | Changes are held in memory until `COMMIT`; `ROLLBACK` discards them |
+| ANA workflow | Snapshot captured when the workflow is created. A new workflow sees later commits | Read-only tools |
 
 ## Cypher Statement Atomicity
 
@@ -27,7 +27,6 @@ changes. The connection enters Bolt's failed state and the client can
 roll back or reset the transaction. See
 [Writer Coordination and Storage Limits](#writer-coordination-and-storage-limits)
 for publication failures and storage durability.
-| ANA workflow | Snapshot captured when the workflow is created | All current tools are read-only; create a new workflow to see later commits |
 
 ## Embedded Context Managers
 
@@ -53,64 +52,80 @@ workflows are covered by the [Bolt integration tests](../tests/integration/test_
 Transaction-local state is held in process memory. It is not a durable write-ahead
 log, and an uncommitted transaction is not recovered after a process crash.
 
-## Writer Coordination and Storage Limits
+## Atomic Publication
 
-On native local storage, GraphArrow coordinates mutations through a reentrant
-thread lock and an OS file lock at `.grapharrow-writer.lock` in the database
-root. Canonical paths share a coordinator, including local file-URI aliases.
-Separate REST, Bolt, CLI, and embedded processes using the same database path
-serialize their graph and catalog writes. Index declarations, compaction,
-vacuum, and recovery use the same coordinator. The lock file remains in place
-after release, and the OS releases a process's lock when its descriptor closes
-or the process exits.
+Each commit prepares immutable Parquet files, a catalog version when needed,
+and a manifest that names the complete snapshot. A single update to
+`current_snapshot.json` makes the commit visible. Catalog-only changes and
+compaction publish through the same pointer. Each attempt uses unique object
+names, so another writer cannot overwrite the winner's files.
 
-Autocommit mutations hold the coordinator across reading their base state,
-validation, and publication. Explicit Bolt transactions keep transaction-local
-state and acquire the publication lock at commit. Before writing any candidate
-files, commit verifies that both the base snapshot and catalog still match.
-Another commit, a catalog-only change, or compaction can invalidate that base.
-The caller then receives `WriteConflictError`, a subclass of
-`TransactionError`, and must recompute the write in a new transaction.
+Readers capture the head once per operation. Graph records, catalog and
+derived indexes come from the same manifest. ANA keeps that snapshot for the
+workflow. Bolt explicit transactions keep their captured base and include
+their own pending writes.
 
-REST maps write conflicts to HTTP 409 with error code `WRITE_CONFLICT`.
-Bolt reports `Neo.TransientError.Transaction.Outdated`, which retry-aware
-drivers classify as a transient transaction failure. The conflicting explicit
-transaction is closed. [Neo4j status-code reference](https://neo4j.com/docs/status-codes/current/errors/all-errors/)
+On native local storage, GraphArrow coordinates writers across threads and
+processes with a reentrant lock and an OS lock at `.grapharrow-writer.lock`.
+File URI aliases share the same lock. GraphArrow flushes new snapshot files
+and the temporary pointer before replacing the head with an atomic rename.
+It also flushes their directories on platforms that support directory
+`fsync`. The filesystem must support advisory locks and atomic rename.
 
-Direct catalog publication requires a newer version, with an identical current
-catalog treated as an idempotent retry. Snapshot publication advances the
-snapshot ID and checks a declared parent against the current head. Repeating
-the identical current snapshot returns its existing pointer. Published
-manifests are protected against replacement with different contents.
+On object storage, any replica can prepare a write. S3 and Azure Blob
+compare the head's ETag before replacing it. Google Cloud Storage compares
+the object generation. Bootstrap uses a conditional create. All replicas
+must use the same writable bucket or container and database prefix.
+S3-compatible endpoints must enforce AWS conditional PUT semantics.
+[Amazon S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) ·
+[Azure Blob concurrency](https://learn.microsoft.com/en-us/azure/storage/blobs/concurrency-manage) ·
+[Google Cloud Storage preconditions](https://cloud.google.com/storage/docs/request-preconditions)
 
-For object storage, coordination covers threads in one process using the same
-database URI. Independent processes need one externally coordinated writer.
-Provider conditional writes and distributed locking are outside the current
-object-store publication contract.
+## Conflicts and Lost Responses
 
-On the local filesystem, GraphArrow writes `current_snapshot.json` to a
-temporary file in the same directory, flushes it to disk and replaces the
-current file with `os.replace`. A reader sees either the previous complete
-pointer or the new one. An error before replacement leaves the previous
-pointer in place.
+Two writers can prepare changes from the same snapshot. The first writer to
+advance the head commits. The other receives `WriteConflictError` and can
+start a new transaction to recompute its change. This applies even when the
+writes touch different graph records.
 
-This guarantee covers pointer visibility. Power-loss durability of the
-whole snapshot, including the manifest and Parquet files, remains outside
-that guarantee. Object storage continues to publish through its filesystem
-output stream, with visibility depending on the backend.
+REST returns HTTP 409 and `WRITE_CONFLICT` for a rejected write. Bolt
+reports `Neo.TransientError.Transaction.Outdated` and closes the conflicting
+explicit transaction. The embedded API raises `WriteConflictError`.
+[Neo4j status-code reference](https://neo4j.com/docs/status-codes/current/errors/all-errors/)
 
-The catalog and snapshot have separate heads. Schema declarations can remain
-visible after a later graph-persistence failure. Verification, recovery, and
-vacuum support inspection and cleanup of unpublished data. Schedule vacuum
-between ordinary Cypher read operations because those reads can load derived
-files after capturing a manifest. ANA workflows pin canonical and property
-tables together during setup and keep their in-memory snapshot after vacuum.
+If the storage provider may have accepted the update before the response was
+lost, GraphArrow checks the published ancestry for that commit. When the
+result remains ambiguous, it raises `CommitOutcomeUnknownError`. REST
+returns HTTP 500 with `COMMIT_OUTCOME_UNKNOWN`. Verify the outcome before
+retrying a non-idempotent write. A client retry after the serving process or
+connection has been lost starts a new operation.
 
-Use [verification and recovery operations](../README.md) for the supported
-administrative checks, and consult the
-[cross-interface comparison](interface-comparison.md) for executable visibility
-examples. The writer-coordination tests additionally exercise simultaneous
-processes, bootstrap races, concurrent MERGE, stale explicit transactions,
-catalog changes, compaction, process termination, and inherited lock state.
-The native process-lock paths are exercised on macOS and Linux. Windows has
-a byte-range lock implementation that was not exercised in this validation.
+## Maintenance and Existing Databases
+
+Vacuum preserves the files referenced by published snapshots so in-flight
+readers can still load them. On native local storage it can remove
+unpublished manifests and Parquet files while holding the writer lock.
+On object storage it only removes abandoned manifest and Parquet files from
+generations that can no longer publish. Published history and its referenced
+data accumulate until a snapshot retention policy is available.
+
+Upgrade all writers sharing a database together. When opening a database
+from the earlier layout, GraphArrow reads the catalog version referenced by
+the published snapshot. Inspect any newer entries in the legacy catalog
+pointer before upgrading, since schema-only work from the earlier layout
+may require replay. New databases use a single head from initialization.
+
+See [the cross-interface comparison](interface-comparison.md) for visibility
+examples and [live storage testing](real-object-storage-testing.md) for
+provider integration checks.
+
+
+## Selective Autocommit Property SET
+
+Eligible relationship SET statements by ID can read and replace only the touched
+canonical range and property projection. They use the same writer coordinator,
+immutable objects and conditional snapshot publication as other commits. The
+catalog, nodes and topology must remain unchanged; broader queries and explicit
+transactions use their existing transaction path. Result construction precedes
+publication, including when the result is empty because of SKIP or LIMIT.
+See [selective relationship updates](engine-performance.md#selective-relationship-property-updates).

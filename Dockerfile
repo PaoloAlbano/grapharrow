@@ -3,12 +3,19 @@ ARG PYTHON_VERSION=3.13
 ARG DISTRIBUTION_SOURCE=wheel-builder
 
 FROM python:${PYTHON_VERSION}-slim-trixie AS wheel-builder
+ARG STORAGE_EXTRA="cloud"
 WORKDIR /build
 RUN pip install --no-cache-dir uv==0.8.12
 COPY pyproject.toml uv.lock README.md LICENSE THIRD_PARTY_NOTICES.md ./
 COPY src ./src
 RUN uv build --wheel --no-sources --out-dir /dist \
-    && uv export --locked --no-dev --no-emit-project --output-file /dist/runtime-requirements.txt
+    && if [ -n "$STORAGE_EXTRA" ]; then \
+         uv export --locked --no-dev --no-emit-project --extra "$STORAGE_EXTRA" \
+           --output-file /dist/runtime-requirements.txt; \
+       else \
+         uv export --locked --no-dev --no-emit-project \
+           --output-file /dist/runtime-requirements.txt; \
+       fi
 
 FROM scratch AS prebuilt
 COPY dist/*.whl dist/runtime-requirements.txt /dist/

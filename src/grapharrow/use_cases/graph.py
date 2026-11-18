@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Generator, Mapping
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import PurePosixPath
@@ -13,6 +13,7 @@ from threading import BoundedSemaphore
 from typing import Any
 
 import pyarrow as pa  # type: ignore[import-untyped]
+import pyarrow.compute as pc  # type: ignore[import-untyped]
 
 from grapharrow.adapters.adjacency import AdjacencyIndexStore, GraphAdjacency
 from grapharrow.adapters.property_index import PropertyIndexStore
@@ -39,8 +40,7 @@ from grapharrow.repositories import (
     NodeRecord,
     SnapshotRepository,
 )
-from grapharrow.repositories.graph import EDGE_SCHEMA
-from grapharrow.use_cases.admin import DatabaseAdminUseCase
+from grapharrow.repositories.graph import EDGE_SCHEMA, _edges_table, _nodes_table
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +79,6 @@ class GraphStateUseCase:
     def __init__(
         self,
         *,
-        admin_service: DatabaseAdminUseCase,
         catalog_store: CatalogRepository,
         snapshot_store: SnapshotRepository,
         graph_store: GraphRepository,
@@ -89,7 +88,6 @@ class GraphStateUseCase:
         adjacency_index_max_bytes: int = 32 * 1024 * 1024,
     ) -> None:
         """Wire the repositories and admin service used by the graph state workflows."""
-        self._admin_service = admin_service
         self._catalog_store = catalog_store
         self._snapshot_store = snapshot_store
         self._graph_store = graph_store
@@ -134,18 +132,61 @@ class GraphStateUseCase:
 
     def capture_snapshot(self) -> SnapshotManifest:
         """Pin a published snapshot without loading canonical graph tables."""
-        self._admin_service.initialize()
-        return self._snapshot_store.load_manifest()
+        return self._catalog_store.bootstrap_snapshot()
+
+    @contextmanager
+    def edit_edge_properties_by_id(
+        self, *, edge_id: int, rel_type: str | None, properties: dict[str, object]
+    ) -> Generator[tuple[EdgeRecord | None] | None, None, None]:
+        """Publish a selective edit only after its caller successfully builds the result.
+
+        None selects the full write path. A one-element tuple containing None
+        represents a successful lookup with no match. Explicit transactions keep
+        their existing staging and rollback path.
+        """
+        with self.writer_lock():
+            snapshot = self.capture_snapshot()
+            catalog = self._catalog_store.load_for_snapshot(snapshot)
+            if catalog.constraints:
+                yield None
+                return
+            eligible, patch = self._graph_store.prepare_edge_property_patch(
+                snapshot, edge_id=edge_id, rel_type=rel_type, properties=properties
+            )
+            if not eligible:
+                yield None
+                return
+            yield (patch.after if patch is not None else None,)
+            if patch is None or patch.before == patch.after:
+                return
+            if self._snapshot_store.load_current_pointer().snapshot_id != snapshot.snapshot_id:
+                raise WriteConflictError(
+                    "Database changed since this write began. Retry in a new transaction."
+                )
+            next_id = SnapshotId(snapshot.snapshot_id.value + 1)
+            canonical, projected = self._graph_store.persist_edge_property_patch(patch, next_id)
+            manifest = replace(
+                snapshot,
+                snapshot_id=next_id,
+                parent_snapshot_id=snapshot.snapshot_id,
+                commit_txid=next_id.value,
+                created_at=_utc_now(),
+                edges=tuple(
+                    canonical if file == patch.canonical_file else file for file in snapshot.edges
+                ),
+                edge_properties=tuple(
+                    projected if file == patch.property_file else file
+                    for file in snapshot.edge_properties
+                ),
+            )
+            self._snapshot_store.publish(manifest, base=snapshot)
 
     def load_state(self, *, snapshot: SnapshotManifest | None = None) -> GraphState:
         """Load the current catalog, snapshot, and graph records."""
 
-        self._admin_service.initialize()
-        catalog = self._catalog_store.load(
-            version=snapshot.catalog_version if snapshot is not None else None
-        )
         if snapshot is None:
-            snapshot = self._snapshot_store.load_manifest()
+            snapshot = self.capture_snapshot()
+        catalog = self._catalog_store.load_for_snapshot(snapshot)
         node_table = self._graph_store.load_node_table(snapshot.nodes)
         edge_table = self._graph_store.load_edge_table(snapshot.edges)
         nodes = tuple(self._graph_store.node_records_from_table(node_table))
@@ -162,12 +203,11 @@ class GraphStateUseCase:
     def load_tabular_state(
         self, *, include_edges: bool = True, snapshot: SnapshotManifest | None = None
     ) -> GraphTabularState:
-        """Load canonical tables from a pinned or current snapshot using the live catalog."""
+        """Load canonical tables and their catalog from a pinned or current snapshot."""
 
-        self._admin_service.initialize()
-        catalog = self._catalog_store.load()
         if snapshot is None:
-            snapshot = self._snapshot_store.load_manifest()
+            snapshot = self.capture_snapshot()
+        catalog = self._catalog_store.load_for_snapshot(snapshot)
         node_table = self._graph_store.load_node_table(snapshot.nodes)
         edge_table = (
             self._graph_store.load_edge_table(snapshot.edges)
@@ -186,10 +226,9 @@ class GraphStateUseCase:
         self, *, include_edges: bool = True, snapshot: SnapshotManifest | None = None
     ) -> Generator[GraphTabularState, None, None]:
         """Share canonical buffers until the snapshot reader releases them."""
-        self._admin_service.initialize()
-        catalog = self._catalog_store.load()
         if snapshot is None:
-            snapshot = self._snapshot_store.load_manifest()
+            snapshot = self.capture_snapshot()
+        catalog = self._catalog_store.load_for_snapshot(snapshot)
         nodes, edges = snapshot.nodes, snapshot.edges
         edge_table = (
             self.snapshot_tables.borrow(
@@ -522,27 +561,14 @@ class GraphStateUseCase:
         if dst_id not in nodes_by_id:
             raise NotFoundError(f"Target node does not exist: {dst_id}")
 
-        edge = EdgeRecord(
-            edge_id=_next_edge_id(state.edges),
-            rel_type=rel_type,
+        return self._append_edge(
+            state,
+            nodes_by_id=nodes_by_id,
             src_id=src_id,
             dst_id=dst_id,
+            rel_type=rel_type,
             properties=properties,
         )
-        self._validate_edge(
-            catalog=state.catalog,
-            nodes=state.nodes,
-            nodes_by_id=nodes_by_id,
-            edge=edge,
-        )
-        next_catalog = self._ensure_catalog(state.catalog, labels=(), rel_types=(rel_type,))
-        next_state = self._publish_graph(
-            previous_state=state,
-            catalog=next_catalog,
-            nodes=list(state.nodes),
-            edges=[*state.edges, edge],
-        )
-        return next_state, edge
 
     @writer_locked
     def create_edge_by_reference(
@@ -575,6 +601,26 @@ class GraphStateUseCase:
             role="target",
         )
 
+        return self._append_edge(
+            state,
+            nodes_by_id=_nodes_by_id(state.nodes),
+            src_id=src_id,
+            dst_id=dst_id,
+            rel_type=rel_type,
+            properties=properties,
+        )
+
+    def _append_edge(
+        self,
+        state: GraphState,
+        *,
+        nodes_by_id: Mapping[int, NodeRecord],
+        src_id: int,
+        dst_id: int,
+        rel_type: str,
+        properties: dict[str, object],
+    ) -> tuple[GraphState, EdgeRecord]:
+        """Append one row to the canonical buffers held by the writer."""
         edge = EdgeRecord(
             edge_id=_next_edge_id(state.edges),
             rel_type=rel_type,
@@ -585,15 +631,17 @@ class GraphStateUseCase:
         self._validate_edge(
             catalog=state.catalog,
             nodes=state.nodes,
-            nodes_by_id=_nodes_by_id(state.nodes),
+            nodes_by_id=nodes_by_id,
             edge=edge,
         )
+        edge_table = pa.concat_tables([state.edge_table, _edges_table([edge])])
         next_catalog = self._ensure_catalog(state.catalog, labels=(), rel_types=(rel_type,))
         next_state = self._publish_graph(
             previous_state=state,
             catalog=next_catalog,
             nodes=list(state.nodes),
             edges=[*state.edges, edge],
+            edge_table=edge_table,
         )
         return next_state, edge
 
@@ -958,17 +1006,18 @@ class GraphStateUseCase:
         catalog: VersionedCatalog,
         nodes: list[NodeRecord],
         edges: list[EdgeRecord],
+        edge_table: pa.Table | None = None,
     ) -> GraphState:
-        """Persist a staged snapshot, update the current pointer, and return the new state."""
-        if (
-            self._snapshot_store.load_manifest() != previous_state.snapshot
-            or self._catalog_store.load() != previous_state.catalog
+        """Prepare immutable objects and publish the complete graph state."""
+        if self._snapshot_store.load_current_pointer().snapshot_id != (
+            previous_state.snapshot.snapshot_id
         ):
             raise WriteConflictError(
                 "Database changed since this write began. Retry in a new transaction."
             )
+        catalog_path = previous_state.snapshot.catalog_path
         if catalog.version != previous_state.catalog.version:
-            self._catalog_store.write(catalog)
+            catalog_path = self._catalog_store.stage(catalog)
 
         next_snapshot_id = SnapshotId(previous_state.snapshot.snapshot_id.value + 1)
         persisted = self._graph_store.persist_snapshot(
@@ -978,6 +1027,8 @@ class GraphStateUseCase:
             previous_snapshot=previous_state.snapshot,
             previous_nodes=previous_state.nodes,
             previous_edges=previous_state.edges,
+            previous_edge_table=previous_state.edge_table,
+            edge_table=edge_table,
         )
         manifest = SnapshotManifest(
             snapshot_id=next_snapshot_id,
@@ -985,6 +1036,7 @@ class GraphStateUseCase:
             commit_txid=next_snapshot_id.value,
             created_at=_utc_now(),
             catalog_version=catalog.version,
+            catalog_path=catalog_path,
             nodes=persisted.nodes,
             edges=persisted.edges,
             node_labels=persisted.node_labels,
@@ -993,28 +1045,25 @@ class GraphStateUseCase:
             adjacency_by_dest=persisted.adjacency_by_dest,
             edge_properties=persisted.edge_properties,
         )
-        try:
-            self._snapshot_store.publish(manifest, staged_relative_path=persisted.staged_dir)
-            node_table = (
-                previous_state.node_table
-                if persisted.nodes == previous_state.snapshot.nodes
-                else self._graph_store.load_node_table(persisted.nodes)
-            )
-            edge_table = (
-                previous_state.edge_table
-                if persisted.edges == previous_state.snapshot.edges
-                else self._graph_store.load_edge_table(persisted.edges)
-            )
-            return GraphState(
-                catalog=catalog,
-                snapshot=manifest,
-                node_table=node_table,
-                edge_table=edge_table,
-                nodes=tuple(nodes),
-                edges=tuple(edges),
-            )
-        finally:
-            self._graph_store.cleanup_staged(persisted.staged_dir)
+        node_table = (
+            previous_state.node_table
+            if persisted.nodes == previous_state.snapshot.nodes
+            else self._graph_store.load_node_table(persisted.nodes)
+        )
+        if persisted.edges == previous_state.snapshot.edges:
+            edge_table = previous_state.edge_table
+        elif edge_table is None:
+            edge_table = self._graph_store.load_edge_table(persisted.edges)
+        state = GraphState(
+            catalog=catalog,
+            snapshot=manifest,
+            node_table=node_table,
+            edge_table=edge_table,
+            nodes=tuple(nodes),
+            edges=tuple(edges),
+        )
+        self._snapshot_store.publish(manifest, base=previous_state.snapshot)
+        return state
 
     def _ensure_catalog(
         self,
@@ -1283,6 +1332,7 @@ class GraphTransactionUseCase:
             self._base_state = graph_service.load_state()
         self.transaction_time_ns = time.time_ns()
         self._state = self._base_state
+        self._reuse_edge_table_on_commit = False
         self._closed = False
         self._adjacency_table: pa.Table | None = None
         self._adjacency_index: GraphAdjacency | None = None
@@ -1292,10 +1342,12 @@ class GraphTransactionUseCase:
         """Keep earlier transaction changes if an updating statement fails."""
         self._ensure_open()
         before = self._state
+        reuse_edge_table = self._reuse_edge_table_on_commit
         try:
             yield
         except BaseException:
             self._state = before
+            self._reuse_edge_table_on_commit = reuse_edge_table
             self._adjacency_table = None
             self._adjacency_index = None
             raise
@@ -1343,14 +1395,21 @@ class GraphTransactionUseCase:
         return nullcontext(self.load_tabular_state(include_edges=include_edges))
 
     def replace_records(
-        self, nodes: tuple[NodeRecord, ...], edges: tuple[EdgeRecord, ...]
+        self,
+        nodes: tuple[NodeRecord, ...],
+        edges: tuple[EdgeRecord, ...],
+        *,
+        edge_property_update: bool = False,
+        deleted_edge_ids: set[int] | None = None,
     ) -> GraphState:
         """Validate and stage the records produced by one updating clause."""
         self._ensure_open()
+        nodes_unchanged = len(nodes) == len(self._state.nodes) and all(
+            new is old for new, old in zip(nodes, self._state.nodes, strict=True)
+        )
         if (
-            len(nodes) == len(self._state.nodes)
+            nodes_unchanged
             and len(edges) == len(self._state.edges)
-            and all(new is old for new, old in zip(nodes, self._state.nodes, strict=True))
             and all(new is old for new, old in zip(edges, self._state.edges, strict=True))
         ):
             return self._state
@@ -1360,6 +1419,23 @@ class GraphTransactionUseCase:
             rel_types=tuple(edge.rel_type for edge in edges),
         )
         self._graph_service._validate_full_graph(catalog=catalog, nodes=nodes, edges=edges)
+        if deleted_edge_ids and nodes_unchanged:
+            return self._stage_edge_table(
+                catalog,
+                self._state.nodes,
+                edges,
+                _without_edge_ids(self._state.edge_table, deleted_edge_ids),
+            )
+        if edge_property_update:
+            positions = [
+                index
+                for index, (new, old) in enumerate(zip(edges, self._state.edges, strict=True))
+                if new is not old
+            ]
+            if positions:
+                return self._stage_edge_properties(
+                    catalog, self._state.nodes if nodes_unchanged else nodes, edges, positions
+                )
         return self._replace_state(catalog=catalog, nodes=list(nodes), edges=list(edges))
 
     def publish_records(
@@ -1462,8 +1538,13 @@ class GraphTransactionUseCase:
 
         nodes = list(self._state.nodes)
         edges = list(self._state.edges)
-        node_indexes = {node.node_id: index for index, node in enumerate(nodes)}
-        edge_indexes = {edge.edge_id: index for index, edge in enumerate(edges)}
+        node_indexes = (
+            {node.node_id: index for index, node in enumerate(nodes)} if node_updates else {}
+        )
+        edge_indexes = (
+            {edge.edge_id: index for index, edge in enumerate(edges)} if edge_updates else {}
+        )
+        changed_edge_positions: set[int] = set()
 
         for node_id, property_name, value in node_updates:
             index = node_indexes.get(node_id)
@@ -1484,6 +1565,7 @@ class GraphTransactionUseCase:
             index = edge_indexes.get(edge_id)
             if index is None:
                 raise NotFoundError(f"Relationship does not exist: {edge_id}")
+            changed_edge_positions.add(index)
             properties = dict(edges[index].properties)
             if remove_nulls and value is None:
                 properties.pop(property_name, None)
@@ -1502,11 +1584,47 @@ class GraphTransactionUseCase:
             nodes=tuple(nodes),
             edges=tuple(edges),
         )
-        return self._replace_state(
-            catalog=self._state.catalog,
+        if changed_edge_positions:
+            return self._stage_edge_properties(
+                self._state.catalog,
+                tuple(nodes) if node_updates else self._state.nodes,
+                tuple(edges),
+                sorted(changed_edge_positions),
+            )
+        return self._replace_state(catalog=self._state.catalog, nodes=nodes, edges=edges)
+
+    def _stage_edge_properties(
+        self,
+        catalog: VersionedCatalog,
+        nodes: tuple[NodeRecord, ...],
+        edges: tuple[EdgeRecord, ...],
+        positions: list[int],
+    ) -> GraphState:
+        edge_table = _replace_edge_property_rows(self._state.edge_table, edges, positions)
+        return self._stage_edge_table(catalog, nodes, edges, edge_table)
+
+    def _stage_edge_table(
+        self,
+        catalog: VersionedCatalog,
+        nodes: tuple[NodeRecord, ...],
+        edges: tuple[EdgeRecord, ...],
+        edge_table: pa.Table,
+    ) -> GraphState:
+        node_table = (
+            self._state.node_table if nodes is self._state.nodes else _nodes_table(list(nodes))
+        )
+        self._state = replace(
+            self._state,
+            catalog=catalog,
+            node_table=node_table,
+            edge_table=edge_table,
             nodes=nodes,
             edges=edges,
         )
+        self._adjacency_table = None
+        self._adjacency_index = None
+        self._reuse_edge_table_on_commit = True
+        return self._state
 
     def remove_properties_batch(
         self,
@@ -1610,9 +1728,25 @@ class GraphTransactionUseCase:
         if not node_ids and not edge_ids:
             return self._state
 
-        node_id_set = set(node_ids)
         edge_id_set = set(edge_ids)
+        if not node_ids:
+            remaining = tuple(edge for edge in self._state.edges if edge.edge_id not in edge_id_set)
+            if len(self._state.edges) - len(remaining) != len(edge_id_set):
+                missing = edge_id_set.difference(edge.edge_id for edge in self._state.edges)
+                raise NotFoundError(f"Relationship does not exist: {min(missing)}")
+            self._graph_service._validate_full_graph(
+                catalog=self._state.catalog,
+                nodes=self._state.nodes,
+                edges=remaining,
+            )
+            return self._stage_edge_table(
+                self._state.catalog,
+                self._state.nodes,
+                remaining,
+                _without_edge_ids(self._state.edge_table, edge_id_set),
+            )
 
+        node_id_set = set(node_ids)
         existing_node_ids = {node.node_id for node in self._state.nodes}
         existing_edge_ids = {edge.edge_id for edge in self._state.edges}
         missing_nodes = sorted(
@@ -1662,6 +1796,7 @@ class GraphTransactionUseCase:
             catalog=self._state.catalog,
             nodes=list(self._state.nodes),
             edges=list(self._state.edges),
+            edge_table=self._state.edge_table if self._reuse_edge_table_on_commit else None,
         )
 
     def rollback(self) -> GraphState:
@@ -1725,6 +1860,53 @@ class GraphTransactionUseCase:
         """Reject operations after commit or rollback has already closed the transaction."""
         if self._closed:
             raise QueryError("Transaction is already closed.")
+
+
+def _without_edge_ids(table: pa.Table, edge_ids: set[int]) -> pa.Table:
+    """Remove edges in row order and reuse Arrow buffers for sparse deletions."""
+    mask = pc.is_in(table["edge_id"], value_set=pa.array(sorted(edge_ids), type=pa.int64()))
+    if max(column.num_chunks for column in table.columns) + len(edge_ids) > 256:
+        return table.filter(pc.invert(mask))
+
+    spans = []
+    start = 0
+    for position in pc.indices_nonzero(mask).to_pylist():
+        if position > start:
+            spans.append(table.slice(start, position - start))
+        start = position + 1
+    if start < table.num_rows:
+        spans.append(table.slice(start))
+    return pa.concat_tables(spans) if spans else table.slice(0, 0)
+
+
+def _replace_edge_property_rows(
+    table: pa.Table, edges: tuple[EdgeRecord, ...], positions: list[int]
+) -> pa.Table:
+    """Replace encoded properties while keeping the endpoint and ID columns."""
+    field = table.schema.field("properties_json")
+    column = table[field.name]
+    replacements = pa.array(
+        [property_codec.dumps(edges[position].properties) for position in positions],
+        type=field.type,
+    )
+    if column.num_chunks + 2 * len(positions) <= 256:
+        chunks = []
+        start = 0
+        for offset, position in enumerate(positions):
+            if position > start:
+                chunks.extend(column.slice(start, position - start).chunks)
+            chunks.append(replacements.slice(offset, 1))
+            start = position + 1
+        if start < len(column):
+            chunks.extend(column.slice(start).chunks)
+        updated = pa.chunked_array(chunks, type=field.type)
+    else:
+        # Bound fragmentation after large batches or repeated sparse updates.
+        identifiers = table["edge_id"]
+        changed_ids = pc.take(identifiers, pa.array(positions, type=pa.int64()))
+        mask = pc.is_in(identifiers, value_set=changed_ids).combine_chunks()
+        updated = pc.replace_with_mask(column.combine_chunks(), mask, replacements)
+    return table.set_column(table.schema.get_field_index(field.name), field, updated)
 
 
 def _next_node_id(nodes: tuple[NodeRecord, ...]) -> int:

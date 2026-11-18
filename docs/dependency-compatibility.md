@@ -20,6 +20,14 @@ benchmark dependency group:
 uv sync --locked --group benchmark
 ```
 
+To run provider SDK tests and type checks with all cloud integrations:
+
+```sh
+uv sync --locked --all-extras
+uv run --frozen --all-extras pytest -m "not live_storage and not neo4j_reference"
+uv run --frozen --all-extras mypy src
+```
+
 Development dependencies include HTTP test clients, the Neo4j comparison driver,
 and local cloud-storage emulators. They are not runtime requirements.
 GraphArrow implements ANA tools itself and does not install the reference ANA
@@ -27,16 +35,55 @@ server or the Neo4j driver as runtime dependencies.
 
 ## Runtime installation
 
-The Docker image installs locked runtime dependencies without the development
-group. The equivalent checkout installation is:
+The default Docker image installs locked runtime dependencies and the `cloud`
+extra without the development group. The equivalent checkout installation is:
 
 ```sh
-uv sync --locked --no-dev
+uv sync --locked --no-dev --extra cloud
 ```
 
 An installed wheel uses the runtime requirement ranges declared in its package
 metadata; it does not enforce the repository lockfile. Use the lockfile when
 an exact, reproducible dependency environment is required.
+
+## Optional cloud SDKs
+
+Cloud data reads use PyArrow; publishing and reading the database head uses the
+provider SDK to preserve conditional-write semantics. These SDKs are loaded only
+when their provider is selected. Local storage and the default server installation
+do not require them. Missing SDKs produce an error naming the required extra.
+
+| Extra | SDKs |
+| --- | --- |
+| `s3` | boto3 |
+| `azure` | azure-storage-blob, azure-identity |
+| `gcs` | google-cloud-storage |
+| `cloud` | All three provider integrations |
+
+```sh
+uv sync --locked --extra s3
+uv run --frozen --extra s3 grapharrow-server --path s3://my-bucket/my-db
+pip install 'grapharrow[s3]'
+# Before PyPI publication, use a downloaded release wheel instead:
+pip install './grapharrow-<version>-py3-none-any.whl[s3]'
+```
+
+The default Docker image includes all provider SDKs. Their Python modules are
+imported only when the corresponding provider is used, so local storage does not
+load them. To build an image with only one provider SDK from the checkout:
+
+```sh
+docker build --build-arg STORAGE_EXTRA=s3 -t grapharrow:s3 .
+```
+
+Use `azure`, `gcs`, or `cloud` for the other extras. `STORAGE_EXTRA` defaults to
+`cloud`; set it to an empty value for a local-only image. The source-build option
+above regenerates locked requirements with the selected extra. Release builds
+export `runtime-requirements.txt` with `--extra cloud`; the prebuilt image path
+uses those supplied requirements. Installing the wheel without extras keeps
+cloud SDKs optional regardless of the Docker configuration.
+Development environments using Moto also install boto3 as an emulator dependency;
+that does not make it a dependency of the base GraphArrow package.
 
 ## Storage compatibility
 

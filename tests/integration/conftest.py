@@ -7,11 +7,11 @@ from pathlib import Path
 from uuid import uuid4
 
 import boto3  # type: ignore[import-untyped]
-import pyarrow.fs as pafs  # type: ignore[import-untyped]
 import pytest
 from moto.server import ThreadedMotoServer
 
 from grapharrow.adapters import FileSystemAdapter
+from grapharrow.config import GraphArrowSettings
 from tests.integration.support import LocalDiskContext, MotoS3Context, RemoteObjectStorageContext
 
 
@@ -32,14 +32,15 @@ def moto_s3_filesystem() -> Iterator[MotoS3Context]:
     bucket_name = f"grapharrow-tests-{uuid4().hex[:12]}"
     client.create_bucket(Bucket=bucket_name)
 
-    s3_filesystem = pafs.S3FileSystem(
-        access_key="test",
-        secret_key="test",
-        region="us-east-1",
-        scheme="http",
-        endpoint_override=f"{host}:{port}",
+    filesystem = FileSystemAdapter.from_settings(
+        GraphArrowSettings(
+            s3_access_key="test",
+            s3_secret_key="test",
+            s3_region="us-east-1",
+            s3_scheme="http",
+            s3_endpoint=f"{host}:{port}",
+        )
     )
-    filesystem = FileSystemAdapter(mounts={f"s3://{bucket_name}": (s3_filesystem, bucket_name)})
 
     try:
         yield MotoS3Context(
@@ -76,7 +77,7 @@ def _live_object_storage_context(
     if not base_uri:
         pytest.skip(f"{env_name} is not configured.")
 
-    filesystem = FileSystemAdapter()
+    filesystem = FileSystemAdapter.from_settings(GraphArrowSettings())
     root_uri = f"{base_uri.rstrip('/')}/{uuid4().hex[:12]}"
     database_uri = f"{root_uri}/example-db"
 

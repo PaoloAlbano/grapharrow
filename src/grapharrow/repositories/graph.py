@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+from uuid import uuid4
 
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.compute as pc  # type: ignore[import-untyped]
 
 from grapharrow.adapters import FileSystemAdapter, ParquetAdapter, PyArrowTabularAdapter
-from grapharrow.core import DatabaseLayout, Location, property_codec
+from grapharrow.adapters.checksum import sha256_file as _compute_sha256
+from grapharrow.core import DatabaseLayout, property_codec
 from grapharrow.domain import DatasetFile, SnapshotId, SnapshotManifest
 from grapharrow.domain.scan import ScanPredicate
 from grapharrow.domain.snapshot import DatasetKind
@@ -45,6 +48,11 @@ ADJACENCY_BY_SOURCE_SCHEMA = pa.schema(
     ]
 )
 
+_EDGE_RANGE_PATH = re.compile(
+    r"data/edges/range-([1-9][0-9]*)/([0-9]+)/snapshot-[0-9]+(?:-[0-9a-f]{32})?\.parquet"
+)
+_DEFAULT_EDGE_RANGE_SIZE = 32_768
+
 
 @dataclass(frozen=True, slots=True)
 class NodeRecord:
@@ -70,7 +78,6 @@ class EdgeRecord:
 class PersistedGraph:
     """Files generated for a published graph snapshot."""
 
-    staged_dir: str
     nodes: tuple[DatasetFile, ...]
     edges: tuple[DatasetFile, ...]
     node_labels: tuple[DatasetFile, ...]
@@ -78,6 +85,18 @@ class PersistedGraph:
     adjacency_by_source: tuple[DatasetFile, ...]
     adjacency_by_dest: tuple[DatasetFile, ...]
     edge_properties: tuple[DatasetFile, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class EdgePropertyPatch:
+    """A schema-preserving edit of one canonical range and its property projection."""
+
+    before: EdgeRecord
+    after: EdgeRecord
+    canonical_file: DatasetFile
+    canonical_table: pa.Table
+    property_file: DatasetFile
+    property_table: pa.Table
 
 
 class GraphRepository:
@@ -89,12 +108,104 @@ class GraphRepository:
         parquet_adapter: ParquetAdapter | None = None,
         tabular_adapter: PyArrowTabularAdapter | None = None,
         filesystem: FileSystemAdapter | None = None,
+        *,
+        edge_parquet_range_size: int | None = None,
     ) -> None:
         """Bind the layout and adapters used to read and publish canonical and derived datasets."""
         self._layout = layout
         self._filesystem = filesystem or FileSystemAdapter()
         self._parquet = parquet_adapter or ParquetAdapter()
         self._tabular = tabular_adapter or PyArrowTabularAdapter()
+        self._edge_parquet_range_size = edge_parquet_range_size
+
+    def prepare_edge_property_patch(
+        self,
+        snapshot: SnapshotManifest,
+        *,
+        edge_id: int,
+        rel_type: str | None,
+        properties: dict[str, object],
+    ) -> tuple[bool, EdgePropertyPatch | None]:
+        """Read only the touched range; decline edits that could change a global schema."""
+        layout = _edge_range_layout(snapshot.edges)
+        if layout is None:
+            return False, None
+        width, files = layout
+        bucket = (edge_id - 1) // width
+        canonical_file = files.get(bucket)
+        if canonical_file is None:
+            return True, None
+        table = self.load_edge_table((canonical_file,))
+        positions = pc.indices_nonzero(pc.equal(table["edge_id"], edge_id)).to_pylist()
+        if not positions:
+            return True, None
+        if len(positions) != 1:
+            return False, None
+        position = positions[0]
+        before = self.edge_records_from_table(table.slice(position, 1))[0]
+        if rel_type is not None and before.rel_type != rel_type:
+            return True, None
+        for key, value in properties.items():
+            old = before.properties.get(key)
+            if type(value) not in (str, bool, int, float) or type(old) is not type(value):
+                return False, None
+            if type(value) is int and not -(2**63) <= value < 2**63:
+                return False, None
+        candidates = [
+            file
+            for file in snapshot.edge_properties
+            if _rel_type_from_edge_property_file(file) == before.rel_type
+            and _edge_property_file_matches_layout(file, width)
+            and Path(file.path).parent.name == f"{bucket:020d}"
+        ]
+        if len(candidates) != 1:
+            return False, None
+        property_file = candidates[0]
+        projection = self._parquet.read_table(self._absolute_location(property_file.path))
+        if any(
+            key not in projection.schema.names or key in _EDGE_ENDPOINT_FIELDS for key in properties
+        ):
+            return False, None
+        projected_positions = pc.indices_nonzero(
+            pc.equal(projection["edge_id"], edge_id)
+        ).to_pylist()
+        if len(projected_positions) != 1:
+            return False, None
+        after = EdgeRecord(
+            before.edge_id,
+            before.rel_type,
+            before.src_id,
+            before.dst_id,
+            {**before.properties, **properties},
+        )
+        try:
+            row = _edge_property_table([after], projection.schema)
+        except (pa.ArrowInvalid, pa.ArrowTypeError, OverflowError):
+            return False, None
+        canonical_row = table.slice(position, 1).set_column(
+            table.schema.get_field_index("properties_json"),
+            "properties_json",
+            pa.array([property_codec.dumps(after.properties)], type=pa.string()),
+        )
+        return True, EdgePropertyPatch(
+            before,
+            after,
+            canonical_file,
+            _replace_row(table, position, canonical_row),
+            property_file,
+            _replace_row(projection, projected_positions[0], row),
+        )
+
+    def persist_edge_property_patch(
+        self, patch: EdgePropertyPatch, snapshot_id: SnapshotId
+    ) -> tuple[DatasetFile, DatasetFile]:
+        """Write two immutable replacements without rebuilding unrelated graph datasets."""
+        filename = f"snapshot-{snapshot_id.value:06d}-{uuid4().hex}.parquet"
+        canonical_parts = (*Path(patch.canonical_file.path).parts[2:-1], filename)
+        canonical = self._write_edge_file(patch.canonical_table, canonical_parts)
+        property_parts = (*Path(patch.property_file.path).parts[2:-1], filename)
+        projected = self._write_edge_property_table(patch.property_table, property_parts)
+        return canonical, projected
 
     def load_node_table(self, files: tuple[DatasetFile, ...]) -> pa.Table:
         """Load node tables referenced by ``files`` into one Arrow table."""
@@ -299,93 +410,75 @@ class GraphRepository:
         previous_snapshot: SnapshotManifest | None = None,
         previous_nodes: tuple[NodeRecord, ...] | None = None,
         previous_edges: tuple[EdgeRecord, ...] | None = None,
+        previous_edge_table: pa.Table | None = None,
+        edge_table: pa.Table | None = None,
     ) -> PersistedGraph:
-        """Write graph records for ``snapshot_id`` and return manifest file metadata."""
+        """Write graph records, optionally reusing the canonical table for ``edges``."""
 
         self._layout.ensure_base_directories()
-        staged_dir = self._join(self._layout.staged_dir, f"tx-{snapshot_id.value:06d}")
-        if self._filesystem.exists(staged_dir):
-            self._filesystem.delete_dir(staged_dir)
-        self._filesystem.create_dir(staged_dir)
-
-        staged_nodes_path = self._join(
-            staged_dir,
-            "data",
-            "nodes",
-            f"snapshot-{snapshot_id.value:06d}.parquet",
-        )
-        staged_edges_path = self._join(
-            staged_dir,
-            "data",
-            "edges",
-            f"snapshot-{snapshot_id.value:06d}.parquet",
-        )
-        final_nodes_path = self._join(
-            self._layout.nodes_dir,
-            f"snapshot-{snapshot_id.value:06d}.parquet",
-        )
-        final_edges_path = self._join(
-            self._layout.edges_dir,
-            f"snapshot-{snapshot_id.value:06d}.parquet",
-        )
-        self._filesystem.create_dir(self._parent(staged_nodes_path))
-        self._filesystem.create_dir(self._parent(staged_edges_path))
+        filename = f"snapshot-{snapshot_id.value:06d}-{uuid4().hex}.parquet"
+        final_nodes_path = self._join(self._layout.nodes_dir, filename)
 
         same_nodes = (
             previous_snapshot is not None
             and previous_nodes is not None
             and list(previous_nodes) == nodes
         )
+        relationship_types = {edge.rel_type for edge in edges}
+        edge_groups = _unchanged_edge_groups(previous_edges, edges)
         same_edges = (
             previous_snapshot is not None
             and previous_edges is not None
             and list(previous_edges) == edges
+            and edge_groups == relationship_types
         )
         if not same_nodes:
-            self._parquet.write_table(_nodes_table(nodes), staged_nodes_path)
-            self._filesystem.copy_file(staged_nodes_path, final_nodes_path)
-        edge_table = None
+            self._filesystem.create_dir(self._parent(final_nodes_path))
+            self._parquet.write_table(_nodes_table(nodes), final_nodes_path)
+        previous_edge_files = previous_snapshot.edges if previous_snapshot is not None else ()
+        edge_files = previous_edge_files
         if not same_edges:
-            edge_table = _edges_table(edges)
-            self._parquet.write_table(edge_table, staged_edges_path)
-            self._filesystem.copy_file(staged_edges_path, final_edges_path)
+            if edge_table is None:
+                edge_table = _edges_table(edges)
+            edge_files = self._persist_edge_files(
+                filename,
+                edge_table,
+                previous_edge_files=previous_edge_files,
+                previous_edge_table=previous_edge_table,
+                allow_conversion=previous_edges is None,
+            )
         node_groups = _unchanged_node_groups(previous_nodes, nodes)
-        edge_groups = _unchanged_edge_groups(previous_edges, edges)
         label_groups = _unchanged_label_groups(previous_nodes, nodes)
         topology_groups = _unchanged_topology_groups(previous_edges, edges)
 
         node_label_files = self._persist_node_label_indexes(
-            snapshot_id=snapshot_id,
+            filename=filename,
             nodes=nodes,
-            staged_dir=staged_dir,
             reuse_files=previous_snapshot.node_labels if previous_snapshot is not None else (),
             unchanged=label_groups,
         )
         node_property_files = self._persist_node_property_tables(
-            snapshot_id=snapshot_id,
+            filename=filename,
             nodes=nodes,
-            staged_dir=staged_dir,
             reuse_files=previous_snapshot.node_properties if previous_snapshot is not None else (),
             unchanged=node_groups,
         )
         adjacency_files, adjacency_by_dest_files = self._persist_adjacency(
-            snapshot_id=snapshot_id,
-            relationship_types={edge.rel_type for edge in edges},
+            filename=filename,
+            relationship_types=relationship_types,
             edge_table=edge_table,
-            staged_dir=staged_dir,
             previous_snapshot=previous_snapshot,
             unchanged=topology_groups,
         )
         edge_property_files = self._persist_edge_property_tables(
-            snapshot_id=snapshot_id,
+            filename=filename,
             edges=edges,
-            staged_dir=staged_dir,
-            reuse_files=previous_snapshot.edge_properties if previous_snapshot is not None else (),
+            edge_files=edge_files,
+            previous_snapshot=previous_snapshot,
             unchanged=edge_groups,
         )
 
         persisted = PersistedGraph(
-            staged_dir=self._layout.relative_path(staged_dir),
             nodes=previous_snapshot.nodes
             if same_nodes and previous_snapshot is not None
             else (
@@ -399,19 +492,7 @@ class GraphRepository:
                     max_key=max((record.node_id for record in nodes), default=None),
                 ),
             ),
-            edges=previous_snapshot.edges
-            if same_edges and previous_snapshot is not None
-            else (
-                _dataset_file_for(
-                    path=final_edges_path,
-                    layout=self._layout,
-                    filesystem=self._filesystem,
-                    kind="edges",
-                    row_count=len(edges),
-                    min_key=min((record.edge_id for record in edges), default=None),
-                    max_key=max((record.edge_id for record in edges), default=None),
-                ),
-            ),
+            edges=edge_files,
             node_labels=node_label_files,
             node_properties=node_property_files,
             adjacency_by_source=adjacency_files,
@@ -420,12 +501,70 @@ class GraphRepository:
         )
         return persisted
 
-    def cleanup_staged(self, staged_relative_path: str) -> None:
-        """Remove a staged transaction directory best-effort."""
+    def _persist_edge_files(
+        self,
+        filename: str,
+        table: pa.Table,
+        *,
+        previous_edge_files: tuple[DatasetFile, ...],
+        previous_edge_table: pa.Table | None,
+        allow_conversion: bool,
+    ) -> tuple[DatasetFile, ...]:
+        """Retain existing ranges and write one immutable file per changed range."""
+        previous_layout = _edge_range_layout(previous_edge_files)
+        previous_files: dict[int, DatasetFile]
+        if allow_conversion and self._edge_parquet_range_size is not None:
+            width, previous_files = self._edge_parquet_range_size, {}
+        elif previous_layout is not None:
+            width, previous_files = previous_layout
+        elif allow_conversion or not previous_edge_files:
+            width = (
+                self._edge_parquet_range_size
+                if self._edge_parquet_range_size is not None
+                else _DEFAULT_EDGE_RANGE_SIZE
+            )
+            previous_files = {}
+        else:
+            width, previous_files = 0, {}
 
-        absolute = self._absolute_location(staged_relative_path)
-        if self._filesystem.exists(absolute):
-            self._filesystem.delete_dir(absolute)
+        if not width:
+            return (self._write_edge_file(table, (filename,)),)
+
+        previous_ranges = (
+            dict(_edge_ranges(previous_edge_table, width))
+            if previous_files and previous_edge_table is not None
+            else {}
+        )
+        files = []
+        for bucket, rows in _edge_ranges(table, width):
+            previous_file = previous_files.get(bucket)
+            previous_rows = previous_ranges.get(bucket)
+            if (
+                previous_file is not None
+                and previous_rows is not None
+                and previous_file.row_count == rows.num_rows
+                and previous_rows.equals(rows)
+            ):
+                files.append(previous_file)
+            else:
+                parts = (f"range-{width}", f"{bucket:020d}", filename)
+                files.append(self._write_edge_file(rows, parts))
+        return tuple(files)
+
+    def _write_edge_file(self, table: pa.Table, parts: tuple[str, ...]) -> DatasetFile:
+        final_path = self._join(self._layout.edges_dir, *parts)
+        self._filesystem.create_dir(self._parent(final_path))
+        self._parquet.write_table(table, final_path)
+        bounds = pc.min_max(table["edge_id"]).as_py()
+        return _dataset_file_for(
+            path=final_path,
+            layout=self._layout,
+            filesystem=self._filesystem,
+            kind="edges",
+            row_count=table.num_rows,
+            min_key=bounds["min"],
+            max_key=bounds["max"],
+        )
 
     def _absolute_location(self, relative_path: str) -> str | Path:
         """Resolve a manifest-relative dataset path against the configured database root."""
@@ -452,9 +591,8 @@ class GraphRepository:
     def _persist_node_label_indexes(
         self,
         *,
-        snapshot_id: SnapshotId,
+        filename: str,
         nodes: list[NodeRecord],
-        staged_dir: Location,
         reuse_files: tuple[DatasetFile, ...] = (),
         unchanged: set[str] | None = None,
     ) -> tuple[DatasetFile, ...]:
@@ -473,21 +611,12 @@ class GraphRepository:
             final_path = self._join(
                 self._layout.node_labels_dir,
                 label,
-                f"snapshot-{snapshot_id.value:06d}.parquet",
+                filename,
             )
-            staged_path = self._join(
-                staged_dir,
-                "derived",
-                "node_labels",
-                label,
-                f"snapshot-{snapshot_id.value:06d}.parquet",
-            )
-            self._filesystem.create_dir(self._parent(staged_path))
             self._filesystem.create_dir(self._parent(final_path))
             node_ids = sorted(node_ids)
             table = pa.Table.from_pydict({"node_id": node_ids}, schema=NODE_LABEL_SCHEMA)
-            self._parquet.write_table(table, staged_path)
-            self._filesystem.copy_file(staged_path, final_path)
+            self._parquet.write_table(table, final_path)
             dataset_files.append(
                 _dataset_file_for(
                     path=final_path,
@@ -504,10 +633,9 @@ class GraphRepository:
     def _persist_adjacency(
         self,
         *,
-        snapshot_id: SnapshotId,
+        filename: str,
         relationship_types: set[str],
         edge_table: pa.Table | None,
-        staged_dir: Location,
         previous_snapshot: SnapshotManifest | None,
         unchanged: set[str],
     ) -> tuple[tuple[DatasetFile, ...], tuple[DatasetFile, ...]]:
@@ -537,15 +665,11 @@ class GraphRepository:
             for rel_type, endpoints in _adjacency_rows_by_type(edge_table, missing):
                 if rel_type not in by_source:
                     by_source[rel_type] = [
-                        self._write_adjacency(
-                            endpoints, rel_type, snapshot_id, staged_dir, by_source=True
-                        )
+                        self._write_adjacency(endpoints, rel_type, filename, by_source=True)
                     ]
                 if rel_type not in by_dest:
                     by_dest[rel_type] = [
-                        self._write_adjacency(
-                            endpoints, rel_type, snapshot_id, staged_dir, by_source=False
-                        )
+                        self._write_adjacency(endpoints, rel_type, filename, by_source=False)
                     ]
         ordered_types = sorted(relationship_types)
         return (
@@ -557,28 +681,22 @@ class GraphRepository:
         self,
         endpoints: pa.Table,
         rel_type: str,
-        snapshot_id: SnapshotId,
-        staged_dir: Location,
+        filename: str,
         *,
         by_source: bool,
     ) -> DatasetFile:
         primary, secondary = ("src_id", "dst_id") if by_source else ("dst_id", "src_id")
-        direction = "by_source" if by_source else "by_dest"
         final_dir = (
             self._layout.adjacency_by_source_dir
             if by_source
             else self._layout.adjacency_by_dest_dir
         )
-        filename = f"snapshot-{snapshot_id.value:06d}.parquet"
         final_path = self._join(final_dir, rel_type, filename)
-        staged_path = self._join(staged_dir, "derived", "adjacency", direction, rel_type, filename)
-        self._filesystem.create_dir(self._parent(staged_path))
         self._filesystem.create_dir(self._parent(final_path))
         table = endpoints.sort_by(
             [(primary, "ascending"), (secondary, "ascending"), ("edge_id", "ascending")]
         )
-        self._parquet.write_table(table, staged_path)
-        self._filesystem.copy_file(staged_path, final_path)
+        self._parquet.write_table(table, final_path)
         keys = table[primary]
         return _dataset_file_for(
             path=final_path,
@@ -593,9 +711,8 @@ class GraphRepository:
     def _persist_node_property_tables(
         self,
         *,
-        snapshot_id: SnapshotId,
+        filename: str,
         nodes: list[NodeRecord],
-        staged_dir: Location,
         reuse_files: tuple[DatasetFile, ...] = (),
         unchanged: set[str] | None = None,
     ) -> tuple[DatasetFile, ...]:
@@ -614,20 +731,11 @@ class GraphRepository:
             final_path = self._join(
                 self._layout.node_properties_dir,
                 label,
-                f"snapshot-{snapshot_id.value:06d}.parquet",
+                filename,
             )
-            staged_path = self._join(
-                staged_dir,
-                "derived",
-                "node_properties",
-                label,
-                f"snapshot-{snapshot_id.value:06d}.parquet",
-            )
-            self._filesystem.create_dir(self._parent(staged_path))
             self._filesystem.create_dir(self._parent(final_path))
             table = _node_property_table(sorted(typed_nodes, key=lambda item: item.node_id))
-            self._parquet.write_table(table, staged_path)
-            self._filesystem.copy_file(staged_path, final_path)
+            self._parquet.write_table(table, final_path)
             node_ids = [node.node_id for node in typed_nodes]
             dataset_files.append(
                 _dataset_file_for(
@@ -645,54 +753,145 @@ class GraphRepository:
     def _persist_edge_property_tables(
         self,
         *,
-        snapshot_id: SnapshotId,
+        filename: str,
         edges: list[EdgeRecord],
-        staged_dir: Location,
-        reuse_files: tuple[DatasetFile, ...] = (),
-        unchanged: set[str] | None = None,
+        edge_files: tuple[DatasetFile, ...],
+        previous_snapshot: SnapshotManifest | None,
+        unchanged: set[str],
     ) -> tuple[DatasetFile, ...]:
-        """Write one property-columnar dataset per relationship type for relation-heavy queries."""
+        """Write schema-consistent property projections on the canonical edge ranges."""
         dataset_files: list[DatasetFile] = []
         by_type: dict[str, list[EdgeRecord]] = {}
         for edge in edges:
             by_type.setdefault(edge.rel_type, []).append(edge)
 
+        previous_by_type: dict[str, list[DatasetFile]] = {}
+        if previous_snapshot is not None:
+            for file in previous_snapshot.edge_properties:
+                rel = _rel_type_from_edge_property_file(file)
+                if rel is not None:
+                    previous_by_type.setdefault(rel, []).append(file)
+
+        layout = _edge_range_layout(edge_files)
+        width, ranges = layout if layout is not None else (0, {})
+        previous_edges = set(previous_snapshot.edges) if previous_snapshot is not None else set()
+        reusable_buckets = {bucket for bucket, file in ranges.items() if file in previous_edges}
+
         for rel_type, typed_edges in sorted(by_type.items()):
-            reused = tuple(item for item in reuse_files if Path(item.path).parent.name == rel_type)
-            if unchanged is not None and rel_type in unchanged and reused:
+            reused = previous_by_type.get(rel_type, [])
+            if (
+                rel_type in unchanged
+                and reused
+                and all(_edge_property_file_matches_layout(file, width) for file in reused)
+            ):
                 dataset_files.extend(reused)
                 continue
-            final_path = self._join(
-                self._layout.edge_properties_dir,
-                rel_type,
-                f"snapshot-{snapshot_id.value:06d}.parquet",
-            )
-            staged_path = self._join(
-                staged_dir,
-                "derived",
-                "edge_properties",
-                rel_type,
-                f"snapshot-{snapshot_id.value:06d}.parquet",
-            )
-            self._filesystem.create_dir(self._parent(staged_path))
-            self._filesystem.create_dir(self._parent(final_path))
             sorted_edges = sorted(typed_edges, key=lambda item: item.edge_id)
-            table = _edge_property_table(sorted_edges)
-            self._parquet.write_table(table, staged_path)
-            self._filesystem.copy_file(staged_path, final_path)
-            edge_ids = [edge.edge_id for edge in typed_edges]
-            dataset_files.append(
-                _dataset_file_for(
-                    path=final_path,
-                    layout=self._layout,
-                    filesystem=self._filesystem,
-                    kind="edge_properties",
-                    row_count=table.num_rows,
-                    min_key=min(edge_ids, default=None),
-                    max_key=max(edge_ids, default=None),
+            schema = _edge_property_schema(sorted_edges)
+            if not width:
+                dataset_files.append(
+                    self._write_edge_property_file((rel_type, filename), sorted_edges, schema)
                 )
-            )
+                continue
+
+            # A changed field layout invalidates every fragment for this relationship type.
+            signature = hashlib.sha256(schema.serialize()).hexdigest()
+            directory = f"range-{width}-{signature}"
+            prior = {Path(file.path).parent: file for file in reused}
+            for bucket, records in _group_edge_records(sorted_edges, width):
+                parts = (rel_type, directory, f"{bucket:020d}")
+                old = prior.get(Path("derived", "edge_properties", *parts))
+                if old is not None and bucket in reusable_buckets and old.row_count == len(records):
+                    dataset_files.append(old)
+                else:
+                    dataset_files.append(
+                        self._write_edge_property_file((*parts, filename), records, schema)
+                    )
         return tuple(dataset_files)
+
+    def _write_edge_property_file(
+        self,
+        parts: tuple[str, ...],
+        records: list[EdgeRecord],
+        schema: pa.Schema,
+    ) -> DatasetFile:
+        return self._write_edge_property_table(_edge_property_table(records, schema), parts)
+
+    def _write_edge_property_table(self, table: pa.Table, parts: tuple[str, ...]) -> DatasetFile:
+        final_path = self._join(self._layout.edge_properties_dir, *parts)
+        self._filesystem.create_dir(self._parent(final_path))
+        self._parquet.write_table(table, final_path)
+        bounds = pc.min_max(table["edge_id"]).as_py()
+        return _dataset_file_for(
+            path=final_path,
+            layout=self._layout,
+            filesystem=self._filesystem,
+            kind="edge_properties",
+            row_count=table.num_rows,
+            min_key=bounds["min"],
+            max_key=bounds["max"],
+        )
+
+
+def _replace_row(table: pa.Table, position: int, replacement: pa.Table) -> pa.Table:
+    """Reuse Arrow buffers outside one edited row."""
+    return pa.concat_tables([table.slice(0, position), replacement, table.slice(position + 1)])
+
+
+def _edge_property_file_matches_layout(file: DatasetFile, width: int) -> bool:
+    parts = Path(file.path).parts
+    if not width:
+        return len(parts) == 4
+    return len(parts) == 6 and parts[3].startswith(f"range-{width}-")
+
+
+def _group_edge_records(
+    records: list[EdgeRecord], width: int
+) -> Generator[tuple[int, list[EdgeRecord]], None, None]:
+    start = 0
+    bucket = (records[0].edge_id - 1) // width
+    for position, edge in enumerate(records):
+        current = (edge.edge_id - 1) // width
+        if current != bucket:
+            yield bucket, records[start:position]
+            start, bucket = position, current
+    yield bucket, records[start:]
+
+
+def _edge_range_layout(files: tuple[DatasetFile, ...]) -> tuple[int, dict[int, DatasetFile]] | None:
+    """Read the range width and bucket IDs from canonical file paths."""
+    width = 0
+    buckets: dict[int, DatasetFile] = {}
+    for file in files:
+        match = _EDGE_RANGE_PATH.fullmatch(Path(file.path).as_posix())
+        if match is None:
+            return None
+        size, bucket = map(int, match.groups())
+        if (width and size != width) or bucket in buckets:
+            return None
+        width = size
+        buckets[bucket] = file
+    return (width, buckets) if width else None
+
+
+def _edge_ranges(table: pa.Table, width: int) -> Generator[tuple[int, pa.Table], None, None]:
+    """Slice canonical rows by stable, one-based edge ID ranges."""
+    if not table.num_rows:
+        # An empty file retains the layout after the last edge is removed.
+        yield 0, table
+        return
+    groups = pc.divide(pc.subtract(table["edge_id"], 1), width)
+    if pc.any(pc.less(groups.slice(1), groups.slice(0, len(groups) - 1))).as_py():
+        order = pc.sort_indices(groups)
+        table = table.take(order)
+        groups = pc.take(groups, order)
+    boundaries = pc.indices_nonzero(
+        pc.not_equal(groups.slice(0, len(groups) - 1), groups.slice(1))
+    ).to_pylist()
+    start = 0
+    for stop in [*(index + 1 for index in boundaries), table.num_rows]:
+        yield groups[start].as_py(), table.slice(start, stop - start)
+        start = stop
 
 
 def _unchanged_node_groups(
@@ -724,7 +923,8 @@ def _unchanged_label_groups(
 
 
 def _unchanged_edge_groups(
-    previous: tuple[EdgeRecord, ...] | None, current: list[EdgeRecord]
+    previous: tuple[EdgeRecord, ...] | None,
+    current: list[EdgeRecord],
 ) -> set[str]:
     before: dict[str, list[EdgeRecord]] = {}
     after: dict[str, list[EdgeRecord]] = {}
@@ -732,7 +932,19 @@ def _unchanged_edge_groups(
         before.setdefault(edge.rel_type, []).append(edge)
     for edge in current:
         after.setdefault(edge.rel_type, []).append(edge)
-    return {kind for kind, records in after.items() if before.get(kind) == records}
+    unchanged = set()
+    for kind, records in after.items():
+        old = before.get(kind)
+        if old is None or old != records:
+            continue
+        if any(
+            left is not right
+            and property_codec.dumps(left.properties) != property_codec.dumps(right.properties)
+            for left, right in zip(old, records, strict=True)
+        ):
+            continue
+        unchanged.add(kind)
+    return unchanged
 
 
 def _unchanged_topology_groups(
@@ -833,25 +1045,49 @@ def _node_property_table(records: list[NodeRecord]) -> pa.Table:
     return pa.Table.from_arrays(list(columns.values()), schema=pa.schema(fields))
 
 
-def _edge_property_table(records: list[EdgeRecord]) -> pa.Table:
-    """Build the per-relationship-type property-columnar table used by the read engine."""
-    property_names = sorted({key for record in records for key in record.properties})
-    columns: dict[str, pa.Array] = {
-        "edge_id": pa.array([record.edge_id for record in records], type=pa.int64()),
-        "src_id": pa.array([record.src_id for record in records], type=pa.int64()),
-        "dst_id": pa.array([record.dst_id for record in records], type=pa.int64()),
-    }
-    metadata = {}
-    for property_name in property_names:
-        values = [record.properties.get(property_name) for record in records]
-        array = _property_column_array(values)
-        columns[property_name] = array
-        if any(property_codec.contains_temporal(value) for value in values):
-            metadata[property_name] = {"grapharrow.encoding": "temporal"}
-    fields = [
-        pa.field(name, array.type, metadata=metadata.get(name)) for name, array in columns.items()
+_EDGE_ENDPOINT_FIELDS = ("edge_id", "src_id", "dst_id")
+
+
+def _edge_property_schema(records: list[EdgeRecord]) -> pa.Schema:
+    """Choose one encoding per property over the entire relationship type."""
+    observed: dict[str, set[type[object]]] = {}
+    for record in records:
+        for name, value in record.properties.items():
+            kinds = observed.setdefault(name, set())
+            if value is not None:
+                kind = type(value)
+                if kind is int and not -(2**63) <= cast(int, value) < 2**63:
+                    kind = object
+                kinds.add(kind)
+
+    fields = [pa.field(name, pa.int64()) for name in _EDGE_ENDPOINT_FIELDS]
+    native = {bool: pa.bool_(), int: pa.int64(), float: pa.float64(), str: pa.string()}
+    for name in sorted(observed.keys() - set(_EDGE_ENDPOINT_FIELDS)):
+        kinds = observed[name]
+        if not kinds:
+            fields.append(pa.field(name, pa.null()))
+        elif len(kinds) == 1 and (kind := next(iter(kinds))) in native:
+            fields.append(pa.field(name, native[kind]))
+        else:
+            fields.append(pa.field(name, pa.string(), metadata={"grapharrow.encoding": "json"}))
+    return pa.schema(fields)
+
+
+def _edge_property_table(records: list[EdgeRecord], schema: pa.Schema) -> pa.Table:
+    """Build one projected file with the shared relationship-type schema."""
+    columns = [
+        pa.array([record.edge_id for record in records], type=pa.int64()),
+        pa.array([record.src_id for record in records], type=pa.int64()),
+        pa.array([record.dst_id for record in records], type=pa.int64()),
     ]
-    return pa.Table.from_arrays(list(columns.values()), schema=pa.schema(fields))
+    for field in list(schema)[len(_EDGE_ENDPOINT_FIELDS) :]:
+        values = [record.properties.get(field.name) for record in records]
+        if field.metadata:
+            values = [
+                property_codec.dumps(value) if value is not None else None for value in values
+            ]
+        columns.append(pa.array(values, type=field.type))
+    return pa.Table.from_arrays(columns, schema=schema)
 
 
 def _property_column_array(values: list[object]) -> pa.Array:
@@ -912,16 +1148,6 @@ def _dataset_file_for(
         min_key=min_key,
         max_key=max_key,
     )
-
-
-def _compute_sha256(path: str | Path, *, filesystem: FileSystemAdapter) -> str:
-    """Compute the SHA-256 checksum stored in snapshot manifests for integrity verification."""
-    hasher = hashlib.sha256()
-    resolved_filesystem, normalized_path = filesystem.resolve(path)
-    with resolved_filesystem.open_input_file(normalized_path) as handle:
-        for chunk in iter(lambda: handle.read(8192), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
 
 
 __all__ = ["EdgeRecord", "GraphRepository", "NodeRecord", "PersistedGraph"]

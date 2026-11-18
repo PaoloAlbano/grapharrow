@@ -14,6 +14,7 @@ from grapharrow.config import GraphArrowSettings
 from grapharrow.core.errors import QueryError, TransactionError
 from grapharrow.domain import DatasetFile
 from grapharrow.interfaces.cypher_guard import query_requires_write
+from grapharrow.repositories.graph import _rel_type_from_edge_property_file
 from grapharrow.use_cases.cypher import _compile_range_literal
 from grapharrow.use_cases.cypher_expression import rule
 from grapharrow.use_cases.cypher_pipeline import walk
@@ -186,7 +187,7 @@ class GraphArrowMcpCypherInterface:
         """Expose derived dataset files that act as bootstrap indexes."""
 
         manifest = self.grapharrow.repositories.snapshot.load_manifest()
-        catalog = self.grapharrow.repositories.catalog.load()
+        catalog = self.grapharrow.repositories.catalog.load_for_snapshot(manifest)
         return {
             "catalog_version": catalog.version.value,
             "snapshot_id": manifest.snapshot_id.value,
@@ -220,7 +221,7 @@ class GraphArrowMcpCypherInterface:
             ],
             "edge_properties": [
                 {
-                    "relationship_type": _rel_type_from_edge_property_file(dataset_file),
+                    "relationship_type": _edge_property_relationship_type(dataset_file),
                     **_dataset_file_payload(dataset_file),
                 }
                 for dataset_file in manifest.edge_properties
@@ -456,12 +457,12 @@ def _rel_type_from_adjacency_file(dataset_file: DatasetFile) -> str:
     raise QueryError(f"Unexpected adjacency dataset path: {dataset_file.path}")
 
 
-def _rel_type_from_edge_property_file(dataset_file: DatasetFile) -> str:
+def _edge_property_relationship_type(dataset_file: DatasetFile) -> str:
     """Extract the relationship type from an edge-property derived dataset path."""
 
-    parts = dataset_file.path.split("/")
-    if len(parts) >= 3:
-        return parts[-2]
+    rel_type = _rel_type_from_edge_property_file(dataset_file)
+    if rel_type is not None:
+        return rel_type
     raise QueryError(f"Unexpected edge property dataset path: {dataset_file.path}")
 
 

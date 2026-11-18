@@ -15,6 +15,7 @@ from grapharrow.app import build_application
 from grapharrow.config import GraphArrowSettings
 from grapharrow.core.errors import (
     CatalogError,
+    CommitOutcomeUnknownError,
     GraphArrowError,
     NotFoundError,
     QueryError,
@@ -340,6 +341,13 @@ def _register_error_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
             content=_error("WRITE_CONFLICT", str(exc)),
+        )
+
+    @app.exception_handler(CommitOutcomeUnknownError)
+    async def unknown_commit_handler(_: Request, exc: CommitOutcomeUnknownError) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content=_error("COMMIT_OUTCOME_UNKNOWN", str(exc)),
         )
 
     @app.exception_handler(NotFoundError)

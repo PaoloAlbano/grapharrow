@@ -14,6 +14,6 @@ COPY src ./src
 COPY tests ./tests
 COPY Makefile ./
 
-RUN uv sync --frozen
+RUN uv sync --frozen --all-extras
 
 CMD ["uv", "run", "pytest"]

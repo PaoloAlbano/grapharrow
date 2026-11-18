@@ -1074,10 +1074,7 @@ def test_rest_admin_endpoints_expose_compact_and_vacuum(tmp_path: Path) -> None:
     assert compact_response.status_code == 200
     assert compact_response.json()["data"]["snapshot_id"] >= 4
     assert vacuum_response.status_code == 200
-    assert any(
-        path.startswith("manifests/snapshot-000001")
-        for path in vacuum_response.json()["data"]["removed_paths"]
-    )
+    assert vacuum_response.json()["data"]["removed_paths"] == []
 
 
 def test_rest_auth_can_be_enabled_with_a_static_bearer_token(tmp_path: Path) -> None:

@@ -54,6 +54,16 @@ def main() -> None:
         args.image,
         "-c",
         "from importlib.metadata import version; from importlib.util import find_spec; "
+        "import sys, tempfile; "
+        "[version(name) for name in ('boto3', 'azure-identity', 'azure-storage-blob', "
+        "'google-cloud-storage')]; "
+        "from grapharrow.app import build_application; "
+        "app = build_application(tempfile.mkdtemp()); "
+        "app.use_cases.cypher.execute('CREATE (:Local {value:1})'); "
+        "sdk_modules = ('boto3', 'botocore', 'azure.identity', 'azure.storage.blob', "
+        "'google.cloud.storage'); "
+        "assert not [name for name in sys.modules if any("
+        "name == sdk or name.startswith(sdk + '.') for sdk in sdk_modules)]; "
         "assert find_spec('agent_native_graph') is None; assert find_spec('neo4j') is None; "
         "print(version('grapharrow'))",
     )

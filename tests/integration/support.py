@@ -96,7 +96,6 @@ def assert_expected_storage_layout(
 ) -> None:
     expected_keys = {
         "example-db/current_snapshot.json",
-        "example-db/catalog/current_catalog.json",
         f"example-db/{node_file}",
         f"example-db/{edge_file}",
         f"example-db/{node_label_file}",
@@ -156,7 +155,6 @@ def assert_expected_local_storage_layout(
     database_name = database_dir.name
     expected_paths = {
         f"{database_name}/current_snapshot.json",
-        f"{database_name}/catalog/current_catalog.json",
         f"{database_name}/{node_file}",
         f"{database_name}/{edge_file}",
         f"{database_name}/{node_label_file}",
@@ -236,7 +234,6 @@ def assert_expected_remote_storage_layout(
     prefix = database_uri.rstrip("/")
     expected_paths = {
         f"{prefix}/current_snapshot.json",
-        f"{prefix}/catalog/current_catalog.json",
         f"{prefix}/{node_file}",
         f"{prefix}/{edge_file}",
         f"{prefix}/{node_label_file}",

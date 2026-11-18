@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from grapharrow.adapters import FileSystemAdapter
+from grapharrow.adapters.checksum import sha256_file as _compute_sha256
 from grapharrow.adapters.writer import writer_locked
 from grapharrow.core import DatabaseLayout
 from grapharrow.domain import (
@@ -76,15 +77,10 @@ class DatabaseAdminUseCase:
     def initialize(self) -> InitializationResult:
         """Create the base layout, catalog, and first empty snapshot."""
 
-        if self._catalog_store.exists() and self._snapshot_store.current_exists():
-            return InitializationResult(
-                catalog=self._catalog_store.load(), snapshot=self._snapshot_store.load_manifest()
-            )
-        with self._writer.hold():
-            self._layout.ensure_base_directories()
-            catalog = self._catalog_store.bootstrap()
-            snapshot = self._snapshot_store.bootstrap(catalog_version=catalog.version)
-            return InitializationResult(catalog=catalog, snapshot=snapshot)
+        snapshot = self._catalog_store.bootstrap_snapshot()
+        return InitializationResult(
+            catalog=self._catalog_store.load_for_snapshot(snapshot), snapshot=snapshot
+        )
 
     def verify(self, *, verify_checksums: bool = False) -> VerificationReport:
         """Verify that the current catalog and snapshot are readable and consistent."""
@@ -98,15 +94,16 @@ class DatabaseAdminUseCase:
         manifest: SnapshotManifest | None = None
 
         try:
-            catalog = self._catalog_store.load()
-        except Exception as exc:  # pragma: no cover - thin error aggregation
-            warnings.append(f"Failed to load current catalog: {exc}")
-
-        try:
             pointer = self._snapshot_store.load_current_pointer()
-            manifest = self._snapshot_store.load_manifest()
+            manifest = self._snapshot_store.load_at(pointer)
         except Exception as exc:  # pragma: no cover - thin error aggregation
             warnings.append(f"Failed to load current snapshot: {exc}")
+
+        if manifest is not None:
+            try:
+                catalog = self._catalog_store.load_for_snapshot(manifest)
+            except Exception as exc:  # pragma: no cover - thin error aggregation
+                warnings.append(f"Failed to load current catalog: {exc}")
 
         if manifest is not None:
             try:
@@ -157,7 +154,7 @@ class DatabaseAdminUseCase:
         removed_paths: list[str] = []
         warnings: list[str] = []
 
-        if cleanup_orphan_staged and not dry_run:
+        if cleanup_orphan_staged and not dry_run and self._writer.local_root is not None:
             for relative_path in orphan_staged_paths:
                 absolute_path = self._absolute_location(relative_path)
                 if self._filesystem.exists(absolute_path):
@@ -166,6 +163,8 @@ class DatabaseAdminUseCase:
                     except Exception:
                         self._filesystem.delete_file(absolute_path)
                 removed_paths.append(relative_path)
+        elif orphan_staged_paths and cleanup_orphan_staged and not dry_run:
+            warnings.append("Remote staged paths were retained for offline inspection.")
         elif orphan_staged_paths and not cleanup_orphan_staged:
             warnings.append("Orphan staged paths were detected but cleanup is disabled.")
 
@@ -180,9 +179,7 @@ class DatabaseAdminUseCase:
     def compact(self) -> SnapshotManifest:
         """Rewrite the current graph state into a fresh snapshot and rebuild derived files."""
 
-        self.initialize()
-        catalog = self._catalog_store.load()
-        current_manifest = self._snapshot_store.load_manifest()
+        current_manifest = self._catalog_store.bootstrap_snapshot()
         nodes = self._graph_store.load_nodes(current_manifest.nodes)
         edges = self._graph_store.load_edges(current_manifest.edges)
 
@@ -191,13 +188,15 @@ class DatabaseAdminUseCase:
             snapshot_id=next_snapshot_id,
             nodes=nodes,
             edges=edges,
+            previous_snapshot=current_manifest,
         )
         manifest = SnapshotManifest(
             snapshot_id=next_snapshot_id,
             parent_snapshot_id=current_manifest.snapshot_id,
             commit_txid=next_snapshot_id.value,
             created_at=current_manifest.created_at,
-            catalog_version=catalog.version,
+            catalog_version=current_manifest.catalog_version,
+            catalog_path=current_manifest.catalog_path,
             nodes=persisted.nodes,
             edges=persisted.edges,
             node_labels=persisted.node_labels,
@@ -206,51 +205,55 @@ class DatabaseAdminUseCase:
             adjacency_by_dest=persisted.adjacency_by_dest,
             edge_properties=persisted.edge_properties,
         )
-        try:
-            self._snapshot_store.publish(manifest, staged_relative_path=persisted.staged_dir)
-        finally:
-            self._graph_store.cleanup_staged(persisted.staged_dir)
+        self._snapshot_store.publish(manifest, base=current_manifest)
         return manifest
 
     @writer_locked
     def vacuum(self) -> tuple[str, ...]:
-        """Remove manifests and data files that are not referenced by the current snapshot."""
+        """Remove abandoned files while preserving every published snapshot."""
 
-        self.initialize()
-        current_manifest = self._snapshot_store.load_manifest()
-        current_pointer = self._snapshot_store.load_current_pointer()
-        keep_paths = {current_pointer.manifest_path, "current_snapshot.json"}
-        keep_paths.update(dataset.path for dataset in _iter_manifest_files(current_manifest))
+        self._catalog_store.bootstrap_snapshot()
+        head = self._snapshot_store.load_current_pointer()
+        keep_paths: set[str] = set()
+        for path, manifest in self._snapshot_store.history(head):
+            keep_paths.add(path)
+            keep_paths.update(dataset.path for dataset in _iter_manifest_files(manifest))
 
+        local = self._writer.local_root is not None
         removed: list[str] = []
-        for directory in (
-            self._layout.manifests_dir,
-            self._layout.nodes_dir,
-            self._layout.edges_dir,
-            self._layout.node_labels_dir,
-            self._layout.node_properties_dir,
-            self._layout.adjacency_by_source_dir,
-            self._layout.adjacency_by_dest_dir,
-            self._layout.edge_properties_dir,
+        for directory, suffix in (
+            (self._layout.manifests_dir, ".json"),
+            (self._layout.nodes_dir, ".parquet"),
+            (self._layout.edges_dir, ".parquet"),
+            (self._layout.node_labels_dir, ".parquet"),
+            (self._layout.node_properties_dir, ".parquet"),
+            (self._layout.adjacency_by_source_dir, ".parquet"),
+            (self._layout.adjacency_by_dest_dir, ".parquet"),
+            (self._layout.edge_properties_dir, ".parquet"),
         ):
             if not self._filesystem.exists(directory):
                 continue
-            suffix = ".json" if directory == self._layout.manifests_dir else ".parquet"
             for path in self._filesystem.list_paths(directory, recursive=True):
                 if not str(path).endswith(suffix):
                     continue
                 relative = self._layout.relative_path(path)
                 if relative in keep_paths:
                     continue
+                if not local and not _past_attempt(relative, head.snapshot_id):
+                    continue
                 if self._filesystem.exists(path):
-                    self._filesystem.delete_file(path)
+                    try:
+                        self._filesystem.delete_file(path)
+                    except FileNotFoundError:
+                        continue
                     removed.append(relative)
 
-        for staged in self._list_orphan_staged_paths():
-            absolute = self._absolute_location(staged)
-            if self._filesystem.exists(absolute):
-                self._filesystem.delete_dir(absolute)
-                removed.append(staged)
+        if local:
+            for staged in self._list_orphan_staged_paths():
+                absolute = self._absolute_location(staged)
+                if self._filesystem.exists(absolute):
+                    self._filesystem.delete_dir(absolute)
+                    removed.append(staged)
 
         return tuple(sorted(removed))
 
@@ -271,6 +274,19 @@ class DatabaseAdminUseCase:
         return f"{str(self._layout.root).rstrip('/')}/{relative_path}"
 
 
+def _past_attempt(path: str, head: SnapshotId) -> bool:
+    # Across pods only delete objects whose generation can no longer win a head update.
+    prefix, _, filename = Path(path).stem.partition("-")
+    generation, _, attempt = filename.partition("-")
+    return (
+        prefix == "snapshot"
+        and bool(attempt)
+        and generation.isascii()
+        and generation.isdecimal()
+        and int(generation) <= head.value
+    )
+
+
 def _iter_manifest_files(manifest: SnapshotManifest) -> tuple[DatasetFile, ...]:
     """Flatten every dataset reference carried by a snapshot manifest into one iterable tuple."""
     return (
@@ -282,18 +298,6 @@ def _iter_manifest_files(manifest: SnapshotManifest) -> tuple[DatasetFile, ...]:
         *manifest.adjacency_by_dest,
         *manifest.edge_properties,
     )
-
-
-def _compute_sha256(path: str | Path, *, filesystem: FileSystemAdapter) -> str:
-    """Compute the SHA-256 checksum used by verification to validate persisted files."""
-    import hashlib
-
-    hasher = hashlib.sha256()
-    resolved_filesystem, normalized_path = filesystem.resolve(path)
-    with resolved_filesystem.open_input_file(normalized_path) as handle:
-        for chunk in iter(lambda: handle.read(8192), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
 
 
 __all__ = [

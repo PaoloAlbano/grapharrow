@@ -19,7 +19,7 @@ from pathlib import Path
 import secrets
 import sys
 import grapharrow
-from importlib.metadata import version
+from importlib.metadata import distributions, version
 from fastapi.testclient import TestClient
 from grapharrow.app import build_application
 from grapharrow.config import GraphArrowSettings
@@ -28,6 +28,9 @@ from importlib.util import find_spec
 
 assert find_spec("agent_native_graph") is None
 assert find_spec("neo4j") is None
+installed = {distribution.metadata['Name'].lower() for distribution in distributions()}
+cloud_sdks = {'boto3', 'botocore', 'azure-identity', 'azure-storage-blob', 'google-cloud-storage'}
+assert not installed & cloud_sdks
 
 assert Path(grapharrow.__file__).is_relative_to(Path(sys.prefix)), grapharrow.__file__
 assert version('grapharrow') == os.environ['GRAPHARROW_EXPECTED_VERSION']
@@ -267,6 +270,15 @@ with GraphArrowAgentBackend(application) as ranked:
 assert ranked._resources.budget.used_bytes == 0
 assert application.use_cases.admin.verify(verify_checksums=True).ok
 print('Installed-wheel smoke passed: seed filters, ranked discovery, adjacency and isolation.')
+point = build_application('point-set-wheel')
+point.use_cases.cypher.execute("CREATE ()-[:LINK {value:'old'}]->()")
+old_point = point.use_cases.graph.capture_snapshot()
+assert point.use_cases.cypher.execute(
+    "MATCH ()-[r:LINK]->() WHERE id(r)=1 SET r.value='new' RETURN r.value AS value"
+).rows == ({'value': 'new'},)
+assert point.use_cases.graph.load_state(snapshot=old_point).edges[0].properties['value'] == 'old'
+assert point.use_cases.admin.verify(verify_checksums=True).ok
+
 """
 
 
@@ -318,6 +330,13 @@ def main() -> None:
             if line.startswith("Requires-Dist: ")
         ]
         assert not any(dep.startswith(("agent-native-graph", "neo4j")) for dep in dependencies)
+        for dependency in dependencies:
+            if dependency.startswith(
+                ("boto3", "azure-identity", "azure-storage-blob", "google-cloud-storage")
+            ):
+                assert "extra ==" in dependency, dependency
+        assert "grapharrow/adapters/checksum.py" in names
+        assert "grapharrow/use_cases/cypher_point_set.py" in names
         assert "grapharrow/ana/tool_schemas.json" in names
         assert "grapharrow/use_cases/ana_patterns.py" in names
         assert "grapharrow/use_cases/ana_roles.py" in names

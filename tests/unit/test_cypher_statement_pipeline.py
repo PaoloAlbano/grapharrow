@@ -429,6 +429,98 @@ def test_failed_statement_keeps_earlier_changes_in_explicit_transaction(tmp_path
     assert [node.labels for node in transaction.commit().nodes] == [("Kept",)]
 
 
+@pytest.mark.parametrize("composed", [False, True])
+def test_set_relationship_publishes_a_change_in_numeric_type(
+    tmp_path: Path, composed: bool
+) -> None:
+    db = Database(tmp_path / "db")
+    with db.write_transaction() as session:
+        session.query("CREATE ()-[:R {value:1}]->()")
+        before = db.load_snapshot()
+        query = "MATCH ()-[r:R]->() SET r.value = 1.0"
+        if composed:
+            query += " WITH r SET r.echo = r.value"
+        result = session.query(query + " RETURN r.value AS value")
+    assert type(result.rows[0]["value"]) is float
+    after = db.load_snapshot()
+    assert after.edges != before.edges
+    assert after.edge_properties != before.edge_properties
+    assert after.adjacency_by_source == before.adjacency_by_source
+    assert after.adjacency_by_dest == before.adjacency_by_dest
+    graph = db._app.use_cases.graph
+    assert type(graph.load_state().edges[0].properties["value"]) is float
+    projection = db._app.repositories.graph.load_edge_property_table(
+        after.edge_properties, rel_type="R"
+    )
+    assert type(projection["value"][0].as_py()) is float
+    if composed:
+        assert type(projection["echo"][0].as_py()) is float
+
+
+def test_set_relationship_reuses_buffers_and_rolls_back_a_failed_statement(tmp_path: Path) -> None:
+    from grapharrow.use_cases import CypherQueryUseCase, GraphTransactionUseCase
+
+    db = Database(tmp_path / "db")
+    with db.write_transaction() as session:
+        session.query("CREATE (a)-[:R {value:1}]->(b) CREATE (a)-[:R {value:2}]->(b)")
+    graph = db._app.use_cases.graph
+    transaction = GraphTransactionUseCase(graph)
+    initial = transaction.load_state()
+    executor = CypherQueryUseCase(transaction)
+    executor.execute("MATCH ()-[r:R]->() WHERE r.value=1 SET r.value=1.0")
+    kept = transaction.load_state()
+    assert kept.node_table is initial.node_table
+    assert kept.edge_table["src_id"].chunk(0).buffers()[1].address == (
+        initial.edge_table["src_id"].chunk(0).buffers()[1].address
+    )
+    assert kept.edge_table["properties_json"].chunk(1).buffers()[2].address == (
+        initial.edge_table["properties_json"].chunk(0).buffers()[2].address
+    )
+    with pytest.raises(QueryError, match="Division by zero"):
+        executor.execute("MATCH ()-[r:R]->() SET r.value=3 WITH r, 0 AS zero SET r.other=1/zero")
+    assert transaction.load_state() is kept
+    result = executor.execute("MATCH ()-[r:R]->() RETURN r.value AS value ORDER BY value")
+    assert [type(row["value"]) for row in result.rows] == [float, int]
+    assert graph.load_state() == initial
+    assert transaction.commit().edge_table is kept.edge_table
+    assert graph.load_state().edge_table.equals(kept.edge_table)
+
+
+@pytest.mark.parametrize("composed", [False, True])
+def test_edge_delete_reuses_transaction_tables(tmp_path: Path, composed: bool) -> None:
+    from grapharrow.use_cases import CypherQueryUseCase, GraphTransactionUseCase
+
+    db = Database(tmp_path / "parallel")
+    with db.write_transaction() as session:
+        session.query(
+            "CREATE (a)-[:R {value:1}]->(b), (a)-[:R {value:2}]->(b), (a)-[:R {value:3}]->(a)"
+        )
+    graph = db._app.use_cases.graph
+    transaction = GraphTransactionUseCase(graph)
+    initial = transaction.load_state()
+    executor = CypherQueryUseCase(transaction)
+    query = "MATCH ()-[r:R {value:1}]->() DELETE r"
+    if composed:
+        query += " WITH 1 AS v MATCH ()-[s:R {value:2}]->() DELETE s"
+    executor.execute(query)
+    remaining = transaction.load_state()
+    assert remaining.node_table is initial.node_table
+    expected = [3] if composed else [2, 3]
+    assert remaining.edge_table["edge_id"].to_pylist() == expected
+    assert remaining.edge_table["properties_json"].chunk(0).buffers()[2].address == (
+        initial.edge_table["properties_json"].chunk(0).buffers()[2].address
+    )
+    assert graph.load_state().edge_table.equals(initial.edge_table)
+
+    with pytest.raises(QueryError, match="Division by zero"):
+        executor.execute(
+            "MATCH ()-[r:R]->() DELETE r WITH 0 AS zero CREATE (:Scratch {value:1/zero})"
+        )
+    assert transaction.load_state() is remaining
+    assert transaction.commit().edge_table is remaining.edge_table
+    assert graph.load_state().edge_table.equals(remaining.edge_table, check_metadata=True)
+
+
 def test_pipeline_merge_reuses_earlier_rows_and_runs_actions(tmp_path: Path) -> None:
     with Database(tmp_path / "db").write_transaction() as session:
         result = session.query(

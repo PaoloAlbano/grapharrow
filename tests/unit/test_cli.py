@@ -20,7 +20,7 @@ def test_cli_init_bootstraps_a_database(
     assert exit_code == 0
     assert "Initialized GraphArrow database" in captured.out
     assert "snapshot 1" in captured.out
-    assert (database_path / "catalog" / "current_catalog.json").exists()
+    assert list((database_path / "catalog").glob("catalog-000001-*.json"))
 
 
 def test_cli_show_catalog_prints_current_catalog(

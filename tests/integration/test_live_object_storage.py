@@ -37,7 +37,7 @@ def _assert_live_remote_storage_roundtrip(context: RemoteObjectStorageContext) -
     assert verify_result.ok is True
 
     current_snapshot = load_remote_json_object(context, "current_snapshot.json")
-    manifest_path = str(current_snapshot["path"])
+    manifest_path = str(current_snapshot["manifest_path"])
     manifest = cast(
         dict[str, Any],
         load_remote_json_object(
@@ -46,10 +46,11 @@ def _assert_live_remote_storage_roundtrip(context: RemoteObjectStorageContext) -
         ),
     )
 
-    node_entries = cast(list[dict[str, Any]], manifest["nodes"])
-    edge_entries = cast(list[dict[str, Any]], manifest["edges"])
-    node_label_entries = cast(list[dict[str, Any]], manifest["node_labels"])
-    adjacency_entries = cast(list[dict[str, Any]], manifest["adjacency_by_source"])
+    files = cast(dict[str, list[dict[str, Any]]], manifest["files"])
+    node_entries = files["nodes"]
+    edge_entries = files["edges"]
+    node_label_entries = files["node_labels"]
+    adjacency_entries = files["adjacency_by_source"]
 
     node_file = str(node_entries[0]["path"]).removeprefix(f"{context.database_uri}/")
     edge_file = str(edge_entries[0]["path"]).removeprefix(f"{context.database_uri}/")

@@ -10,8 +10,10 @@ from typing import Any
 import pytest
 
 from grapharrow import Database
+from grapharrow.app import GraphArrowApplication, build_application
 from grapharrow.core.errors import WriteConflictError
 from grapharrow.use_cases import CypherQueryUseCase, GraphTransactionUseCase
+from grapharrow.use_cases.ana import GraphArrowAgentBackend
 
 
 def _write_process(path: str, start: Any, index: int) -> None:
@@ -74,6 +76,89 @@ def test_concurrent_merge_uses_one_current_state_across_database_instances(tmp_p
     with databases[0].read_transaction() as session:
         assert session.query("MATCH (p:Person) RETURN count(p) AS count").rows == ({"count": 1},)
     assert databases[0].verify(verify_checksums=True).ok
+
+
+@pytest.mark.parametrize("shared_edge", [False, True])
+def test_one_server_serializes_ten_simultaneous_property_updates(
+    tmp_path: Path, shared_edge: bool
+) -> None:
+    app = build_application(tmp_path / "one-server")
+    query = app.use_cases.cypher.execute
+    query(
+        "CREATE (a:Person), (b:Person) "
+        "WITH a,b UNWIND range(1,10) AS i CREATE (a)-[:LINK {value:0}]->(b)"
+    )
+    initial = app.use_cases.graph.capture_snapshot()
+    barrier = Barrier(10)
+
+    def increment(index: int) -> None:
+        barrier.wait(timeout=10)
+        for _ in range(2):
+            result = query(
+                "MATCH ()-[r:LINK]->() WHERE id(r)=$id "
+                "SET r.value=r.value+1 RETURN r.value AS value",
+                {"id": 1 if shared_edge else index + 1},
+            )
+            assert len(result.rows) == 1
+
+    with GraphArrowAgentBackend(app) as reader:
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            list(pool.map(increment, range(10)))
+        state = app.use_cases.graph.load_state()
+        assert state.snapshot.snapshot_id.value == initial.snapshot_id.value + 20
+        assert [edge.properties["value"] for edge in state.edges] == (
+            [20, *([0] * 9)] if shared_edge else [2] * 10
+        )
+        assert reader._state.snapshot == initial
+        assert all(
+            edge.properties["value"] == 0
+            for edge in app.use_cases.graph.load_state(snapshot=initial).edges
+        )
+        app.use_cases.admin.vacuum()
+        assert app.use_cases.admin.verify(verify_checksums=True).ok
+
+
+def test_edge_appends_retry_and_preserve_a_pinned_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "concurrent-edge-appends"
+    app = build_application(root)
+    graph = app.use_cases.graph
+    _, source = graph.create_node(labels=("Person",), properties={"name": "Alice"})
+    _, target = graph.create_node(labels=("Person",), properties={"name": "Bob"})
+
+    def create_edge(application: GraphArrowApplication, value: int) -> int:
+        _, edge = application.use_cases.graph.create_edge(
+            src_id=source.node_id, dst_id=target.node_id, rel_type="KNOWS", properties={"v": value}
+        )
+        return edge.edge_id
+
+    first = create_edge(app, 0)
+    start = Barrier(2)
+
+    def append(value: int) -> int:
+        writer = build_application(root)
+        start.wait(timeout=10)
+        return create_edge(writer, value)
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        raise OSError("Simulated publish failure")
+
+    with GraphArrowAgentBackend(app) as reader:
+        with monkeypatch.context() as patch:
+            patch.setattr(app.repositories.snapshot, "publish", fail)
+            with pytest.raises(OSError, match="publish failure"):
+                create_edge(app, 1)
+        assert app.repositories.snapshot.load_manifest() == reader._state.snapshot
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert sorted(pool.map(append, (1, 2))) == [first + 1, first + 2]
+
+        app.use_cases.admin.vacuum()
+        assert reader._state.edge_table["edge_id"].to_pylist() == [first]
+        state = graph.load_state()
+        assert [edge.edge_id for edge in state.edges] == [first, first + 1, first + 2]
+        assert sorted(edge.properties["v"] for edge in state.edges) == [0, 1, 2]
+    assert app.use_cases.admin.verify(verify_checksums=True).ok
 
 
 @pytest.mark.parametrize("change", ["graph", "catalog", "compact"])
@@ -184,3 +269,29 @@ def test_forked_coordinator_keeps_the_parent_lock_held(tmp_path: Path) -> None:
         if process.is_alive():
             process.kill()
             process.join(timeout=10)
+
+
+def test_failed_commit_leaves_schema_and_graph_unchanged(tmp_path: Path, monkeypatch) -> None:
+    app = build_application(tmp_path / "failed-schema-and-data")
+    reader = build_application(tmp_path / "failed-schema-and-data")
+    before = reader.use_cases.graph.load_state()
+
+    def fail(*args, **kwargs):
+        # All candidate data and schema files have been written at this point.
+        assert reader.repositories.catalog.load() == before.catalog
+        assert reader.use_cases.graph.load_state().snapshot == before.snapshot
+        raise OSError("Interrupted before replacing the head")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(app.adapters.filesystem, "replace_pointer", fail)
+        with pytest.raises(OSError, match="Interrupted before replacing"):
+            app.use_cases.cypher.execute("CREATE (:Unpublished)-[:UnpublishedLink]->(:Unpublished)")
+
+    assert reader.repositories.catalog.load() == before.catalog
+    assert reader.use_cases.graph.load_state().snapshot == before.snapshot
+    app.use_cases.cypher.execute("CREATE (:Committed)-[:CommittedLink]->(:Committed)")
+    committed = reader.use_cases.graph.load_state()
+    assert committed.snapshot.snapshot_id.value == before.snapshot.snapshot_id.value + 1
+    assert [label.name for label in committed.catalog.labels] == ["Committed"]
+    assert [edge.rel_type for edge in committed.edges] == ["CommittedLink"]
+    assert reader.use_cases.admin.verify(verify_checksums=True).ok

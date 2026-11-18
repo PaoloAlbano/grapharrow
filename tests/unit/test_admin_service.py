@@ -21,7 +21,10 @@ def test_admin_service_initialize_bootstraps_catalog_and_snapshot(tmp_path: Path
     assert result.snapshot.snapshot_id.value == 1
     assert isinstance(layout.current_catalog_path, Path)
     assert isinstance(layout.current_snapshot_path, Path)
-    assert layout.current_catalog_path.exists()
+    assert not layout.current_catalog_path.exists()
+    assert result.snapshot.catalog_path is not None
+    assert isinstance(layout.root, Path)
+    assert (layout.root / result.snapshot.catalog_path).exists()
     assert layout.current_snapshot_path.exists()
 
 
@@ -57,7 +60,10 @@ def test_admin_service_verify_flags_missing_manifest_files(tmp_path: Path) -> No
         adjacency_by_source=manifest.adjacency_by_source,
         adjacency_by_dest=manifest.adjacency_by_dest,
     )
+    path = tmp_path / "example-db" / "data/nodes/missing.parquet"
+    path.touch()
     snapshot_store.publish(broken_manifest)
+    path.unlink()
 
     report = service.verify()
 
@@ -99,7 +105,6 @@ def test_admin_service_compact_rebuilds_a_fresh_snapshot(tmp_path: Path) -> None
     from grapharrow.use_cases.graph import GraphStateUseCase
 
     graph_service = GraphStateUseCase(
-        admin_service=service,
         catalog_store=CatalogRepository(layout=layout),
         snapshot_store=SnapshotRepository(layout=layout),
         graph_store=graph_store,
@@ -120,7 +125,9 @@ def test_admin_service_compact_rebuilds_a_fresh_snapshot(tmp_path: Path) -> None
     assert len(manifest.adjacency_by_source) == 1
 
 
-def test_admin_service_vacuum_removes_obsolete_snapshot_files(tmp_path: Path) -> None:
+def test_admin_service_vacuum_preserves_history_and_removes_unpublished_files(
+    tmp_path: Path,
+) -> None:
     layout = DatabaseLayout(root=tmp_path / "example-db")
     service = DatabaseAdminUseCase(
         layout=layout,
@@ -133,18 +140,19 @@ def test_admin_service_vacuum_removes_obsolete_snapshot_files(tmp_path: Path) ->
     from grapharrow.use_cases.graph import GraphStateUseCase
 
     graph_service = GraphStateUseCase(
-        admin_service=service,
         catalog_store=CatalogRepository(layout=layout),
         snapshot_store=SnapshotRepository(layout=layout),
         graph_store=GraphRepository(layout=layout),
     )
-    graph_service.create_node(labels=("Person",), properties={"name": "Alice"})
+    first, _ = graph_service.create_node(labels=("Person",), properties={"name": "Alice"})
     graph_service.create_node(labels=("Person",), properties={"name": "Bob"})
+    assert isinstance(layout.root, Path)
+    orphan = layout.root / "data/nodes/snapshot-000003-abandoned.parquet"
+    orphan.touch()
     current_manifest = SnapshotRepository(layout=layout).load_manifest()
 
     removed = service.vacuum()
 
-    assert any(path.startswith("manifests/snapshot-000001") for path in removed)
-    assert any(path.startswith("data/nodes/snapshot-000002") for path in removed)
-    assert isinstance(layout.root, Path)
-    assert (layout.root / current_manifest.nodes[0].path).exists() is True
+    assert removed == ("data/nodes/snapshot-000003-abandoned.parquet",)
+    assert (layout.root / first.snapshot.nodes[0].path).exists()
+    assert (layout.root / current_manifest.nodes[0].path).exists()

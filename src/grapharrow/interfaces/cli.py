@@ -129,7 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     vacuum_parser = subparsers.add_parser(
         "vacuum",
-        help="Remove obsolete manifests, Parquet files, and orphan staged directories.",
+        help="Remove abandoned files while preserving published snapshots.",
     )
     vacuum_parser.add_argument("path", help="Database directory to vacuum.")
 

@@ -24,6 +24,17 @@ dependencies = [
   "uvicorn>=0.54.0",
 ]
 
+[project.optional-dependencies]
+s3 = ["boto3>=1.37"]
+azure = ["azure-identity>=1.19", "azure-storage-blob>=12.24"]
+gcs = ["google-cloud-storage>=3.0"]
+cloud = [
+  "azure-identity>=1.19",
+  "azure-storage-blob>=12.24",
+  "boto3>=1.37",
+  "google-cloud-storage>=3.0",
+]
+
 [project.scripts]
 grapharrow = "grapharrow.interfaces.cli:main"
 grapharrow-server = "grapharrow.server:main"

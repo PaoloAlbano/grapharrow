@@ -324,7 +324,7 @@ class Database:
         return self._app.use_cases.admin.compact()
 
     def vacuum(self) -> tuple[str, ...]:
-        """Remove unreachable manifests, parquet files, and orphan staged directories."""
+        """Remove abandoned files while preserving published snapshots."""
 
         return self._app.use_cases.admin.vacuum()
 

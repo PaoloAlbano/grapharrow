@@ -259,10 +259,12 @@ def test_mcp_returns_schema_constraints_and_indexes(tmp_path: Path) -> None:
     assert node_labels[1]["row_count"] == 1
     assert node_labels[1]["checksum_algorithm"] == "sha256"
     assert node_labels[1]["checksum"] is not None
+    filename = Path(node_labels[0]["path"]).name
+    assert filename.startswith(f"snapshot-{snapshot_id:06d}-")
     assert node_properties == [
         {
             "label": "Company",
-            "path": f"derived/node_properties/Company/snapshot-{snapshot_id:06d}.parquet",
+            "path": f"derived/node_properties/Company/{filename}",
             "row_count": 1,
             "checksum": node_properties[0]["checksum"],
             "checksum_algorithm": "sha256",
@@ -271,7 +273,7 @@ def test_mcp_returns_schema_constraints_and_indexes(tmp_path: Path) -> None:
         },
         {
             "label": "Person",
-            "path": f"derived/node_properties/Person/snapshot-{snapshot_id:06d}.parquet",
+            "path": f"derived/node_properties/Person/{filename}",
             "row_count": 1,
             "checksum": node_properties[1]["checksum"],
             "checksum_algorithm": "sha256",
@@ -283,7 +285,7 @@ def test_mcp_returns_schema_constraints_and_indexes(tmp_path: Path) -> None:
     assert adjacency_by_source == [
         {
             "relationship_type": "WORKS_AT",
-            "path": (f"derived/adjacency/by_source/WORKS_AT/snapshot-{snapshot_id:06d}.parquet"),
+            "path": f"derived/adjacency/by_source/WORKS_AT/{filename}",
             "row_count": 1,
             "checksum": adjacency_by_source[0]["checksum"],
             "checksum_algorithm": "sha256",
@@ -295,7 +297,7 @@ def test_mcp_returns_schema_constraints_and_indexes(tmp_path: Path) -> None:
     assert adjacency_by_dest == [
         {
             "relationship_type": "WORKS_AT",
-            "path": (f"derived/adjacency/by_dest/WORKS_AT/snapshot-{snapshot_id:06d}.parquet"),
+            "path": f"derived/adjacency/by_dest/WORKS_AT/{filename}",
             "row_count": 1,
             "checksum": adjacency_by_dest[0]["checksum"],
             "checksum_algorithm": "sha256",
@@ -304,10 +306,14 @@ def test_mcp_returns_schema_constraints_and_indexes(tmp_path: Path) -> None:
         }
     ]
     assert adjacency_by_dest[0]["checksum"] is not None
+    projection_path = Path(edge_properties[0]["path"])
+    assert projection_path.parts[:3] == ("derived", "edge_properties", "WORKS_AT")
+    assert projection_path.parts[3].startswith("range-32768-")
+    assert projection_path.name == filename
     assert edge_properties == [
         {
             "relationship_type": "WORKS_AT",
-            "path": f"derived/edge_properties/WORKS_AT/snapshot-{snapshot_id:06d}.parquet",
+            "path": str(projection_path),
             "row_count": 1,
             "checksum": edge_properties[0]["checksum"],
             "checksum_algorithm": "sha256",

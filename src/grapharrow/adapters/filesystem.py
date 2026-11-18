@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import suppress
+from functools import cached_property
 from pathlib import Path
 from stat import S_IMODE
 from typing import cast
@@ -14,6 +15,9 @@ from uuid import uuid4
 import pyarrow.fs as pafs  # type: ignore[import-untyped]
 
 from grapharrow.config import GraphArrowSettings
+from grapharrow.core.errors import CommitOutcomeUnknownError, StorageError
+
+from .object_pointer import AzurePointer, GCSPointer, ObjectPointer, Revision, S3Pointer
 
 
 class FileSystemAdapter:
@@ -24,6 +28,7 @@ class FileSystemAdapter:
         *,
         mounts: dict[str, tuple[pafs.FileSystem, str]] | None = None,
         scheme_filesystems: dict[str, pafs.FileSystem] | None = None,
+        settings: GraphArrowSettings | None = None,
     ) -> None:
         self._local = pafs.LocalFileSystem()
         self._mounts = {
@@ -34,6 +39,8 @@ class FileSystemAdapter:
             scheme.rstrip(":/").lower(): filesystem
             for scheme, filesystem in (scheme_filesystems or {}).items()
         }
+        self._settings = settings
+        self._pointer_clients: dict[tuple[str, str], ObjectPointer] = {}
 
     @classmethod
     def from_settings(cls, settings: GraphArrowSettings) -> FileSystemAdapter:
@@ -120,7 +127,7 @@ class FileSystemAdapter:
                 dfs_storage_scheme=settings.azure_dfs_storage_scheme,
             )
 
-        return cls(scheme_filesystems=scheme_filesystems)
+        return cls(scheme_filesystems=scheme_filesystems, settings=settings)
 
     def resolve(self, location: str | Path) -> tuple[pafs.FileSystem, str]:
         """Resolve ``location`` into a filesystem instance and normalized path."""
@@ -186,15 +193,14 @@ class FileSystemAdapter:
         self.write_text(location, json.dumps(payload, indent=2, sort_keys=True))
 
     def replace_json(self, location: str | Path, payload: object) -> None:
-        """Replace a native local JSON file atomically, or use the normal remote write."""
+        """Replace a local JSON file by renaming a fully written sibling."""
 
-        filesystem, normalized_path = self.resolve(location)
-        if not isinstance(filesystem, pafs.LocalFileSystem):
+        destination = self.native_path(location)
+        if destination is None:
             self.write_json(location, payload)
             return
 
         content = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
-        destination = Path(normalized_path).resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
         handle = temporary.open("xb")
@@ -206,10 +212,107 @@ class FileSystemAdapter:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, destination)
+            try:
+                _sync_directory(destination.parent)
+            except OSError as exc:
+                raise CommitOutcomeUnknownError(
+                    "The new head is visible, but its directory could not be flushed."
+                ) from exc
         except BaseException:
             with suppress(OSError):
                 temporary.unlink(missing_ok=True)
             raise
+
+    def native_path(self, location: str | Path) -> Path | None:
+        """Return the canonical path for native files, including local mounts."""
+        filesystem, path = self.resolve(location)
+        while isinstance(filesystem, pafs.SubTreeFileSystem):
+            path = f"{filesystem.base_path.rstrip('/')}/{path.lstrip('/')}"
+            filesystem = filesystem.base_fs
+        return Path(path).resolve() if isinstance(filesystem, pafs.LocalFileSystem) else None
+
+    def sync_commit_files(self, root: str | Path, locations: list[str | Path]) -> None:
+        """Flush newly referenced local files and their directory entries before publishing."""
+        database = self.native_path(root)
+        if database is None:
+            return
+        directories = {database.parent}
+        for location in locations:
+            path = self.native_path(location)
+            assert path is not None
+            with path.open("rb") as handle:
+                os.fsync(handle.fileno())
+            directory = path.parent
+            while directory not in directories:
+                directories.add(directory)
+                directory = directory.parent
+        for directory in sorted(directories, key=lambda path: -len(path.parts)):
+            _sync_directory(directory)
+
+    def read_pointer(self, location: str | Path) -> tuple[object, Revision] | None:
+        """Read a pointer and the revision corresponding to those exact bytes."""
+        remote = self._object_pointer(location)
+        if remote is not None:
+            client, bucket, key = remote
+            result = client.read(bucket, key)
+            return (json.loads(result[0]), result[1]) if result is not None else None
+        try:
+            content = self.read_text(location)
+        except FileNotFoundError:
+            return None
+        return json.loads(content), content
+
+    def replace_pointer(
+        self, location: str | Path, payload: object, expected: Revision | None
+    ) -> bool:
+        """Compare and replace the head, under the database writer lock for local storage."""
+        remote = self._object_pointer(location)
+        if remote is not None:
+            client, bucket, key = remote
+            data = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+            return client.replace(bucket, key, data, expected)
+        self.replace_json(location, payload)
+        return True
+
+    def _object_pointer(self, location: str | Path) -> tuple[ObjectPointer, str, str] | None:
+        filesystem, path = self.resolve(location)
+        while isinstance(filesystem, pafs.SubTreeFileSystem):
+            path = f"{filesystem.base_path.rstrip('/')}/{path.lstrip('/')}"
+            filesystem = filesystem.base_fs
+        if isinstance(filesystem, (pafs.LocalFileSystem, pafs._MockFileSystem)):
+            return None
+        settings = self._storage_settings
+        provider = filesystem.type_name
+        account = ""
+        if isinstance(filesystem, pafs.AzureFileSystem):
+            parsed = urlparse(str(location))
+            host = parsed.hostname or ""
+            account = settings.azure_account_name or ""
+            if parsed.scheme in {"abfs", "abfss"}:
+                for suffix in (".dfs.core.windows.net", ".blob.core.windows.net"):
+                    if host.endswith(suffix):
+                        account = host.removesuffix(suffix)
+                        break
+            if not account:
+                raise StorageError("Configure GRAPHARROW_AZURE_ACCOUNT_NAME for Azure writes.")
+        bucket, _, key = path.partition("/")
+        cache_key = (provider, account)
+        client = self._pointer_clients.get(cache_key)
+        if client is None:
+            if isinstance(filesystem, pafs.S3FileSystem):
+                client = S3Pointer(settings)
+            elif isinstance(filesystem, pafs.AzureFileSystem):
+                client = AzurePointer(settings, account)
+            elif isinstance(filesystem, pafs.GcsFileSystem):
+                client = GCSPointer(settings)
+            else:
+                raise StorageError(f"Conditional database pointers are unsupported on {provider}.")
+            self._pointer_clients[cache_key] = client
+        return client, bucket, key
+
+    @cached_property
+    def _storage_settings(self) -> GraphArrowSettings:
+        return self._settings or GraphArrowSettings()
 
     def copy_file(self, source: str | Path, destination: str | Path) -> None:
         """Copy a file between locations handled by ``pyarrow.fs``."""
@@ -292,6 +395,15 @@ class FileSystemAdapter:
         if netloc and path:
             return f"{netloc}/{path}"
         return netloc or path
+
+
+def _sync_directory(path: Path) -> None:
+    if os.name != "nt":
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 __all__ = ["FileSystemAdapter"]
