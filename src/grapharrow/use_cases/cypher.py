@@ -18,10 +18,18 @@ import pyarrow.compute as pc  # type: ignore[import-untyped]
 from grapharrow.adapters import PyArrowTabularAdapter
 from grapharrow.adapters.query_cache import CypherParseCache
 from grapharrow.core import property_codec
-from grapharrow.core.errors import CatalogError, QueryError, QueryPhase, SchemaError
+from grapharrow.core.errors import (
+    CatalogError,
+    IdempotencyConflictError,
+    QueryError,
+    QueryPhase,
+    SchemaError,
+    WriteConflictError,
+)
 from grapharrow.core.temporal import Duration, Instant
 from grapharrow.domain import IndexKind, PropertyOwnerKind
 from grapharrow.domain.scan import ScanOperator, ScanPredicate
+from grapharrow.domain.snapshot import IdempotencyReceipt
 from grapharrow.interfaces.opencypher.generated.vendor.opencypher.GraphArrowCypherParser import (
     GraphArrowCypherParser as CypherParser,
 )
@@ -574,6 +582,20 @@ def _query_phase(phase: QueryPhase) -> Generator[None, None, None]:
         ) from error
 
 
+def _public_query_result(result: QueryResult) -> QueryResult:
+    if not any(property_codec.contains_temporal(row) for row in result.rows):
+        return result
+    from grapharrow.use_cases.cypher_expression import public_value
+
+    return QueryResult(result.columns, tuple(public_value(row) for row in result.rows))
+
+
+def _replay_response(receipt: IdempotencyReceipt, request_hash: str) -> str:
+    if receipt.request_hash != request_hash:
+        raise IdempotencyConflictError("This idempotency key belongs to a different request.")
+    return receipt.response_json
+
+
 class CypherQueryUseCase:
     """Execute a narrow but useful subset of Cypher statements."""
 
@@ -604,11 +626,48 @@ class CypherQueryUseCase:
         with self._graph_service.cypher_query_slot():
             with _query_phase("compile"):
                 result = self._execute(query, params)
-            if not any(property_codec.contains_temporal(row) for row in result.rows):
-                return result
-            from grapharrow.use_cases.cypher_expression import public_value
+            return _public_query_result(result)
 
-            return QueryResult(result.columns, tuple(public_value(row) for row in result.rows))
+    def execute_idempotent_write(
+        self,
+        query: str,
+        params: dict[str, object],
+        *,
+        key_hash: str,
+        request_hash: str,
+        encode_response: Callable[[QueryResult], str],
+    ) -> str:
+        """Publish a data mutation and its replay response as one snapshot."""
+        from grapharrow.use_cases.cypher_pipeline import contains_updates
+
+        graph = self._graph_service
+        if not isinstance(graph, GraphStateUseCase):
+            raise QueryError.unsupported("Idempotency requires an autocommit data write.")
+        with graph.cypher_query_slot(), graph.writer_lock():
+            base, receipt = graph.idempotency_base(key_hash)
+            if receipt is not None:
+                return _replay_response(receipt, request_hash)
+
+            with _query_phase("compile"):
+                tree = self._parse_cache.parse(query)
+                if not contains_updates(tree):
+                    raise QueryError.unsupported("Idempotency-Key requires a Cypher data write.")
+                # The lookup and transaction use the same snapshot. A concurrent publication
+                # after the lookup must go through commit conflict handling below.
+                transaction = GraphTransactionUseCase(graph, base_snapshot=base)
+                executor = self._transaction_executor(transaction)
+                result = executor._compile_and_execute_write(tree, query.strip(), params)
+            response = encode_response(_public_query_result(result))
+            try:
+                transaction.commit(
+                    idempotency_receipt=IdempotencyReceipt(key_hash, request_hash, response)
+                )
+            except WriteConflictError:
+                _, receipt = graph.idempotency_base(key_hash)
+                if receipt is None:
+                    raise
+                return _replay_response(receipt, request_hash)
+            return response
 
     def _execute(self, query: str, params: dict[str, object] | None) -> QueryResult:
         normalized = query.strip()
@@ -757,13 +816,7 @@ class CypherQueryUseCase:
                     return run(self)
             with graph.writer_lock():
                 transaction = GraphTransactionUseCase(graph)
-                executor = CypherQueryUseCase(
-                    transaction,
-                    self._tabular,
-                    self._index_service,
-                    self._parse_cache,
-                    procedures=self._procedures,
-                )
+                executor = self._transaction_executor(transaction)
                 with transaction.statement():
                     result = run(executor)
                 transaction.commit()
@@ -772,6 +825,15 @@ class CypherQueryUseCase:
             raise QueryError(
                 str(error), category="ConstraintVerificationFailed", detail="ConstraintViolation"
             ) from error
+
+    def _transaction_executor(self, transaction: GraphTransactionUseCase) -> CypherQueryUseCase:
+        return CypherQueryUseCase(
+            transaction,
+            self._tabular,
+            self._index_service,
+            self._parse_cache,
+            procedures=self._procedures,
+        )
 
     def _execute_compiled(self, compiled: CompiledQuery) -> QueryResult:
         """Dispatch a compiled statement under its caller's mutation boundary."""
@@ -4730,7 +4792,7 @@ def _compile_set_items(
             variable, field = _parse_property_reference(property_expression.getText())
             if variable not in bound_variables:
                 raise QueryError(f"SET references an unbound variable: {variable}")
-            if field in {"id", "labels", "type", "source", "target", "__join_id"}:
+            if field in {"labels", "type", "source", "target", "__join_id"}:
                 raise QueryError(f"SET cannot update reserved field '{field}'.")
             compiled_items.append(
                 SetPropertyItem(
@@ -4761,7 +4823,7 @@ def _compile_set_items(
                 raise QueryError("SET += requires a map value.")
             if not all(isinstance(key, str) for key in compiled_value):
                 raise QueryError("SET += requires string property keys.")
-            reserved_fields = {"id", "labels", "type", "source", "target", "__join_id"}
+            reserved_fields = {"labels", "type", "source", "target", "__join_id"}
             invalid_fields = sorted(key for key in compiled_value if key in reserved_fields)
             if invalid_fields:
                 raise QueryError(f"SET cannot update reserved field '{invalid_fields[0]}'.")
@@ -4812,7 +4874,7 @@ def _compile_remove_items(
             variable, field = _parse_property_reference(property_expression.getText())
             if variable not in bound_variables:
                 raise QueryError(f"REMOVE references an unbound variable: {variable}")
-            if field in {"id", "labels", "type", "source", "target", "__join_id"}:
+            if field in {"labels", "type", "source", "target", "__join_id"}:
                 raise QueryError(f"REMOVE cannot update reserved field '{field}'.")
             compiled_items.append(RemovePropertyItem(variable=variable, field=field))
             continue
@@ -6712,7 +6774,7 @@ def _path_step_edges(
     adjacency_by_source_loader: Callable[[str], pa.Table] | None,
 ) -> pa.Table:
     prefix = "__path_edge"
-    edge_id = f"{prefix}.id"
+    edge_id = f"{prefix}.{_ENTITY_ID_FIELD}"
     requested_fields = set(step.properties)
     table = _edge_match_table(
         edges,
@@ -6726,7 +6788,7 @@ def _path_step_edges(
     ) or _has_relationship_type_alternatives(step):
         table = _apply_edge_pattern_filter(table, prefix, step)
     src, dst = table[f"{prefix}.source"], table[f"{prefix}.target"]
-    ids = table[f"{prefix}.id"]
+    ids = table[f"{prefix}.{_ENTITY_ID_FIELD}"]
     if step.direction == "undirected":
         non_loops = pc.not_equal(src, dst)
         return pa.table(
@@ -6871,12 +6933,12 @@ def _filter_reused_relationships_in_fixed_path(
     previous_edge_prefixes: tuple[str, ...],
 ) -> pa.Table:
     """Apply Cypher relationship uniqueness for fixed-hop path patterns."""
-    current_column = f"{current_edge_prefix}.id"
+    current_column = f"{current_edge_prefix}.{_ENTITY_ID_FIELD}"
     if current_column not in table.column_names:
         return table
     masks: list[pa.Array] = []
     for previous_edge_prefix in previous_edge_prefixes:
-        previous_column = f"{previous_edge_prefix}.id"
+        previous_column = f"{previous_edge_prefix}.{_ENTITY_ID_FIELD}"
         if previous_column not in table.column_names:
             continue
         masks.append(pc.not_equal(table[current_column], table[previous_column]))
@@ -6978,7 +7040,7 @@ def _match_single_variable_length_path_table(
             node_property_loader=node_property_loader,
         )
     filtered_edges = filtered_edges.select(
-        [f"{edge_prefix}.id", f"{edge_prefix}.source", f"{edge_prefix}.target"]
+        [f"{edge_prefix}.{_ENTITY_ID_FIELD}", f"{edge_prefix}.source", f"{edge_prefix}.target"]
     )
 
     end_nodes = _node_binding_table(
@@ -7001,7 +7063,9 @@ def _match_single_variable_length_path_table(
             break
         joined_edges = joined_edges.rename_columns(
             [
-                current_edge_id_column if column_name == f"{edge_prefix}.id" else column_name
+                current_edge_id_column
+                if column_name == f"{edge_prefix}.{_ENTITY_ID_FIELD}"
+                else column_name
                 for column_name in joined_edges.column_names
             ]
         )
@@ -7290,7 +7354,7 @@ def _adjacency_map_from_edge_table(
     edge_prefix: str,
 ) -> dict[int, tuple[tuple[int, int], ...]]:
     """Build a compact source-id adjacency map for endpoint-only traversal."""
-    edge_ids = edge_table[f"{edge_prefix}.id"].combine_chunks().to_pylist()
+    edge_ids = edge_table[f"{edge_prefix}.{_ENTITY_ID_FIELD}"].combine_chunks().to_pylist()
     source_ids = edge_table[f"{edge_prefix}.source"].combine_chunks().to_pylist()
     target_ids = edge_table[f"{edge_prefix}.target"].combine_chunks().to_pylist()
     adjacency_lists: dict[int, list[tuple[int, int]]] = {}
@@ -8605,9 +8669,9 @@ def _project_columns_for_required_fields(
     reserved = (
         {_NODE_ID_FIELD, _ENTITY_ID_FIELD, "__join_id", "labels"}
         if is_node
-        else {"id", _ENTITY_ID_FIELD, _NODE_ID_FIELD, "type", "source", "target"}
+        else {_ENTITY_ID_FIELD, _NODE_ID_FIELD, "type", "source", "target"}
     )
-    id_field = _NODE_ID_FIELD if is_node else "id"
+    id_field = _NODE_ID_FIELD if is_node else _ENTITY_ID_FIELD
     columns = [_binding_column_name(variable, id_field)]
     if _ENTITY_ID_FIELD in requested_fields and _ENTITY_ID_FIELD != id_field:
         columns.append(_binding_column_name(variable, _ENTITY_ID_FIELD))
@@ -8645,7 +8709,7 @@ def _project_columns_for_with_stage_input(
         source_column = _aggregate_source_column_name(aggregate_item)
         if source_column == _ENTITY_ID_FIELD:
             columns.append(_binding_column_name(aggregate_item.variable, _NODE_ID_FIELD))
-            columns.append(_binding_column_name(aggregate_item.variable, "id"))
+            columns.append(_binding_column_name(aggregate_item.variable, _ENTITY_ID_FIELD))
             continue
         columns.append(
             _binding_column_name(
@@ -9969,7 +10033,7 @@ def _resolve_input_set_property_updates(
     resolved = _resolve_input_set_value(item.source, source_row=source_row)
     if not isinstance(resolved, Mapping):
         raise QueryError("SET += row requires the row reference to resolve to a map.")
-    reserved_fields = {"id", "labels", "type", "source", "target", "__join_id"}
+    reserved_fields = {"labels", "type", "source", "target", "__join_id"}
     return tuple(
         (str(key), value)
         for key, value in resolved.items()
@@ -9990,9 +10054,10 @@ def _resolve_input_set_value(
 
 def _required_entity_id_value_from_row(row: Mapping[str, Any], variable: str) -> int:
     """Read one bound entity id from a row."""
-    value = row.get(_binding_column_name(variable, _ENTITY_ID_FIELD))
-    if isinstance(value, int):
-        return value
+    for field in (_ENTITY_ID_FIELD, _NODE_ID_FIELD):
+        value = row.get(_binding_column_name(variable, field))
+        if isinstance(value, int):
+            return value
     raise QueryError(f"SET variable '{variable}' does not resolve to an entity id.")
 
 
@@ -10761,7 +10826,6 @@ def _edge_binding_values(
     fields = requested_fields.get(variable)
     row: dict[str, Any] = {
         _binding_column_name(variable, _ENTITY_ID_FIELD): edge.edge_id,
-        _binding_column_name(variable, "id"): edge.edge_id,
     }
     if fields is None or "type" in fields or _FULL_ENTITY_FIELDS in fields:
         row[_binding_column_name(variable, "type")] = edge.rel_type
@@ -10773,7 +10837,7 @@ def _edge_binding_values(
         edge.properties.keys() if fields is None or _FULL_ENTITY_FIELDS in fields else fields
     )
     for field in property_fields:
-        if field in {_ENTITY_ID_FIELD, "id", "type", "source", "target", _FULL_ENTITY_FIELDS}:
+        if field in {_ENTITY_ID_FIELD, "type", "source", "target", _FULL_ENTITY_FIELDS}:
             continue
         row[_binding_column_name(variable, field)] = edge.properties.get(field)
     return row
@@ -10813,7 +10877,7 @@ def _resolve_input_merge_set_properties(
                 key: value
                 for key, value in resolved.items()
                 if isinstance(key, str)
-                and key not in {"id", "labels", "type", "source", "target", "__join_id"}
+                and key not in {"labels", "type", "source", "target", "__join_id"}
             }
         )
     return properties
@@ -11053,7 +11117,7 @@ def _project_value(value: object, field: str | None) -> Any:
                 "target": value.dst_id,
                 "properties": dict(value.properties),
             }
-        if field in {"id", _ENTITY_ID_FIELD}:
+        if field == _ENTITY_ID_FIELD:
             return value.edge_id
         if field == "type":
             return value.rel_type
@@ -11097,7 +11161,7 @@ def _project_node_from_row(record: Mapping[str, Any], variable: str) -> dict[str
 def _project_edge_from_row(record: Mapping[str, Any], variable: str) -> dict[str, Any] | None:
     """Project bindings into the columns or values needed by the next step."""
     prefix = f"{variable}."
-    edge_id = record.get(f"{prefix}id")
+    edge_id = record.get(f"{prefix}{_ENTITY_ID_FIELD}")
     if edge_id is None:
         return None
     properties = {
@@ -11106,7 +11170,7 @@ def _project_edge_from_row(record: Mapping[str, Any], variable: str) -> dict[str
         if column.startswith(prefix)
         and column
         not in {
-            f"{prefix}id",
+            f"{prefix}{_ENTITY_ID_FIELD}",
             f"{prefix}type",
             f"{prefix}source",
             f"{prefix}target",
@@ -11271,7 +11335,7 @@ def _with_missing_optional_columns(table: pa.Table, column_names: list[str]) -> 
 
 def _optional_column_type(column_name: str) -> pa.DataType:
     """Support the current Cypher compilation or execution step."""
-    if column_name.endswith((".id", ".__id", ".__entity_id", ".__join_id", ".source", ".target")):
+    if column_name.endswith((".__id", ".__entity_id", ".__join_id", ".source", ".target")):
         return pa.int64()
     if column_name.endswith((".labels", ".type")):
         return pa.string()
@@ -11306,7 +11370,7 @@ def _node_null_columns(variable: str) -> list[str]:
 def _edge_null_columns(variable: str) -> list[str]:
     """Handle edge-specific matching, projection, or lookup logic for Cypher."""
     return [
-        _binding_column_name(variable, "id"),
+        _binding_column_name(variable, _ENTITY_ID_FIELD),
         _binding_column_name(variable, "type"),
         _binding_column_name(variable, "source"),
         _binding_column_name(variable, "target"),
@@ -11499,7 +11563,7 @@ def _reserved_property_fields_for_record(
     if _binding_column_name(variable, "labels") in record:
         return {_ENTITY_ID_FIELD, _NODE_ID_FIELD, "__join_id", "labels"}
     if _binding_column_name(variable, "type") in record:
-        return {"id", "type", "source", "target"}
+        return {_ENTITY_ID_FIELD, "type", "source", "target"}
     return set()
 
 
@@ -11508,7 +11572,7 @@ def _reserved_property_fields_for_table(table: pa.Table, variable: str) -> set[s
     if _is_node_binding_table(table, variable):
         return {_ENTITY_ID_FIELD, _NODE_ID_FIELD, "__join_id", "labels"}
     if _is_edge_binding_table(table, variable):
-        return {"id", "type", "source", "target"}
+        return {_ENTITY_ID_FIELD, "type", "source", "target"}
     return set()
 
 
@@ -11539,10 +11603,10 @@ def _resolve_record_field_value(
         return _property_keys_from_record(record, variable)
 
     if field == _ENTITY_ID_FIELD:
-        node_id = record.get(_binding_column_name(variable, _NODE_ID_FIELD))
-        if node_id is not None:
-            return node_id
-        return record.get(_binding_column_name(variable, "id"))
+        identity_column = _binding_column_name(variable, _ENTITY_ID_FIELD)
+        if identity_column in record:
+            return record[identity_column]
+        return record.get(_binding_column_name(variable, _NODE_ID_FIELD))
 
     function_field = _decode_function_field(field)
     if function_field is None:
@@ -11568,12 +11632,10 @@ def _resolve_table_field_array(
         return _property_keys_array_from_table(table, variable)
 
     if field == _ENTITY_ID_FIELD:
-        node_column = _binding_column_name(variable, _NODE_ID_FIELD)
-        if node_column in table.column_names:
-            return table[node_column]
-        edge_column = _binding_column_name(variable, "id")
-        if edge_column in table.column_names:
-            return table[edge_column]
+        for identity_field in (_ENTITY_ID_FIELD, _NODE_ID_FIELD):
+            identity_column = _binding_column_name(variable, identity_field)
+            if identity_column in table.column_names:
+                return table[identity_column]
         return None
 
     function_field = _decode_function_field(field)
@@ -11606,6 +11668,11 @@ def _ensure_order_column(
             if node_id_column in table.column_names:
                 return table, node_id_column
         if column_name not in table.column_names:
+            if (
+                _is_node_binding_table(table, variable) or _is_edge_binding_table(table, variable)
+            ) and field not in _reserved_property_fields_for_table(table, variable):
+                # A missing user property sorts as null; it is never an entity identity.
+                return table.append_column(column_name, pa.nulls(table.num_rows)), column_name
             raise QueryError(f"ORDER BY references an unknown binding: {column_name}")
         return table, column_name
 
@@ -12388,7 +12455,7 @@ def _typed_adjacency_binding_table(
     """Support the current Cypher compilation or execution step."""
     if adjacency_table.num_rows == 0:
         empty_columns: dict[str, pa.Array] = {
-            f"{edge_prefix}.id": pa.array([], type=pa.int64()),
+            f"{edge_prefix}.{_ENTITY_ID_FIELD}": pa.array([], type=pa.int64()),
             f"{edge_prefix}.source": pa.array([], type=pa.int64()),
             f"{edge_prefix}.target": pa.array([], type=pa.int64()),
         }
@@ -12396,7 +12463,7 @@ def _typed_adjacency_binding_table(
             empty_columns[f"{edge_prefix}.type"] = pa.array([], type=pa.string())
         return pa.table(empty_columns)
     columns: dict[str, pa.Array | pa.ChunkedArray] = {
-        f"{edge_prefix}.id": adjacency_table["edge_id"],
+        f"{edge_prefix}.{_ENTITY_ID_FIELD}": adjacency_table["edge_id"],
         f"{edge_prefix}.source": adjacency_table["src_id"],
         f"{edge_prefix}.target": adjacency_table["dst_id"],
     }
@@ -12607,7 +12674,7 @@ def _edge_binding_table(
             requested_fields=requested_fields,
         )
     edge_records = cast(tuple[EdgeRecord, ...], edges)
-    reserved_fields = {"id", "type", "source", "target"}
+    reserved_fields = {_ENTITY_ID_FIELD, "type", "source", "target"}
     if requested_fields is None:
         property_names = sorted({key for edge in edge_records for key in edge.properties})
     else:
@@ -12619,7 +12686,7 @@ def _edge_binding_table(
         )
     rows = [
         {
-            f"{prefix}.id": edge.edge_id,
+            f"{prefix}.{_ENTITY_ID_FIELD}": edge.edge_id,
             f"{prefix}.type": edge.rel_type,
             f"{prefix}.source": edge.src_id,
             f"{prefix}.target": edge.dst_id,
@@ -12634,7 +12701,7 @@ def _edge_binding_table(
         return pa.Table.from_pylist(rows)
     return pa.table(
         {
-            f"{prefix}.id": pa.array([], type=pa.int64()),
+            f"{prefix}.{_ENTITY_ID_FIELD}": pa.array([], type=pa.int64()),
             f"{prefix}.type": pa.array([], type=pa.string()),
             f"{prefix}.source": pa.array([], type=pa.int64()),
             f"{prefix}.target": pa.array([], type=pa.int64()),
@@ -13001,13 +13068,17 @@ def _can_use_edge_property_projection(
     if requested_fields is None or step.rel_type is None:
         return False
     property_fields = {
-        field for field in requested_fields if field not in {"id", "type", "source", "target"}
+        field
+        for field in requested_fields
+        if field not in {_ENTITY_ID_FIELD, "type", "source", "target"}
     }
     if step.properties:
         property_fields.update(step.properties)
     if property_fields.intersection({"edge_id", "src_id", "dst_id"}):
         return False
-    return bool(property_fields or requested_fields.intersection({"id", "source", "target"}))
+    return bool(
+        property_fields or requested_fields.intersection({_ENTITY_ID_FIELD, "source", "target"})
+    )
 
 
 def _requested_edge_property_fields(
@@ -13016,7 +13087,7 @@ def _requested_edge_property_fields(
 ) -> set[str]:
     """Return the logical relationship property columns needed by a property projection."""
 
-    reserved_fields = {"id", "type", "source", "target"}
+    reserved_fields = {_ENTITY_ID_FIELD, "type", "source", "target"}
     property_fields = {field for field in requested_fields if field not in reserved_fields}
     property_fields.update(step.properties)
     return property_fields
@@ -13036,7 +13107,9 @@ def _can_project_requested_edge_fields(
     required_fields = set(step.properties)
     if requested_fields is not None:
         required_fields.update(
-            field for field in requested_fields if field not in {"id", "type", "source", "target"}
+            field
+            for field in requested_fields
+            if field not in {_ENTITY_ID_FIELD, "type", "source", "target"}
         )
     return required_fields.issubset(set(property_table.column_names))
 
@@ -13050,7 +13123,7 @@ def _edge_binding_table_from_property_projection(
 ) -> pa.Table:
     """Handle edge-specific matching, projection, or lookup logic for Cypher."""
     columns: dict[str, pa.Array | pa.ChunkedArray] = {
-        f"{prefix}.id": property_table["edge_id"],
+        f"{prefix}.{_ENTITY_ID_FIELD}": property_table["edge_id"],
         f"{prefix}.type": pa.array([rel_type] * property_table.num_rows, type=pa.string()),
         f"{prefix}.source": property_table["src_id"],
         f"{prefix}.target": property_table["dst_id"],
@@ -13066,7 +13139,7 @@ def _edge_binding_table_from_property_projection(
         property_names = sorted(
             field
             for field in requested_fields
-            if field not in {"id", "type", "source", "target"}
+            if field not in {_ENTITY_ID_FIELD, "type", "source", "target"}
             and field in property_table.column_names
         )
     for property_name in property_names:
@@ -13110,7 +13183,7 @@ def _edge_binding_table_from_canonical_table(
     requested_fields: set[str] | None,
 ) -> pa.Table:
     """Handle edge-specific matching, projection, or lookup logic for Cypher."""
-    reserved_fields = {"id", "type", "source", "target"}
+    reserved_fields = {_ENTITY_ID_FIELD, "type", "source", "target"}
     if requested_fields is None:
         properties = [
             _normalize_property_map(property_codec.loads(value))
@@ -13134,7 +13207,7 @@ def _edge_binding_table_from_canonical_table(
         )
 
     columns: dict[str, pa.Array | pa.ChunkedArray] = {
-        f"{prefix}.id": table["edge_id"],
+        f"{prefix}.{_ENTITY_ID_FIELD}": table["edge_id"],
         f"{prefix}.type": pa.array(
             [_cypher_name(value) for value in table["rel_type"].to_pylist()],
             type=pa.string(),

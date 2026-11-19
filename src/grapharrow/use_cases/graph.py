@@ -6,11 +6,9 @@ import time
 from collections.abc import Generator, Mapping
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
 from functools import partial
-from pathlib import PurePosixPath
 from threading import BoundedSemaphore
-from typing import Any
+from typing import Any, cast
 
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.compute as pc  # type: ignore[import-untyped]
@@ -20,27 +18,24 @@ from grapharrow.adapters.property_index import PropertyIndexStore
 from grapharrow.adapters.snapshot_tables import SnapshotTableCache
 from grapharrow.adapters.writer import writer_locked
 from grapharrow.core import property_codec
-from grapharrow.core.errors import NotFoundError, QueryError, SchemaError, WriteConflictError
+from grapharrow.core.errors import NotFoundError, QueryError, SchemaError
 from grapharrow.domain import (
     CatalogVersion,
-    DatasetFile,
     LabelDefinition,
     LabelId,
     RelationshipTypeDefinition,
     RelationshipTypeId,
-    SnapshotId,
     SnapshotManifest,
     VersionedCatalog,
 )
 from grapharrow.domain.scan import ScanPredicate
+from grapharrow.domain.snapshot import IdempotencyReceipt
 from grapharrow.repositories import (
-    CatalogRepository,
     EdgeRecord,
-    GraphRepository,
     NodeRecord,
-    SnapshotRepository,
 )
 from grapharrow.repositories.graph import EDGE_SCHEMA, _edges_table, _nodes_table
+from grapharrow.storage.contracts import CatalogStore, GraphStore, SnapshotStore, StorageBackend
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,9 +74,10 @@ class GraphStateUseCase:
     def __init__(
         self,
         *,
-        catalog_store: CatalogRepository,
-        snapshot_store: SnapshotRepository,
-        graph_store: GraphRepository,
+        catalog_store: CatalogStore,
+        snapshot_store: SnapshotStore,
+        graph_store: GraphStore,
+        storage_backend: StorageBackend | None = None,
         cypher_max_concurrent_queries: int = 0,
         snapshot_table_cache_max_bytes: int = 64 * 1024 * 1024,
         property_index_max_bytes: int = 32 * 1024 * 1024,
@@ -91,7 +87,24 @@ class GraphStateUseCase:
         self._catalog_store = catalog_store
         self._snapshot_store = snapshot_store
         self._graph_store = graph_store
-        self._writer = snapshot_store.writer
+        if storage_backend is None:
+            from grapharrow.storage.native import NativeGraphStore, NativeStorageBackend
+
+            storage_backend = NativeStorageBackend(
+                catalog=catalog_store,
+                snapshot=snapshot_store,
+                graph=cast(NativeGraphStore, graph_store),
+            )
+        elif not (
+            storage_backend.catalog is catalog_store
+            and storage_backend.snapshot is snapshot_store
+            and storage_backend.graph is graph_store
+        ):
+            raise ValueError(
+                "The Storage Backend must use the same catalog, snapshot and graph stores."
+            )
+        self._storage_backend = storage_backend
+        self._writer = storage_backend.writer
         self._cypher_slots = (
             BoundedSemaphore(cypher_max_concurrent_queries)
             if cypher_max_concurrent_queries
@@ -132,54 +145,23 @@ class GraphStateUseCase:
 
     def capture_snapshot(self) -> SnapshotManifest:
         """Pin a published snapshot without loading canonical graph tables."""
-        return self._catalog_store.bootstrap_snapshot()
+        return self._storage_backend.capture_snapshot()
 
-    @contextmanager
+    def idempotency_base(self, key_hash: str) -> tuple[SnapshotManifest, IdempotencyReceipt | None]:
+        """Find a receipt and the write base in the same published history."""
+        pointer = self._snapshot_store.try_load_current_pointer()
+        if pointer is None:
+            self.capture_snapshot()
+            pointer = self._snapshot_store.load_current_pointer()
+        return self._snapshot_store.idempotency_base(pointer, key_hash)
+
     def edit_edge_properties_by_id(
         self, *, edge_id: int, rel_type: str | None, properties: dict[str, object]
-    ) -> Generator[tuple[EdgeRecord | None] | None, None, None]:
-        """Publish a selective edit only after its caller successfully builds the result.
-
-        None selects the full write path. A one-element tuple containing None
-        represents a successful lookup with no match. Explicit transactions keep
-        their existing staging and rollback path.
-        """
-        with self.writer_lock():
-            snapshot = self.capture_snapshot()
-            catalog = self._catalog_store.load_for_snapshot(snapshot)
-            if catalog.constraints:
-                yield None
-                return
-            eligible, patch = self._graph_store.prepare_edge_property_patch(
-                snapshot, edge_id=edge_id, rel_type=rel_type, properties=properties
-            )
-            if not eligible:
-                yield None
-                return
-            yield (patch.after if patch is not None else None,)
-            if patch is None or patch.before == patch.after:
-                return
-            if self._snapshot_store.load_current_pointer().snapshot_id != snapshot.snapshot_id:
-                raise WriteConflictError(
-                    "Database changed since this write began. Retry in a new transaction."
-                )
-            next_id = SnapshotId(snapshot.snapshot_id.value + 1)
-            canonical, projected = self._graph_store.persist_edge_property_patch(patch, next_id)
-            manifest = replace(
-                snapshot,
-                snapshot_id=next_id,
-                parent_snapshot_id=snapshot.snapshot_id,
-                commit_txid=next_id.value,
-                created_at=_utc_now(),
-                edges=tuple(
-                    canonical if file == patch.canonical_file else file for file in snapshot.edges
-                ),
-                edge_properties=tuple(
-                    projected if file == patch.property_file else file
-                    for file in snapshot.edge_properties
-                ),
-            )
-            self._snapshot_store.publish(manifest, base=snapshot)
+    ) -> AbstractContextManager[tuple[EdgeRecord | None] | None]:
+        """Let the selected backend prepare and atomically publish a selective edit."""
+        return self._storage_backend.edit_edge_properties_by_id(
+            edge_id=edge_id, rel_type=rel_type, properties=properties
+        )
 
     def load_state(self, *, snapshot: SnapshotManifest | None = None) -> GraphState:
         """Load the current catalog, snapshot, and graph records."""
@@ -301,11 +283,7 @@ class GraphStateUseCase:
             prop = index.property_names[0]
             if prop not in equalities:
                 continue
-            files = tuple(
-                item
-                for item in snapshot.node_properties
-                if PurePosixPath(item.path).parts[2] == label
-            )
+            files = self._graph_store.node_property_files(snapshot.node_properties, label=label)
             selected = self.property_indexes.lookup(
                 files,
                 prop,
@@ -368,11 +346,7 @@ class GraphStateUseCase:
     ) -> pa.Table:
         """Load the adjacency-by-source table for a relationship type."""
 
-        files = tuple(
-            dataset_file
-            for dataset_file in snapshot.adjacency_by_source
-            if _adjacency_rel_type_from_file(dataset_file) == rel_type
-        )
+        files = self._graph_store.adjacency_files(snapshot.adjacency_by_source, rel_type=rel_type)
         return self._graph_store.load_adjacency_by_source_table(files, predicates=predicates)
 
     def load_adjacency_by_dest_table(
@@ -384,22 +358,14 @@ class GraphStateUseCase:
     ) -> pa.Table:
         """Load the adjacency-by-destination table for a relationship type."""
 
-        files = tuple(
-            dataset_file
-            for dataset_file in snapshot.adjacency_by_dest
-            if _adjacency_rel_type_from_file(dataset_file) == rel_type
-        )
+        files = self._graph_store.adjacency_files(snapshot.adjacency_by_dest, rel_type=rel_type)
         return self._graph_store.load_adjacency_by_dest_table(files, predicates=predicates)
 
     def has_complete_adjacency(
         self, snapshot: SnapshotManifest, rel_type: str, *, incoming: bool
     ) -> bool:
         """Use a derived read only when the manifest accounts for every edge."""
-        files = snapshot.adjacency_by_dest if incoming else snapshot.adjacency_by_source
-        if sum(file.row_count for file in files) != sum(file.row_count for file in snapshot.edges):
-            return False
-        names = {_adjacency_rel_type_from_file(file) for file in files}
-        return None not in names and rel_type in names and f"`{rel_type}`" not in names
+        return self._graph_store.has_complete_adjacency(snapshot, rel_type, incoming=incoming)
 
     @writer_locked
     def create_node(
@@ -1007,63 +973,17 @@ class GraphStateUseCase:
         nodes: list[NodeRecord],
         edges: list[EdgeRecord],
         edge_table: pa.Table | None = None,
+        idempotency_receipt: IdempotencyReceipt | None = None,
     ) -> GraphState:
-        """Prepare immutable objects and publish the complete graph state."""
-        if self._snapshot_store.load_current_pointer().snapshot_id != (
-            previous_state.snapshot.snapshot_id
-        ):
-            raise WriteConflictError(
-                "Database changed since this write began. Retry in a new transaction."
-            )
-        catalog_path = previous_state.snapshot.catalog_path
-        if catalog.version != previous_state.catalog.version:
-            catalog_path = self._catalog_store.stage(catalog)
-
-        next_snapshot_id = SnapshotId(previous_state.snapshot.snapshot_id.value + 1)
-        persisted = self._graph_store.persist_snapshot(
-            snapshot_id=next_snapshot_id,
+        """Publish through the selected backend's atomic commit implementation."""
+        return self._storage_backend.publish_graph(
+            previous_state=previous_state,
+            catalog=catalog,
             nodes=nodes,
             edges=edges,
-            previous_snapshot=previous_state.snapshot,
-            previous_nodes=previous_state.nodes,
-            previous_edges=previous_state.edges,
-            previous_edge_table=previous_state.edge_table,
             edge_table=edge_table,
+            idempotency_receipt=idempotency_receipt,
         )
-        manifest = SnapshotManifest(
-            snapshot_id=next_snapshot_id,
-            parent_snapshot_id=previous_state.snapshot.snapshot_id,
-            commit_txid=next_snapshot_id.value,
-            created_at=_utc_now(),
-            catalog_version=catalog.version,
-            catalog_path=catalog_path,
-            nodes=persisted.nodes,
-            edges=persisted.edges,
-            node_labels=persisted.node_labels,
-            node_properties=persisted.node_properties,
-            adjacency_by_source=persisted.adjacency_by_source,
-            adjacency_by_dest=persisted.adjacency_by_dest,
-            edge_properties=persisted.edge_properties,
-        )
-        node_table = (
-            previous_state.node_table
-            if persisted.nodes == previous_state.snapshot.nodes
-            else self._graph_store.load_node_table(persisted.nodes)
-        )
-        if persisted.edges == previous_state.snapshot.edges:
-            edge_table = previous_state.edge_table
-        elif edge_table is None:
-            edge_table = self._graph_store.load_edge_table(persisted.edges)
-        state = GraphState(
-            catalog=catalog,
-            snapshot=manifest,
-            node_table=node_table,
-            edge_table=edge_table,
-            nodes=tuple(nodes),
-            edges=tuple(edges),
-        )
-        self._snapshot_store.publish(manifest, base=previous_state.snapshot)
-        return state
 
     def _ensure_catalog(
         self,
@@ -1325,11 +1245,17 @@ class GraphStateUseCase:
 class GraphTransactionUseCase:
     """In-memory transaction wrapper that publishes only on commit."""
 
-    def __init__(self, graph_service: GraphStateUseCase) -> None:
+    def __init__(
+        self, graph_service: GraphStateUseCase, *, base_snapshot: SnapshotManifest | None = None
+    ) -> None:
         """Start an isolated in-memory transaction from the current published snapshot."""
         self._graph_service = graph_service
         with graph_service.writer_lock():
-            self._base_state = graph_service.load_state()
+            self._base_state = (
+                graph_service.load_state()
+                if base_snapshot is None
+                else graph_service.load_state(snapshot=base_snapshot)
+            )
         self.transaction_time_ns = time.time_ns()
         self._state = self._base_state
         self._reuse_edge_table_on_commit = False
@@ -1782,14 +1708,14 @@ class GraphTransactionUseCase:
             edges=remaining_edges,
         )
 
-    def commit(self) -> GraphState:
+    def commit(self, *, idempotency_receipt: IdempotencyReceipt | None = None) -> GraphState:
         """Persist the transaction-local state as a new published snapshot."""
 
         self._ensure_open()
         self._closed = True
         self._adjacency_table = None
         self._adjacency_index = None
-        if self._state == self._base_state:
+        if idempotency_receipt is None and self._state == self._base_state:
             return self._base_state
         return self._graph_service._publish_graph(
             previous_state=self._base_state,
@@ -1797,6 +1723,7 @@ class GraphTransactionUseCase:
             nodes=list(self._state.nodes),
             edges=list(self._state.edges),
             edge_table=self._state.edge_table if self._reuse_edge_table_on_commit else None,
+            idempotency_receipt=idempotency_receipt,
         )
 
     def rollback(self) -> GraphState:
@@ -1926,18 +1853,6 @@ def _nodes_by_id(
     return {node.node_id: node for node in nodes}
 
 
-def _adjacency_rel_type_from_file(dataset_file: DatasetFile) -> str | None:
-    """Extract the relationship type encoded in an adjacency derived-dataset path."""
-    parts = PurePosixPath(dataset_file.path).parts
-    if (
-        "adjacency" not in parts
-        or ("by_source" not in parts and "by_dest" not in parts)
-        or len(parts) < 2
-    ):
-        return None
-    return parts[-2]
-
-
 def _bulk_labels_for_row(
     row: dict[str, Any],
     *,
@@ -1999,11 +1914,6 @@ def _required_int_value(row: dict[str, Any], column: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise SchemaError(f"Bulk ingest column '{column}' must contain integers.")
     return value
-
-
-def _utc_now() -> str:
-    """Return the timestamp format used in snapshot manifests."""
-    return datetime.now(tz=UTC).isoformat(timespec="seconds")
 
 
 __all__ = ["GraphState", "GraphStateUseCase", "GraphTransactionUseCase", "QueryResult"]

@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 from collections.abc import Sequence
+from dataclasses import asdict
 from pathlib import Path
 
 import pyarrow.csv as pacsv  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
+from grapharrow.core.errors import StorageError
 from grapharrow.domain import DatasetFile, IndexDefinition, PropertyOwnerKind
 from grapharrow.interfaces.embedded import Database
 
@@ -132,6 +134,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Remove abandoned files while preserving published snapshots.",
     )
     vacuum_parser.add_argument("path", help="Database directory to vacuum.")
+
+    retention_parser = subparsers.add_parser(
+        "retention-plan",
+        help="Estimate reclaimable Parquet space for a proposed snapshot policy.",
+    )
+    retention_parser.add_argument("path", help="Database directory or URI to inspect.")
+    retention_parser.add_argument(
+        "--keep-last", type=int, required=True, help="Minimum number of snapshots to keep."
+    )
+    retention_parser.add_argument(
+        "--min-age-hours", type=int, default=0, help="Keep snapshots within this age window."
+    )
 
     bulk_nodes_parser = subparsers.add_parser(
         "bulk-add-nodes",
@@ -438,6 +452,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         database = Database(args.path)
         removed_paths = database.vacuum()
         print(json.dumps({"removed_paths": list(removed_paths)}, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "retention-plan":
+        database = Database(args.path)
+        try:
+            plan = database.plan_retention(
+                keep_last=args.keep_last, min_age_hours=args.min_age_hours
+            )
+        except (ValueError, StorageError) as exc:
+            parser.error(str(exc))
+        print(json.dumps(asdict(plan), indent=2, sort_keys=True))
         return 0
 
     if args.command in {"bulk-add-nodes", "import-nodes"}:

@@ -105,5 +105,9 @@ class WriteConflictError(TransactionError):
     """The database changed after a writer captured its base state."""
 
 
+class IdempotencyConflictError(GraphArrowError):
+    """An idempotency key already belongs to another request."""
+
+
 class CommitOutcomeUnknownError(StorageError):
     """The head update could not be confirmed or safely ruled out."""

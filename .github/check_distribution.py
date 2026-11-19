@@ -271,6 +271,9 @@ assert ranked._resources.budget.used_bytes == 0
 assert application.use_cases.admin.verify(verify_checksums=True).ok
 print('Installed-wheel smoke passed: seed filters, ranked discovery, adjacency and isolation.')
 point = build_application('point-set-wheel')
+assert point.storage_backend.name == 'native'
+assert point.storage_backend.graph is point.repositories.graph
+assert point.storage_backend.snapshot is point.repositories.snapshot
 point.use_cases.cypher.execute("CREATE ()-[:LINK {value:'old'}]->()")
 old_point = point.use_cases.graph.capture_snapshot()
 assert point.use_cases.cypher.execute(
@@ -335,6 +338,11 @@ def main() -> None:
                 ("boto3", "azure-identity", "azure-storage-blob", "google-cloud-storage")
             ):
                 assert "extra ==" in dependency, dependency
+        assert "grapharrow/storage/contracts.py" in names
+        assert "grapharrow/storage/factory.py" in names
+        assert "grapharrow/storage/native.py" in names
+        assert "grapharrow/storage/native_maintenance.py" in names
+        assert "grapharrow/domain/records.py" in names
         assert "grapharrow/adapters/checksum.py" in names
         assert "grapharrow/use_cases/cypher_point_set.py" in names
         assert "grapharrow/ana/tool_schemas.json" in names

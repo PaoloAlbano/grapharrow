@@ -34,6 +34,15 @@ class DatasetFile:
 
 
 @dataclass(frozen=True, slots=True)
+class IdempotencyReceipt:
+    """Replay information committed with one successful write."""
+
+    key_hash: str
+    request_hash: str
+    response_json: str
+
+
+@dataclass(frozen=True, slots=True)
 class SnapshotManifest:
     """Immutable description of a published snapshot."""
 
@@ -50,6 +59,7 @@ class SnapshotManifest:
     adjacency_by_dest: tuple[DatasetFile, ...] = field(default_factory=tuple)
     edge_properties: tuple[DatasetFile, ...] = field(default_factory=tuple)
     catalog_path: str | None = None
+    idempotency_receipt: IdempotencyReceipt | None = None
 
     @classmethod
     def empty(
@@ -79,6 +89,7 @@ class CurrentSnapshotPointer:
     manifest_path: str
     commit_txid: int
     created_at: str
+    idempotency_index_path: str | None = None
 
 
 def _utc_now() -> str:

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import json
+from dataclasses import asdict
+from hashlib import sha256
 from pathlib import Path
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -17,6 +21,7 @@ from grapharrow.core.errors import (
     CatalogError,
     CommitOutcomeUnknownError,
     GraphArrowError,
+    IdempotencyConflictError,
     NotFoundError,
     QueryError,
     StorageError,
@@ -24,6 +29,9 @@ from grapharrow.core.errors import (
     WriteConflictError,
 )
 from grapharrow.use_cases.cypher_expression import public_value
+from grapharrow.use_cases.graph import QueryResult
+
+_MAX_IDEMPOTENT_RESPONSE_BYTES = 64 * 1024
 
 
 class QueryRequest(BaseModel):
@@ -150,16 +158,31 @@ def create_rest_app(
         )
 
     @protected_router.post("/query")
-    def query(payload: QueryRequest) -> dict[str, object]:
+    def query(
+        payload: QueryRequest,
+        idempotency_key: Annotated[
+            str | None, Header(min_length=1, max_length=128, pattern=r"^[!-~]+$")
+        ] = None,
+    ) -> dict[str, object]:
         """Execute a Cypher statement over HTTP and wrap the tabular result in the REST envelope."""
-        result = container.use_cases.cypher.execute(payload.query, dict(payload.params))
-        return _ok(
-            data={
-                "columns": list(result.columns),
-                "rows": list(result.rows),
-            },
-            meta={"row_count": len(result.rows)},
+        cypher = container.use_cases.cypher
+        if idempotency_key is None:
+            return _query_envelope(cypher.execute(payload.query, payload.params))
+
+        try:
+            fingerprint = json.dumps(
+                payload.model_dump(), sort_keys=True, separators=(",", ":"), allow_nan=False
+            )
+        except ValueError as exc:
+            raise QueryError("Idempotency-Key requires finite JSON parameters.") from exc
+        response = cypher.execute_idempotent_write(
+            payload.query,
+            payload.params,
+            key_hash=sha256(idempotency_key.encode("ascii")).hexdigest(),
+            request_hash=sha256(fingerprint.encode("utf-8")).hexdigest(),
+            encode_response=_encode_idempotent_response,
         )
+        return cast(dict[str, object], json.loads(response))
 
     @protected_router.post("/nodes", status_code=status.HTTP_201_CREATED)
     def create_node(payload: NodeCreateRequest) -> dict[str, object]:
@@ -305,6 +328,17 @@ def create_rest_app(
         payload = VacuumResponse(removed_paths=list(removed_paths))
         return _ok(data=payload.model_dump())
 
+    @protected_router.get("/admin/retention/plan")
+    def plan_retention(
+        keep_last: Annotated[int, Query(ge=1)],
+        min_age_hours: Annotated[int, Query(ge=0)] = 0,
+    ) -> dict[str, object]:
+        """Estimate a retention policy against the published snapshot history."""
+        plan = container.use_cases.admin.plan_retention(
+            keep_last=keep_last, min_age_hours=min_age_hours
+        )
+        return _ok(data=asdict(plan))
+
     app.include_router(public_router)
     app.include_router(protected_router)
     _register_error_handlers(app)
@@ -341,6 +375,15 @@ def _register_error_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
             content=_error("WRITE_CONFLICT", str(exc)),
+        )
+
+    @app.exception_handler(IdempotencyConflictError)
+    async def idempotency_conflict_handler(
+        _: Request, exc: IdempotencyConflictError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content=_error("IDEMPOTENCY_KEY_CONFLICT", str(exc)),
         )
 
     @app.exception_handler(CommitOutcomeUnknownError)
@@ -400,6 +443,25 @@ def _register_error_handlers(app: FastAPI) -> None:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content=_error(type(exc).__name__.upper(), str(exc)),
         )
+
+
+def _query_envelope(result: QueryResult) -> dict[str, object]:
+    return _ok(
+        data={"columns": list(result.columns), "rows": list(result.rows)},
+        meta={"row_count": len(result.rows)},
+    )
+
+
+def _encode_idempotent_response(result: QueryResult) -> str:
+    try:
+        body = bytes(JSONResponse(jsonable_encoder(_query_envelope(result))).body)
+    except (ValueError, TypeError) as exc:
+        raise QueryError(
+            "The idempotent write result must be valid JSON.", phase="runtime"
+        ) from exc
+    if len(body) > _MAX_IDEMPOTENT_RESPONSE_BYTES:
+        raise QueryError("The idempotent write result exceeds 64 KiB.", phase="runtime")
+    return body.decode("utf-8")
 
 
 def _ok(*, data: dict[str, Any], meta: dict[str, Any] | None = None) -> dict[str, object]:

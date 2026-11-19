@@ -137,7 +137,7 @@ def test_incoming_typed_edge_match_falls_back_when_dest_adjacency_is_missing() -
 
     assert table.to_pylist() == [
         {
-            "h.id": 10,
+            "h.__entity_id": 10,
             "h.source": 1,
             "h.target": 2,
             "h.type": "HAPPENED_IN",

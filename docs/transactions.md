@@ -65,6 +65,10 @@ derived indexes come from the same manifest. ANA keeps that snapshot for the
 workflow. Bolt explicit transactions keep their captured base and include
 their own pending writes.
 
+For Native deployments, route mutations and write maintenance to one
+writer process per database. Other processes can read from the same
+storage while the writer publishes new snapshots.
+
 On native local storage, GraphArrow coordinates writers across threads and
 processes with a reentrant lock and an OS lock at `.grapharrow-writer.lock`.
 File URI aliases share the same lock. GraphArrow flushes new snapshot files
@@ -72,10 +76,10 @@ and the temporary pointer before replacing the head with an atomic rename.
 It also flushes their directories on platforms that support directory
 `fsync`. The filesystem must support advisory locks and atomic rename.
 
-On object storage, any replica can prepare a write. S3 and Azure Blob
-compare the head's ETag before replacing it. Google Cloud Storage compares
-the object generation. Bootstrap uses a conditional create. All replicas
-must use the same writable bucket or container and database prefix.
+On object storage, S3 and Azure Blob compare the head's ETag before replacing
+it. Google Cloud Storage compares the object generation. Bootstrap uses a
+conditional create. All replicas must use the same bucket or container and
+database prefix.
 S3-compatible endpoints must enforce AWS conditional PUT semantics.
 [Amazon S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) ·
 [Azure Blob concurrency](https://learn.microsoft.com/en-us/azure/storage/blobs/concurrency-manage) ·
@@ -96,18 +100,72 @@ explicit transaction. The embedded API raises `WriteConflictError`.
 If the storage provider may have accepted the update before the response was
 lost, GraphArrow checks the published ancestry for that commit. When the
 result remains ambiguous, it raises `CommitOutcomeUnknownError`. REST
-returns HTTP 500 with `COMMIT_OUTCOME_UNKNOWN`. Verify the outcome before
-retrying a non-idempotent write. A client retry after the serving process or
-connection has been lost starts a new operation.
+returns HTTP 500 with `COMMIT_OUTCOME_UNKNOWN`. For a write without an
+idempotency key, verify the outcome before retrying.
+
+## Retrying REST Cypher Writes
+
+On the Native backend, send `Idempotency-Key` with a Cypher data write to
+`POST /v1/query`. Choose a unique key for each intended write and reuse it
+with the same statement text and JSON parameter values on every attempt.
+Keys contain 1–128 printable ASCII characters without spaces and are scoped
+to the database. Every REST replica serving keyed writes must support the header.
+
+GraphArrow publishes the successful response and the graph change in the
+same snapshot. A retry that finds the committed key returns the original
+response, even from another replica or after subsequent commits. Using the
+same key with a different query or parameters returns HTTP 409 with
+`IDEMPOTENCY_KEY_CONFLICT`. A concurrent write using another key can still
+cause `WRITE_CONFLICT`. Retry that request with its original key.
+
+Successful updates that match zero rows also record a response. Queries that
+fail before publication leave the key available. Keyed requests accept data
+updates and JSON responses of up to 64 KiB. Read queries and schema commands
+should omit the header. Native keeps receipts in published manifests and uses
+an immutable index split by the first byte of the key hash. The database head
+publishes the index root together with the snapshot. An indexed lookup reads at
+most one index root and one shard before reading the receipt manifest. A keyed
+commit replaces the root and the affected shard. When opening an older head
+without an index, the first new keyed commit builds one from published history.
+Keyed writes use the transaction path so GraphArrow can prepare the response
+before publication. Successful keys and their responses are retained for the
+lifetime of the database.
 
 ## Maintenance and Existing Databases
 
 Vacuum preserves the files referenced by published snapshots so in-flight
 readers can still load them. On native local storage it can remove
-unpublished manifests and Parquet files while holding the writer lock.
-On object storage it only removes abandoned manifest and Parquet files from
-generations that can no longer publish. Published history and its referenced
-data accumulate until a snapshot retention policy is available.
+unpublished manifests, index pages and Parquet files while holding the writer
+lock. On object storage it only removes abandoned files from generations that
+can no longer publish. Published snapshot metadata, index pages and referenced
+data are retained. A reader can continue to use an earlier snapshot while
+another replica commits or runs vacuum.
+
+### Previewing Snapshot Retention
+
+Estimate the space a retention policy could reclaim with a read-only preview.
+
+```sh
+grapharrow retention-plan /data/grapharrow --keep-last 100 --min-age-hours 168
+```
+
+The embedded equivalent is `database.plan_retention(keep_last=100,
+min_age_hours=168)`. The authenticated REST endpoint is
+`GET /v1/admin/retention/plan?keep_last=100&min_age_hours=168`.
+
+The preview captures one published head. It retains at least the requested
+number of snapshots and every snapshot within the requested age window. It
+also retains the snapshots between them so the retained range is contiguous.
+`min_age_hours=0` uses the count alone. Use the report's head and evaluation
+time to identify the view that was measured.
+
+`shared_parquet_paths` lists files referenced by both parts of the history.
+`candidate_files` contains older-only Parquet files with their actual stored
+sizes. Missing candidates are reported separately and contribute zero to
+`estimated_reclaimable_bytes`. Catalogs, manifests and idempotency records
+are outside this estimate. The preview performs no writes. Its candidates
+are a space estimate for the proposed policy. Native vacuum preserves the
+files of all published snapshots, including those outside that policy.
 
 Upgrade all writers sharing a database together. When opening a database
 from the earlier layout, GraphArrow reads the catalog version referenced by

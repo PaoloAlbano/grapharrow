@@ -7,13 +7,13 @@ from dataclasses import replace
 from grapharrow.adapters.writer import writer_locked
 from grapharrow.core.errors import CatalogError
 from grapharrow.domain import CatalogVersion, IndexDefinition, IndexKind, PropertyOwnerKind
-from grapharrow.repositories import CatalogRepository
+from grapharrow.storage.contracts import CatalogStore
 
 
 class IndexCatalogUseCase:
     """Manage logical index declarations independently from any serving interface."""
 
-    def __init__(self, catalog_store: CatalogRepository) -> None:
+    def __init__(self, catalog_store: CatalogStore) -> None:
         """Bind index operations to the catalog repository used by the database."""
 
         self._catalog_store = catalog_store

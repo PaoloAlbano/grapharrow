@@ -4,8 +4,8 @@ import pyarrow.parquet as pq  # type: ignore[import-untyped]
 import pytest
 
 from grapharrow import Database
-from grapharrow.core.errors import TransactionError
 from grapharrow.domain import CatalogVersion, SnapshotId
+from grapharrow.errors import TransactionError
 
 
 def test_database_resolves_path(tmp_path: Path) -> None:

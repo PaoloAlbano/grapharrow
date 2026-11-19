@@ -1356,8 +1356,6 @@ class ReadRuntime:
                     identity = entry.get(
                         f"{variable}.__id" if kind == "node" else f"{variable}.__entity_id"
                     )
-                    if identity is None and kind in {"relationship", "relationship_list"}:
-                        identity = entry.get(f"{variable}.id")
                     binding[variable] = (self._nodes if kind == "node" else self._edges).get(
                         identity
                     )

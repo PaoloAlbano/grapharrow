@@ -131,6 +131,24 @@ representative writes and their persisted effects against a disposable Neo4j
 instance. ANA tools have separate execution paths: read visibility does not
 establish identical write semantics for every ANA tool.
 
+## Relationship identity bindings
+
+Relationship ordering by `id(r)` recognizes the technical relationship identity,
+including aliases, hidden ordering keys and result windows. SET after WITH/MATCH
+resolves the identities of newly matched relationships before publishing updates.
+[Relationship binding regressions](../tests/unit/test_cypher_relationship_bindings.py)
+cover ordering, persisted mutations, snapshot isolation and rollback.
+
+Relationship identity and the user property `id` have separate bindings.
+`id(r)` returns the technical identity; `r.id` returns the stored property,
+or null when absent. Property filters, ordering, `WITH` aliases and property
+updates preserve that distinction. Updating or removing `r.id` does not change
+the relationship identity or its endpoints. [ID property regressions](
+../tests/unit/test_cypher_id_properties.py) cover these paths, property functions,
+snapshot visibility and rollback; [interface comparisons](
+../tests/integration/test_interface_comparison.py) exercise the same behavior
+through embedded Python, REST, Bolt and MCP.
+
 ## Remaining semantic validation and standard coverage gaps
 
 The engine is not certified as conformant with the

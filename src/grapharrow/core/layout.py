@@ -49,6 +49,10 @@ class DatabaseLayout:
         return self._join("manifests")
 
     @property
+    def idempotency_dir(self) -> Location:
+        return self._join("idempotency")
+
+    @property
     def staged_dir(self) -> Location:
         return self._join("staged")
 

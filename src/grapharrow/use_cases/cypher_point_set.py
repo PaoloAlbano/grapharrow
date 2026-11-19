@@ -64,7 +64,7 @@ def try_point_set(executor: CypherQueryUseCase, query: CompiledMatchSetQuery) ->
         if (
             projection.variable != variable
             or projection.field is None
-            or projection.field in {"id", "type", "source", "target"}
+            or projection.field in {"type", "source", "target"}
             or projection.field.startswith("__")
             or projection.scalar_expression is not None
             or projection.aggregate is not None

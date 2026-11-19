@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
@@ -13,7 +13,20 @@ from grapharrow.adapters.writer import WriterCoordinator, writer_locked
 from grapharrow.core import DatabaseLayout
 from grapharrow.core.errors import CommitOutcomeUnknownError, StorageError, WriteConflictError
 from grapharrow.domain import CatalogVersion, CurrentSnapshotPointer, DatasetFile, SnapshotId
-from grapharrow.domain.snapshot import ChecksumAlgorithm, DatasetKind, SnapshotManifest
+from grapharrow.domain.snapshot import (
+    ChecksumAlgorithm,
+    DatasetKind,
+    IdempotencyReceipt,
+    SnapshotManifest,
+)
+from grapharrow.repositories.idempotency import IdempotencyIndex
+
+
+@dataclass(frozen=True, slots=True)
+class _SnapshotEntry:
+    manifest: SnapshotManifest
+    parent_path: str | None
+    idempotency_pages: tuple[str, ...]
 
 
 class SnapshotRepository:
@@ -28,6 +41,7 @@ class SnapshotRepository:
         self._layout = layout
         self._filesystem = filesystem or FileSystemAdapter()
         self._writer = WriterCoordinator(layout.root, self._filesystem)
+        self._idempotency = IdempotencyIndex(layout.root, self._filesystem)
 
     @property
     def writer(self) -> WriterCoordinator:
@@ -58,6 +72,7 @@ class SnapshotRepository:
         head = self._filesystem.read_pointer(self._layout.current_snapshot_path)
         revision = None
         parent_path = None
+        current = None
         if head is not None:
             payload, revision = head
             current = self._deserialize_pointer(cast(dict[str, Any], payload))
@@ -80,11 +95,24 @@ class SnapshotRepository:
         elif base is not None:
             raise WriteConflictError("The base snapshot is no longer available.")
 
-        manifest_path = self._absolute_path(
+        relative_manifest = (
             f"manifests/snapshot-{manifest.snapshot_id.value:06d}-{uuid4().hex}.json"
         )
+        manifest_path = self._absolute_path(relative_manifest)
+        index_root = current.idempotency_index_path if current is not None else None
+        index_pages: tuple[str, ...] = ()
+        if (receipt := manifest.idempotency_receipt) is not None:
+            index_root, index_pages = self._idempotency.stage(
+                previous_root=index_root,
+                snapshot_id=manifest.snapshot_id,
+                key_hash=receipt.key_hash,
+                manifest_path=relative_manifest,
+                legacy_entries=self._legacy_receipt_entries(current) if current is not None else (),
+            )
         payload = self._serialize_manifest(manifest)
         payload["parent_manifest_path"] = parent_path
+        if index_pages:
+            payload["idempotency_pages"] = list(index_pages)
         self._filesystem.write_json(manifest_path, payload)
         prior_files = set(_dataset_paths(base)) if base is not None else set()
         new_files = [
@@ -96,12 +124,14 @@ class SnapshotRepository:
             base is None or manifest.catalog_path != base.catalog_path
         ):
             new_files.append(self._absolute_path(manifest.catalog_path))
+        new_files.extend(self._absolute_path(path) for path in index_pages)
         self._filesystem.sync_commit_files(self._layout.root, [*new_files, manifest_path])
         pointer = CurrentSnapshotPointer(
             snapshot_id=manifest.snapshot_id,
-            manifest_path=self._layout.relative_path(manifest_path),
+            manifest_path=relative_manifest,
             commit_txid=manifest.commit_txid,
             created_at=manifest.created_at,
+            idempotency_index_path=index_root,
         )
         try:
             published = self._filesystem.replace_pointer(
@@ -153,13 +183,57 @@ class SnapshotRepository:
     ) -> Iterator[tuple[str, SnapshotManifest]]:
         """Follow the published chain, excluding all failed commit attempts."""
         pointer = pointer or self.load_current_pointer()
+        for path, entry in self._history_entries(pointer):
+            yield path, entry.manifest
+
+    def retained_paths(self, pointer: CurrentSnapshotPointer) -> Iterator[str]:
+        """Return all immutable objects retained by the published snapshot chain."""
+        for path, entry in self._history_entries(pointer):
+            yield path
+            yield from entry.idempotency_pages
+            yield from _dataset_paths(entry.manifest)
+
+    def idempotency_base(
+        self, pointer: CurrentSnapshotPointer, key_hash: str
+    ) -> tuple[SnapshotManifest, IdempotencyReceipt | None]:
+        """Read a receipt against the exact publication used as the write base."""
+        history = self.history(pointer)
+        _, base = next(history)
+        if (receipt := base.idempotency_receipt) is not None and receipt.key_hash == key_hash:
+            return base, receipt
+        if pointer.idempotency_index_path is None:
+            # Older heads store receipts only in manifests until the first indexed write.
+            for _, manifest in history:
+                if (receipt := manifest.idempotency_receipt) is not None and (
+                    receipt.key_hash == key_hash
+                ):
+                    return base, receipt
+            return base, None
+
+        receipt_path = self._idempotency.lookup(pointer.idempotency_index_path, key_hash)
+        if receipt_path is None:
+            return base, None
+        receipt = self._load_entry(receipt_path).manifest.idempotency_receipt
+        if receipt is None or receipt.key_hash != key_hash:
+            raise StorageError("The idempotency index does not match the receipt manifest.")
+        return base, receipt
+
+    def _legacy_receipt_entries(self, pointer: CurrentSnapshotPointer) -> Iterator[tuple[str, str]]:
+        for path, manifest in self.history(pointer):
+            if (receipt := manifest.idempotency_receipt) is not None:
+                yield receipt.key_hash, path
+
+    def _history_entries(
+        self, pointer: CurrentSnapshotPointer
+    ) -> Iterator[tuple[str, _SnapshotEntry]]:
         path: str | None = pointer.manifest_path
         expected_id: SnapshotId | None = pointer.snapshot_id
         while path is not None:
-            manifest, parent = self._load_entry(path)
+            entry = self._load_entry(path)
+            manifest, parent = entry.manifest, entry.parent_path
             if manifest.snapshot_id != expected_id:
                 raise StorageError("Snapshot ancestry does not match the published head.")
-            yield path, manifest
+            yield path, entry
             if parent is not None and _is_legacy_manifest_path(parent):
                 if not self._filesystem.exists(self._absolute_path(parent)):
                     # Legacy vacuum could prune published ancestors before this format existed.
@@ -169,12 +243,12 @@ class SnapshotRepository:
 
     def load_at(self, pointer: CurrentSnapshotPointer) -> SnapshotManifest:
         """Load the exact manifest referenced by an already captured pointer."""
-        manifest, _ = self._load_entry(pointer.manifest_path)
+        manifest = self._load_entry(pointer.manifest_path).manifest
         if manifest.snapshot_id != pointer.snapshot_id:
             raise StorageError("Snapshot manifest does not match the published head.")
         return manifest
 
-    def _load_entry(self, path: str) -> tuple[SnapshotManifest, str | None]:
+    def _load_entry(self, path: str) -> _SnapshotEntry:
         try:
             payload = cast(dict[str, Any], self._filesystem.read_json(self._absolute_path(path)))
         except FileNotFoundError as exc:
@@ -183,7 +257,12 @@ class SnapshotRepository:
         parent = payload.get("parent_manifest_path")
         if "parent_manifest_path" not in payload and manifest.parent_snapshot_id is not None:
             parent = f"manifests/snapshot-{manifest.parent_snapshot_id.value:06d}.json"
-        return manifest, parent
+        pages = payload.get("idempotency_pages", [])
+        if not isinstance(pages, list) or any(
+            not isinstance(page, str) or not page.startswith("idempotency/") for page in pages
+        ):
+            raise StorageError("Snapshot idempotency pages are invalid.")
+        return _SnapshotEntry(manifest, parent, tuple(pages))
 
     def load_current_pointer(self) -> CurrentSnapshotPointer:
         """Load the current snapshot pointer with a single read."""
@@ -245,12 +324,15 @@ class SnapshotRepository:
 
     def _serialize_pointer(self, pointer: CurrentSnapshotPointer) -> dict[str, Any]:
         """Serialize the reader-visible current snapshot pointer to JSON."""
-        return {
+        payload: dict[str, Any] = {
             "snapshot_id": pointer.snapshot_id.value,
             "manifest_path": pointer.manifest_path,
             "commit_txid": pointer.commit_txid,
             "created_at": pointer.created_at,
         }
+        if pointer.idempotency_index_path is not None:
+            payload["idempotency_index_path"] = pointer.idempotency_index_path
+        return payload
 
     def _deserialize_pointer(self, payload: dict[str, Any]) -> CurrentSnapshotPointer:
         """Parse the current snapshot pointer JSON into the typed domain object."""
@@ -259,6 +341,9 @@ class SnapshotRepository:
             manifest_path = str(payload["manifest_path"])
             commit_txid = int(payload["commit_txid"])
             created_at = str(payload["created_at"])
+            index_path = payload.get("idempotency_index_path")
+            if index_path is not None and not isinstance(index_path, str):
+                raise TypeError("Expected a path for the idempotency index.")
         except (KeyError, TypeError, ValueError) as exc:
             raise StorageError("Current snapshot pointer is invalid.") from exc
 
@@ -267,11 +352,12 @@ class SnapshotRepository:
             manifest_path=manifest_path,
             commit_txid=commit_txid,
             created_at=created_at,
+            idempotency_index_path=index_path,
         )
 
     def _serialize_manifest(self, manifest: SnapshotManifest) -> dict[str, Any]:
         """Serialize one snapshot manifest into the JSON shape stored on disk."""
-        return {
+        payload: dict[str, Any] = {
             "snapshot_id": manifest.snapshot_id.value,
             "parent_snapshot_id": (
                 manifest.parent_snapshot_id.value
@@ -302,6 +388,13 @@ class SnapshotRepository:
                 ],
             },
         }
+        if (receipt := manifest.idempotency_receipt) is not None:
+            payload["idempotency_receipt"] = {
+                "key_hash": receipt.key_hash,
+                "request_hash": receipt.request_hash,
+                "response_json": receipt.response_json,
+            }
+        return payload
 
     def _serialize_dataset_file(self, dataset_file: DatasetFile) -> dict[str, Any]:
         """Serialize one dataset-file entry embedded inside a snapshot manifest."""
@@ -329,6 +422,7 @@ class SnapshotRepository:
             created_at = str(payload["created_at"])
             catalog_version = CatalogVersion(int(payload["catalog_version"]))
             files = payload.get("files", {})
+            receipt = _deserialize_idempotency_receipt(payload.get("idempotency_receipt"))
         except (KeyError, TypeError, ValueError) as exc:
             raise StorageError("Snapshot manifest is invalid.") from exc
 
@@ -339,6 +433,7 @@ class SnapshotRepository:
             created_at=created_at,
             catalog_version=catalog_version,
             catalog_path=payload.get("catalog_path"),
+            idempotency_receipt=receipt,
             nodes=self._deserialize_dataset_files(files.get("nodes", [])),
             edges=self._deserialize_dataset_files(files.get("edges", [])),
             node_labels=self._deserialize_dataset_files(files.get("node_labels", [])),
@@ -368,6 +463,19 @@ class SnapshotRepository:
             )
             for item in payload
         )
+
+
+def _deserialize_idempotency_receipt(payload: object) -> IdempotencyReceipt | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise TypeError("Expected an idempotency receipt object.")
+    key_hash = payload["key_hash"]
+    request_hash = payload["request_hash"]
+    response_json = payload["response_json"]
+    if not all(isinstance(value, str) for value in (key_hash, request_hash, response_json)):
+        raise TypeError("Expected string fields in the idempotency receipt.")
+    return IdempotencyReceipt(key_hash, request_hash, response_json)
 
 
 def _dataset_paths(manifest: SnapshotManifest) -> Iterator[str]:

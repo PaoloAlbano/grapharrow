@@ -85,6 +85,18 @@ cloud SDKs optional regardless of the Docker configuration.
 Development environments using Moto also install boto3 as an emulator dependency;
 that does not make it a dependency of the base GraphArrow package.
 
+## Storage Backend
+
+A **Storage Backend** defines how GraphArrow reads and writes graph snapshots,
+publishes atomic commits, and performs compaction and vacuum. GraphArrow's current
+Storage Backend is `native`: immutable Parquet files, snapshot manifests, and a
+conditionally updated database head.
+
+Filesystem paths, S3, Azure Blob Storage, and Google Cloud Storage identify the
+physical storage location. Filesystem adapters provide access to those locations.
+Cypher, ANA, REST, Bolt, and the embedded API use the graph engine above this layer.
+See [Storage Backend](storage-backends.md) for the native factory and contracts.
+
 ## Storage compatibility
 
 The dependency update does not introduce a new snapshot manifest or Parquet

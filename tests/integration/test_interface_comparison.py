@@ -797,3 +797,67 @@ def test_variable_length_paths_round_trip_through_public_interfaces(interfaces: 
                 node["labels"] for node in comparison["p"]["nodes"]
             ]
             assert list(edge.start_node for edge in path.relationships) == list(path.nodes[1:])
+
+
+@pytest.mark.parametrize("interface", ["embedded", "rest", "bolt", "mcp"])
+def test_relationship_order_and_with_match_set_across_interfaces(
+    interfaces: Interfaces, interface: str
+) -> None:
+    interfaces.write(
+        interface,
+        "CREATE (a:BindingStart)-[:BindingLink {writer:'seed',witness:'seed'}]->(b:BindingEnd) "
+        "WITH a,b CREATE (a)-[:BindingLink {writer:'seed',witness:'seed'}]->(b)",
+        {},
+    )
+    graph = interfaces.embedded._app.use_cases.graph
+    original = graph.load_state()
+    ids = [edge.edge_id for edge in original.edges if edge.rel_type == "BindingLink"]
+    assert len(ids) == 2
+    update = (
+        "MATCH ()-[other:BindingLink]->() WHERE id(other)=$source_id "
+        "WITH other.writer AS dependency MATCH ()-[r:BindingLink]->() "
+        "WHERE id(r)=$target_id AND dependency='seed' "
+        "SET r.writer='candidate',r.witness='candidate' RETURN r.writer AS stamp"
+    )
+    interfaces.write(interface, update, {"source_id": ids[1], "target_id": ids[0]})
+    verify = (
+        "MATCH ()-[r:BindingLink]->() RETURN id(r) AS edge_id,r.writer AS writer "
+        "ORDER BY id(r) DESC"
+    )
+    results = interfaces.read_cypher(verify, {})
+    expected = [{"edge_id": ids[1], "writer": "seed"}, {"edge_id": ids[0], "writer": "candidate"}]
+    assert all(result["rows"] == expected for result in results.values())
+    assert graph.load_state().snapshot.snapshot_id.value == original.snapshot.snapshot_id.value + 1
+    assert graph.load_state(snapshot=original.snapshot).edges[-2].properties["writer"] == "seed"
+    assert interfaces.embedded.verify(verify_checksums=True).ok
+
+
+@pytest.mark.parametrize("interface", ["embedded", "rest", "bolt", "mcp"])
+def test_relationship_id_properties_across_interfaces(
+    interfaces: Interfaces, interface: str
+) -> None:
+    interfaces.write(
+        interface,
+        "CREATE (a:PropertyIdStart)-[:PropertyIdLink {id:999}]->(b:PropertyIdEnd) "
+        "WITH a,b CREATE (a)-[:PropertyIdLink {id:4}]->(b)",
+        {},
+    )
+    graph = interfaces.embedded._app.use_cases.graph
+    before = graph.load_state()
+    ids = [edge.edge_id for edge in before.edges if edge.rel_type == "PropertyIdLink"]
+    assert len(ids) == 2
+    interfaces.write(
+        interface,
+        "MATCH ()-[r:PropertyIdLink]->() WHERE r.id=999 WITH r AS edge "
+        "SET edge.id=123 RETURN id(edge) AS identity,edge.id AS property",
+        {},
+    )
+    results = interfaces.read_cypher(
+        "MATCH ()-[r:PropertyIdLink]->() RETURN id(r) AS identity,r.id AS property ORDER BY r.id",
+        {},
+    )
+    expected = [{"identity": ids[1], "property": 4}, {"identity": ids[0], "property": 123}]
+    assert all(result["rows"] == expected for result in results.values())
+    old = graph.load_state(snapshot=before.snapshot)
+    assert next(edge for edge in old.edges if edge.edge_id == ids[0]).properties["id"] == 999
+    assert interfaces.embedded.verify(verify_checksums=True).ok

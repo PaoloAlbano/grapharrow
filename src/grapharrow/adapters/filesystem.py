@@ -159,6 +159,12 @@ class FileSystemAdapter:
         info = filesystem.get_file_info([normalized_path])[0]
         return bool(info.type != pafs.FileType.NotFound)
 
+    def file_size(self, location: str | Path) -> int | None:
+        """Read file metadata without opening the object's contents."""
+        filesystem, normalized_path = self.resolve(location)
+        info = filesystem.get_file_info([normalized_path])[0]
+        return int(info.size) if info.type == pafs.FileType.File and info.size is not None else None
+
     def create_dir(self, location: str | Path) -> None:
         """Create ``location`` recursively when supported by the filesystem."""
 

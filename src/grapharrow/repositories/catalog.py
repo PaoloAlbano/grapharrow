@@ -110,6 +110,7 @@ class CatalogRepository:
                 commit_txid=next_id.value,
                 created_at=datetime.now(UTC).isoformat(timespec="seconds"),
                 catalog_version=catalog.version,
+                idempotency_receipt=None,
             )
         path = self.stage(catalog)
         self._snapshots.publish(replace(manifest, catalog_path=path), base=base)

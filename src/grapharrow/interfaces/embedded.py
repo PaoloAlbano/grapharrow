@@ -22,6 +22,7 @@ from grapharrow.domain import (
     VersionedCatalog,
 )
 from grapharrow.interfaces.cypher_guard import query_requires_write
+from grapharrow.storage.models import RetentionPlan
 from grapharrow.use_cases import (
     InitializationResult,
     QueryResult,
@@ -327,6 +328,12 @@ class Database:
         """Remove abandoned files while preserving published snapshots."""
 
         return self._app.use_cases.admin.vacuum()
+
+    def plan_retention(self, *, keep_last: int, min_age_hours: int = 0) -> RetentionPlan:
+        """Preview the space a proposed snapshot retention policy could reclaim."""
+        return self._app.use_cases.admin.plan_retention(
+            keep_last=keep_last, min_age_hours=min_age_hours
+        )
 
     def session(self) -> Session:
         """Create the default embedded session, which is currently read-only by design."""

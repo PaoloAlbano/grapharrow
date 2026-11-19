@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -20,6 +21,7 @@ class GraphArrowSettings(BaseSettings):
 
     environment: str = Field(default="development")
     database_path: str | Path | None = Field(default=None)
+    storage_backend: Literal["native"] = Field(default="native")
     verify_checksums_on_verify: bool = Field(default=False)
     server_host: str = Field(default="127.0.0.1")
     server_port: int = Field(default=8000)

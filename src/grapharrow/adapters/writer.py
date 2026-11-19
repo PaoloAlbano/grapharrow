@@ -6,7 +6,7 @@ import os
 import sys
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
@@ -115,8 +115,17 @@ class WriterCoordinator:
                     state.handle = None
 
 
+class WriterLock(Protocol):
+    """The writer gate required by a storage-backed operation."""
+
+    @property
+    def local_root(self) -> Path | None: ...
+
+    def hold(self) -> AbstractContextManager[None]: ...
+
+
 class _Coordinated(Protocol):
-    _writer: WriterCoordinator
+    _writer: WriterLock
 
 
 P = ParamSpec("P")

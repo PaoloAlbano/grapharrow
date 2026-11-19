@@ -13,6 +13,8 @@ All versioned documents, source code and comments are written in English.
 - [ANA HTTP Interface](ana-interface.md): default agent tools, RPC, sessions and runtime limits.
 - [Interface Comparison](interface-comparison.md): expected and actual graph
   results across Python, REST, Bolt, MCP, ANA and CLI ingestion.
+- [Storage Backend](storage-backends.md): factory, typed store contracts, native
+  configuration, physical storage locations and format preservation.
 - [Transactions and Sessions](transactions.md): write visibility, explicit Bolt
   transactions, embedded session behavior and writer-coordination limits.
 - [Cypher V1](cypher-v1.md): supported query features, execution and limitations.
@@ -29,7 +31,8 @@ All versioned documents, source code and comments are written in English.
 - [Planner V1](planner-v1.md): logical operators, supported query shapes and fallback behavior.
 - [MCP Interface](mcp-interface-design.md): the current Cypher-oriented tool interface.
 - [Dependencies and Installation](dependency-compatibility.md): Python and Arrow
-  requirements, locked environments, runtime installs, and storage compatibility.
+  requirements, locked environments, runtime installs, Storage Backend terminology,
+  and storage compatibility.
 - [Real Object Storage Testing](real-object-storage-testing.md): optional live
   integration tests for S3, GCS and Azure.
 

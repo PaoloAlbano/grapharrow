@@ -5,8 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Generator
-from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import cast
 from uuid import uuid4
 
@@ -17,8 +16,12 @@ from grapharrow.adapters import FileSystemAdapter, ParquetAdapter, PyArrowTabula
 from grapharrow.adapters.checksum import sha256_file as _compute_sha256
 from grapharrow.core import DatabaseLayout, property_codec
 from grapharrow.domain import DatasetFile, SnapshotId, SnapshotManifest
+from grapharrow.domain.records import EdgeRecord as EdgeRecord
+from grapharrow.domain.records import NodeRecord as NodeRecord
 from grapharrow.domain.scan import ScanPredicate
 from grapharrow.domain.snapshot import DatasetKind
+from grapharrow.storage.models import EdgePropertyPatch
+from grapharrow.storage.models import PersistedGraph as PersistedGraph
 
 NODE_SCHEMA = pa.schema(
     [
@@ -52,51 +55,6 @@ _EDGE_RANGE_PATH = re.compile(
     r"data/edges/range-([1-9][0-9]*)/([0-9]+)/snapshot-[0-9]+(?:-[0-9a-f]{32})?\.parquet"
 )
 _DEFAULT_EDGE_RANGE_SIZE = 32_768
-
-
-@dataclass(frozen=True, slots=True)
-class NodeRecord:
-    """Minimal canonical node representation used by the bootstrap engine."""
-
-    node_id: int
-    labels: tuple[str, ...]
-    properties: dict[str, object]
-
-
-@dataclass(frozen=True, slots=True)
-class EdgeRecord:
-    """Minimal canonical edge representation used by the bootstrap engine."""
-
-    edge_id: int
-    rel_type: str
-    src_id: int
-    dst_id: int
-    properties: dict[str, object]
-
-
-@dataclass(frozen=True, slots=True)
-class PersistedGraph:
-    """Files generated for a published graph snapshot."""
-
-    nodes: tuple[DatasetFile, ...]
-    edges: tuple[DatasetFile, ...]
-    node_labels: tuple[DatasetFile, ...]
-    node_properties: tuple[DatasetFile, ...]
-    adjacency_by_source: tuple[DatasetFile, ...]
-    adjacency_by_dest: tuple[DatasetFile, ...]
-    edge_properties: tuple[DatasetFile, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class EdgePropertyPatch:
-    """A schema-preserving edit of one canonical range and its property projection."""
-
-    before: EdgeRecord
-    after: EdgeRecord
-    canonical_file: DatasetFile
-    canonical_table: pa.Table
-    property_file: DatasetFile
-    property_table: pa.Table
 
 
 class GraphRepository:
@@ -230,6 +188,24 @@ class GraphRepository:
             [self._absolute_location(dataset_file.path) for dataset_file in files],
             schema=NODE_LABEL_SCHEMA,
         )
+
+    @staticmethod
+    def adjacency_files(
+        files: tuple[DatasetFile, ...], *, rel_type: str
+    ) -> tuple[DatasetFile, ...]:
+        """Select native adjacency references for a relationship type."""
+        return tuple(file for file in files if _adjacency_rel_type_from_file(file) == rel_type)
+
+    @staticmethod
+    def has_complete_adjacency(
+        snapshot: SnapshotManifest, rel_type: str, *, incoming: bool
+    ) -> bool:
+        """Check native coverage before enabling a selective derived read."""
+        files = snapshot.adjacency_by_dest if incoming else snapshot.adjacency_by_source
+        if sum(file.row_count for file in files) != sum(file.row_count for file in snapshot.edges):
+            return False
+        names = {_adjacency_rel_type_from_file(file) for file in files}
+        return None not in names and rel_type in names and f"`{rel_type}`" not in names
 
     def load_adjacency_by_source_table(
         self, files: tuple[DatasetFile, ...], *, predicates: tuple[ScanPredicate, ...] = ()
@@ -1148,6 +1124,18 @@ def _dataset_file_for(
         min_key=min_key,
         max_key=max_key,
     )
+
+
+def _adjacency_rel_type_from_file(dataset_file: DatasetFile) -> str | None:
+    """Extract the relationship type encoded in an adjacency derived-dataset path."""
+    parts = PurePosixPath(dataset_file.path).parts
+    if (
+        "adjacency" not in parts
+        or ("by_source" not in parts and "by_dest" not in parts)
+        or len(parts) < 2
+    ):
+        return None
+    return parts[-2]
 
 
 __all__ = ["EdgeRecord", "GraphRepository", "NodeRecord", "PersistedGraph"]

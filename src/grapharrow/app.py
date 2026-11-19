@@ -15,7 +15,8 @@ from grapharrow.adapters import (
 from grapharrow.adapters.query_cache import CypherParseCache
 from grapharrow.config import GraphArrowSettings
 from grapharrow.core import DatabaseLayout
-from grapharrow.repositories import CatalogRepository, GraphRepository, SnapshotRepository
+from grapharrow.storage import StorageBackend, create_storage_backend
+from grapharrow.storage.contracts import CatalogStore, GraphStore, SnapshotStore
 from grapharrow.use_cases import (
     CypherQueryUseCase,
     DatabaseAdminUseCase,
@@ -41,9 +42,9 @@ class GraphArrowAdapters:
 class GraphArrowRepositories:
     """Persistence-facing components."""
 
-    catalog: CatalogRepository
-    snapshot: SnapshotRepository
-    graph: GraphRepository
+    catalog: CatalogStore
+    snapshot: SnapshotStore
+    graph: GraphStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +65,7 @@ class GraphArrowApplication:
     layout: DatabaseLayout
     adapters: GraphArrowAdapters
     repositories: GraphArrowRepositories
+    storage_backend: StorageBackend
     use_cases: GraphArrowUseCases
     _ana_schema_cache: SnapshotSchemaCache = field(default_factory=SnapshotSchemaCache, repr=False)
     _ana_node_lookups: AnaNodeLookupCache = field(default_factory=AnaNodeLookupCache, repr=False)
@@ -92,28 +94,21 @@ def build_application(
         opencypher=OpenCypherAdapter(),
         tabular=PyArrowTabularAdapter(),
     )
-    snapshot_store = SnapshotRepository(layout=layout, filesystem=adapters.filesystem)
-    repositories = GraphArrowRepositories(
-        catalog=CatalogRepository(
-            layout=layout, filesystem=adapters.filesystem, snapshot_store=snapshot_store
-        ),
-        snapshot=snapshot_store,
-        graph=GraphRepository(
-            layout=layout,
-            parquet_adapter=adapters.parquet,
-            tabular_adapter=adapters.tabular,
-            filesystem=adapters.filesystem,
-            edge_parquet_range_size=resolved_settings.edge_parquet_range_size,
-        ),
-    )
-    admin_use_case = DatabaseAdminUseCase(
+    storage_backend = create_storage_backend(
+        settings=resolved_settings,
         layout=layout,
-        catalog_store=repositories.catalog,
-        snapshot_store=repositories.snapshot,
-        graph_store=repositories.graph,
         filesystem=adapters.filesystem,
+        parquet_adapter=adapters.parquet,
+        tabular_adapter=adapters.tabular,
     )
+    repositories = GraphArrowRepositories(
+        catalog=storage_backend.catalog,
+        snapshot=storage_backend.snapshot,
+        graph=storage_backend.graph,
+    )
+    admin_use_case = DatabaseAdminUseCase(storage_backend=storage_backend)
     graph_use_case = GraphStateUseCase(
+        storage_backend=storage_backend,
         catalog_store=repositories.catalog,
         snapshot_store=repositories.snapshot,
         graph_store=repositories.graph,
@@ -138,7 +133,7 @@ def build_application(
         cypher=cypher_use_case,
         indexes=index_use_case,
     )
-    local_root = repositories.snapshot.writer.local_root
+    local_root = storage_backend.writer.local_root
     schema_cache_disk = None
     if local_root is not None and resolved_settings.ana_persistent_schema_cache_enabled:
         schema_cache_disk = (
@@ -150,6 +145,7 @@ def build_application(
         layout=layout,
         adapters=adapters,
         repositories=repositories,
+        storage_backend=storage_backend,
         use_cases=use_cases,
         _ana_schema_cache=SnapshotSchemaCache(
             disk=schema_cache_disk,
