@@ -37,7 +37,7 @@ conditional mode for S3-compatible storage.
 ## Atomicity and concurrency
 
 The table at `<database path>/delta` partitions canonical nodes, edges, graph
-metadata, and REST idempotency receipts. Every mutation replaces the metadata
+metadata, and REST idempotency receipts. General mutations replace the metadata
 partition and any changed canonical partitions in a single log commit. A
 catalog-only change leaves the canonical partitions in place. Receipt keys are
 bucketed by hash prefix. A keyed REST write publishes its response in the same
@@ -45,14 +45,19 @@ commit as its graph updates.
 
 New Delta databases partition edges into ranges of 8,192 IDs by default.
 A compatible autocommit `SET` by edge ID reads and replaces only the affected
-edge range and publishes the result with the graph metadata. The full graph
-write path also reuses unchanged edge range files. Property projections are
-derived from the graph version selected by each reader.
+edge range. This path applies to updates that preserve existing scalar
+property types on graphs without constraints when the request carries no REST
+idempotency key. The full graph write path also reuses unchanged edge range
+files. Property projections are derived from the graph version selected by
+each reader.
 
 `GRAPHARROW_EDGE_PARQUET_RANGE_SIZE` overrides the range width at database
 creation or explicit compaction. Set it to `0` for a single edge partition.
 The chosen width is stored with the graph. Compaction converts earlier Delta
 databases with one edge partition to ID ranges and preserves historical reads.
+GraphArrow still reads earlier Delta layouts. Writes to range-partitioned
+graphs upgrade their metadata to the guarded layout. Upgrade all GraphArrow
+replicas sharing a Delta database before allowing writes with this version.
 
 Readers capture one Delta version. Catalog, adjacency and property projections
 are resolved from that version, including after another replica commits. New
@@ -61,20 +66,28 @@ issued their session ID because handles live in the server process.
 
 Canonical tables and derived property projections share the Arrow table cache
 budget. A new snapshot capture checks the latest log version before reusing a
-pinned read handle or a table. ANA retains one recent schema and reuses
-relationship statistics for unchanged edge ranges within its schema cache budget.
+pinned read handle or a table. Cypher reuses typed projections of unchanged
+edge range files and ANA reuses their canonical Arrow tables across snapshots.
+ANA also retains one recent schema and reuses relationship statistics for
+unchanged edge ranges within its schema cache budget.
 
-A writer publishes only against its captured base version. When two replicas
-write from the same base, one publishes and the other receives a write conflict.
-REST reports HTTP 409. Retry the whole operation in a new transaction. A retry
-with the same REST idempotency key and payload replays a committed response
-byte for byte. See [Transactions and Sessions](transactions.md).
+A general mutation publishes only against its captured base version. For
+compatible point `SET` operations on disjoint edge ranges, Delta can rebase
+the commit without replaying the query as long as the graph metadata remains
+unchanged. A conflicting file rewrite or a change to graph metadata, including
+catalog updates and compaction, rejects the pending point update. The Delta
+log identifies point commits by a unique ID so the writer can check whether
+publication succeeded if the storage response is lost.
+
+REST reports write conflicts as HTTP 409. Retry the whole operation in a new
+transaction. A retry with the same REST idempotency key and payload replays a
+committed response byte for byte. See [Transactions and Sessions](transactions.md).
 
 ## Current Delta scope
 
 - Node changes can rewrite the full node partition. Edge changes can rewrite
-  the affected ID ranges. Publication still checks the shared graph version,
-  so writes to different ranges can conflict.
+  the affected ID ranges. General mutations still check the shared graph
+  version, so they can conflict even when they change disjoint data.
 - `verify` checks the captured metadata and reads active Parquet data.
   `compact` rewrites the active graph partitions as a new snapshot.
   Historical reads remain available. `vacuum` and retention planning are

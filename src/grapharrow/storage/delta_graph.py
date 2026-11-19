@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator
+from contextlib import AbstractContextManager, ExitStack
+from dataclasses import dataclass
 from functools import partial
 from urllib.parse import quote, unquote
 
@@ -12,11 +14,13 @@ import pyarrow.dataset as ds  # type: ignore[import-untyped]
 
 from grapharrow.adapters.scan_filter import dataset_filter
 from grapharrow.adapters.snapshot_tables import SnapshotTableCache
+from grapharrow.core import property_codec
 from grapharrow.domain import DatasetFile, SnapshotId, SnapshotManifest
 from grapharrow.domain.records import EdgeRecord, NodeRecord
 from grapharrow.domain.scan import ScanPredicate
 from grapharrow.domain.snapshot import DatasetKind
 from grapharrow.repositories.graph import (
+    _EDGE_ENDPOINT_FIELDS,
     ADJACENCY_BY_SOURCE_SCHEMA,
     EDGE_SCHEMA,
     NODE_LABEL_SCHEMA,
@@ -48,6 +52,12 @@ def _snapshot_id(file: DatasetFile) -> SnapshotId:
     return SnapshotId(int(file.path.split("/")[1]))
 
 
+@dataclass(frozen=True, slots=True)
+class DeltaEdgeRange:
+    partition: str
+    files: tuple[DatasetFile, ...]
+
+
 class DeltaGraphStore:
     """Read canonical rows and derive projections from that same captured version."""
 
@@ -55,10 +65,12 @@ class DeltaGraphStore:
         self,
         read_partition: Callable[[SnapshotId, str, list[str], object], pa.Table],
         *,
+        edge_ranges: Callable[[SnapshotId], tuple[DeltaEdgeRange, ...]],
         snapshot_tables: SnapshotTableCache,
         filter_pushdown_enabled: bool,
     ) -> None:
         self._read_partition = read_partition
+        self._edge_ranges = edge_ranges
         self._snapshot_tables = snapshot_tables
         self._filter_pushdown_enabled = filter_pushdown_enabled
 
@@ -74,7 +86,29 @@ class DeltaGraphStore:
     def load_edge_table(self, files: tuple[DatasetFile, ...]) -> pa.Table:
         if not files:
             return EDGE_SCHEMA.empty_table()
+        snapshot_id = _snapshot_id(files[0])
+        ranges = self._edge_ranges(snapshot_id)
+        if ranges:
+            with ExitStack() as leases:
+                return pa.concat_tables(
+                    [
+                        leases.enter_context(self._borrow_edge_range(snapshot_id, item))
+                        for item in ranges
+                    ]
+                )
         return self._edge_rows(files[0], EDGE_SCHEMA)
+
+    def _borrow_edge_range(
+        self, snapshot_id: SnapshotId, item: DeltaEdgeRange
+    ) -> AbstractContextManager[pa.Table]:
+        def load() -> pa.Table:
+            return (
+                self._read_partition(snapshot_id, item.partition, EDGE_SCHEMA.names, None)
+                .cast(EDGE_SCHEMA)
+                .sort_by([("edge_id", "ascending")])
+            )
+
+        return self._snapshot_tables.borrow(("edge_range", item.files), load)
 
     def _edge_rows(self, file: DatasetFile, schema: pa.Schema) -> pa.Table:
         rel_type = _name(file)
@@ -236,8 +270,30 @@ class DeltaGraphStore:
             return self._select(table, columns, predicates)
 
     def _load_edge_property_projection(self, file: DatasetFile) -> pa.Table:
-        edges = edge_records_from_table(self._edge_rows(file, EDGE_SCHEMA))
-        return _edge_property_table(edges, _edge_property_schema(edges))
+        snapshot_id, rel_type = _snapshot_id(file), _name(file)
+        ranges = self._edge_ranges(snapshot_id)
+        if ranges:
+            with ExitStack() as leases:
+                tables = [
+                    leases.enter_context(self._borrow_range_projection(snapshot_id, item, rel_type))
+                    for item in ranges
+                ]
+                return _merge_edge_projections([table for table in tables if table.num_rows])
+        return _edge_projection(self._edge_rows(file, EDGE_SCHEMA))
+
+    def _borrow_range_projection(
+        self, snapshot_id: SnapshotId, item: DeltaEdgeRange, rel_type: str
+    ) -> AbstractContextManager[pa.Table]:
+        suffix = quote(rel_type, safe="")
+        files = tuple(
+            DatasetFile(f"{file.path}#{suffix}", file.row_count, file.kind) for file in item.files
+        )
+
+        def load() -> pa.Table:
+            with self._borrow_edge_range(snapshot_id, item) as edges:
+                return _edge_projection(edges.filter(pc.equal(edges["rel_type"], rel_type)))
+
+        return self._snapshot_tables.borrow(("edge_range_properties", files), load)
 
     def _select(
         self, table: pa.Table, columns: list[str] | None, predicates: tuple[ScanPredicate, ...]
@@ -263,3 +319,51 @@ class DeltaGraphStore:
 
     node_records_from_table = staticmethod(node_records_from_table)
     edge_records_from_table = staticmethod(edge_records_from_table)
+
+
+def _edge_projection(table: pa.Table) -> pa.Table:
+    records = edge_records_from_table(table)
+    return _edge_property_table(records, _edge_property_schema(records))
+
+
+def _merge_edge_projections(tables: list[pa.Table]) -> pa.Table:
+    if not tables:
+        return _edge_projection(EDGE_SCHEMA.empty_table())
+    endpoints = list(tables[0].schema)[: len(_EDGE_ENDPOINT_FIELDS)]
+    properties: dict[str, pa.Field] = {}
+    for table in tables:
+        for field in list(table.schema)[len(endpoints) :]:
+            previous = properties.get(field.name)
+            if previous is None or pa.types.is_null(previous.type):
+                properties[field.name] = field
+            elif not pa.types.is_null(field.type) and not previous.equals(
+                field, check_metadata=True
+            ):
+                properties[field.name] = pa.field(
+                    field.name, pa.string(), metadata={"grapharrow.encoding": "json"}
+                )
+    schema = pa.schema([*endpoints, *(properties[name] for name in sorted(properties))])
+    return pa.concat_tables([_align_edge_projection(table, schema) for table in tables])
+
+
+def _align_edge_projection(table: pa.Table, schema: pa.Schema) -> pa.Table:
+    if table.schema.equals(schema, check_metadata=True):
+        return table
+    arrays = []
+    for target in schema:
+        index = table.schema.get_field_index(target.name)
+        if index == -1 or pa.types.is_null(table.schema.field(index).type):
+            arrays.append(pa.nulls(table.num_rows, type=target.type))
+            continue
+        source = table.schema.field(index)
+        column = table.column(index)
+        if target.metadata and not source.metadata:
+            column = pa.array(
+                [
+                    property_codec.dumps(value) if value is not None else None
+                    for value in column.to_pylist()
+                ],
+                type=target.type,
+            )
+        arrays.append(column)
+    return pa.Table.from_arrays(arrays, schema=schema)

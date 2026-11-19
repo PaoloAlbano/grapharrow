@@ -8,9 +8,10 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
+from functools import cached_property
 from pathlib import Path
 from threading import Lock, RLock
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -27,7 +28,7 @@ from deltalake.transaction import CommitProperties
 from grapharrow.adapters.snapshot_tables import SnapshotTableCache
 from grapharrow.adapters.writer import WriterLock, writer_locked
 from grapharrow.config import GraphArrowSettings
-from grapharrow.core import DatabaseLayout
+from grapharrow.core import DatabaseLayout, property_codec
 from grapharrow.core.errors import (
     CatalogError,
     CommitOutcomeUnknownError,
@@ -37,6 +38,7 @@ from grapharrow.core.errors import (
 from grapharrow.domain import (
     CatalogVersion,
     CurrentSnapshotPointer,
+    DatasetFile,
     SnapshotId,
     SnapshotManifest,
     VersionedCatalog,
@@ -53,7 +55,7 @@ from grapharrow.repositories.graph import (
     _replace_row,
 )
 from grapharrow.storage.contracts import CatalogStore, GraphStore, SnapshotStore, StorageMaintenance
-from grapharrow.storage.delta_graph import DeltaGraphStore, dataset_ref
+from grapharrow.storage.delta_graph import DeltaEdgeRange, DeltaGraphStore, dataset_ref
 from grapharrow.storage.models import (
     InitializationResult,
     RecoveryReport,
@@ -65,7 +67,10 @@ if TYPE_CHECKING:
     from grapharrow.use_cases.graph import GraphState
 
 _LEGACY_FORMAT = "grapharrow-delta-v1"
-_FORMAT = "grapharrow-delta-v2"
+_RANGE_FORMAT = "grapharrow-delta-v2"
+_FORMAT = "grapharrow-delta-v3"
+_POINT_COMMIT_ID = "grapharrowPointCommitId"
+_POINT_COMMIT_RETRIES = 10
 _DEFAULT_EDGE_RANGE_SIZE = 8192
 # The string interval contains exactly the partition names with the 'edges-' prefix.
 _EDGE_PARTITION_PREDICATE = "kind = 'edges' OR (kind >= 'edges-' AND kind < 'edges.')"
@@ -107,6 +112,7 @@ class _Head:
     relationships: dict[str, int]
     receipt: IdempotencyReceipt | None
     edge_range_size: int | None = None
+    metadata_version: int | None = None
 
     def manifest(self, snapshot_id: SnapshotId, version: CatalogVersion) -> SnapshotManifest:
         return SnapshotManifest(
@@ -144,12 +150,33 @@ class _Head:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class _ReadVersion:
     table: DeltaTable
     manifest: SnapshotManifest
     catalog: VersionedCatalog
     head: _Head
+
+    @cached_property
+    def edge_ranges(self) -> tuple[DeltaEdgeRange, ...]:
+        if not self.head.edge_range_size or not self.head.edge_count:
+            return ()
+        try:
+            actions = pa.table(self.table.get_add_actions(flatten=True))
+            rows = actions.select(["path", "partition.kind", "num_records"]).to_pylist()
+        except (DeltaError, pa.ArrowException, OSError) as exc:
+            raise StorageError("Could not read the active Delta edge files.") from exc
+        files: dict[str, list[DatasetFile]] = {}
+        for row in rows:
+            kind = row["partition.kind"]
+            if kind.startswith("edges-"):
+                files.setdefault(kind, []).append(
+                    DatasetFile(row["path"], row["num_records"] or 0, "edges")
+                )
+        return tuple(
+            DeltaEdgeRange(kind, tuple(sorted(items, key=lambda item: item.path)))
+            for kind, items in sorted(files.items())
+        )
 
 
 class DeltaStorageBackend:
@@ -177,6 +204,7 @@ class DeltaStorageBackend:
         self._read_version_lock = Lock()
         self._graph = DeltaGraphStore(
             self._read_partition,
+            edge_ranges=self._read_edge_ranges,
             snapshot_tables=snapshot_tables,
             filter_pushdown_enabled=settings.parquet_filter_pushdown_enabled,
         )
@@ -237,6 +265,9 @@ class DeltaStorageBackend:
     ) -> pa.Table:
         return _partition(self._read_table(snapshot_id), kind, columns, expression)
 
+    def _read_edge_ranges(self, snapshot_id: SnapshotId) -> tuple[DeltaEdgeRange, ...]:
+        return self._describe_read_version(self._read_table(snapshot_id)).edge_ranges
+
     def _read_table(self, snapshot_id: SnapshotId) -> DeltaTable:
         cached = self._read_version
         if cached is not None and cached.manifest.snapshot_id == snapshot_id:
@@ -251,12 +282,47 @@ class DeltaStorageBackend:
             if cached is not None and cached.manifest.snapshot_id == snapshot_id:
                 return cached
             head, catalog = _metadata(table)
-            entry = _ReadVersion(table, head.manifest(snapshot_id, catalog.version), catalog, head)
+            entry = _ReadVersion(table, self._manifest(table, head, catalog), catalog, head)
             if self._retain_read_version and (
                 cached is None or cached.manifest.snapshot_id.value < snapshot_id.value
             ):
                 self._read_version = entry
             return entry
+
+    def _commit_info(self, version: int) -> dict[str, Any]:
+        path = f"_delta_log/{version:020d}.json"
+        try:
+            storage = DeltaStorageHandler(self._uri, self._options)
+            # Supplying the size lets the handler skip an additional object-store HEAD.
+            info = storage.get_file_info([path])[0]
+            if info.type != pafs.FileType.File:
+                raise StorageError(f"Missing Delta log file for version {version}.")
+            storage = DeltaStorageHandler(self._uri, self._options, known_sizes={path: info.size})
+            with storage.open_input_file(path) as handle:
+                for line in handle.read().splitlines():
+                    action = orjson.loads(line)
+                    if isinstance(action, dict) and isinstance(
+                        commit := action.get("commitInfo"), dict
+                    ):
+                        return commit
+        except (DeltaError, OSError, pa.ArrowException, ValueError) as exc:
+            raise StorageError(f"Could not read Delta commit {version}.") from exc
+        raise StorageError(f"Missing commit information for Delta version {version}.")
+
+    def _manifest(
+        self, table: DeltaTable, head: _Head, catalog: VersionedCatalog
+    ) -> SnapshotManifest:
+        version = table.version()
+        if head.metadata_version is not None and head.metadata_version != version:
+            commit = self._commit_info(version)
+            timestamp = commit.get("timestamp")
+            if not isinstance(commit.get(_POINT_COMMIT_ID), str) or type(timestamp) is not int:
+                raise StorageError(f"Unexpected Delta commit without graph metadata at {version}.")
+            created_at = datetime.fromtimestamp(timestamp / 1000, UTC).isoformat(
+                timespec="milliseconds"
+            )
+            head = replace(head, created_at=created_at, receipt=None)
+        return head.manifest(SnapshotId(version + 1), catalog.version)
 
     def capture_snapshot(self) -> SnapshotManifest:
         return self.bootstrap_snapshot()
@@ -271,7 +337,9 @@ class DeltaStorageBackend:
                 return self._describe_read_version(table).manifest
             self._check_native_layout()
             catalog = VersionedCatalog.empty(version=CatalogVersion(1))
-            head = _new_head(0, 0, {}, {}, None, self._compaction_range_size(None))
+            head = replace(
+                _new_head(0, 0, {}, {}, None, self._compaction_range_size(None)), metadata_version=0
+            )
             data = _metadata_table(head, catalog)
             try:
                 write_deltalake(
@@ -462,6 +530,8 @@ class DeltaStorageBackend:
         replace_all_edges: bool = False,
     ) -> SnapshotManifest:
         snapshot_id = SnapshotId(base.version() + 2)
+        if head.edge_range_size is not None:
+            head = replace(head, metadata_version=snapshot_id.value - 1)
         data = pa.concat_tables(
             [
                 _metadata_table(head, catalog),
@@ -537,20 +607,60 @@ class DeltaStorageBackend:
             yield (after,)
             if before == after:
                 return
-            head = _new_head(
-                current.head.node_count,
-                current.head.edge_count,
-                current.head.labels,
-                current.head.relationships,
-                None,
-                width,
+            base = self._require_table(snapshot.snapshot_id)
+            if current.head.metadata_version is None:
+                head = replace(
+                    current.head,
+                    commit_id=uuid4().hex,
+                    created_at=datetime.now(UTC).isoformat(timespec="seconds"),
+                    receipt=None,
+                )
+                self._commit(
+                    base,
+                    head,
+                    current.catalog,
+                    {kind: _replace_row(table, position, _edges_table([after]))},
+                )
+            else:
+                self._commit_point(base, current.head.commit_id, kind, after)
+
+    def _commit_point(
+        self, base: DeltaTable, metadata_id: str, kind: str, edge: EdgeRecord
+    ) -> None:
+        commit_id = uuid4().hex
+        base_version = base.version()
+        # The guard matches no row on the pinned base and matches any replacement
+        # metadata row during conflict checking. The update only writes the edge file.
+        predicate = (
+            f"(kind = '{kind}' AND edge_id = {edge.edge_id}) OR "
+            f"(kind = 'metadata' AND (key_hash IS NULL OR key_hash <> '{metadata_id}'))"
+        )
+        try:
+            metrics = base.update(
+                predicate=predicate,
+                new_values={"properties_json": property_codec.dumps(edge.properties)},
+                commit_properties=CommitProperties(
+                    custom_metadata={_POINT_COMMIT_ID: commit_id},
+                    max_commit_retries=_POINT_COMMIT_RETRIES,
+                ),
             )
-            self._commit(
-                self._require_table(snapshot.snapshot_id),
-                head,
-                current.catalog,
-                {kind: _replace_row(table, position, _edges_table([after]))},
-            )
+        except (DeltaError, OSError) as exc:
+            # A successful rebase can publish at any version after the original base.
+            # A retried conditional put can report a conflict with its own commit.
+            try:
+                latest = self._require_table(None).version()
+                for version in range(latest, base_version, -1):
+                    if self._commit_info(version).get(_POINT_COMMIT_ID) == commit_id:
+                        return
+            except StorageError as read_error:
+                raise CommitOutcomeUnknownError(
+                    "Could not confirm the Delta commit outcome."
+                ) from read_error
+            if isinstance(exc, CommitFailedError):
+                raise WriteConflictError(_CONFLICT) from exc
+            raise CommitOutcomeUnknownError("Could not confirm the Delta commit outcome.") from exc
+        if metrics.get("num_updated_rows") != 1:
+            raise CommitOutcomeUnknownError("Delta did not report exactly one updated edge.")
 
     def initialize(self) -> InitializationResult:
         snapshot = self.bootstrap_snapshot()
@@ -574,7 +684,9 @@ class DeltaStorageBackend:
             else ()
         )
         try:
-            manifest = _manifest(self._require_table(None))
+            table = self._require_table(None)
+            head, catalog = _metadata(table)
+            manifest = self._manifest(table, head, catalog)
             self._verify_rows(manifest)
         except StorageError as exc:
             return VerificationReport(
@@ -667,14 +779,30 @@ def _rows(table: pa.Table, kind: str) -> pa.Table:
 
 def _metadata_table(head: _Head, catalog: VersionedCatalog) -> pa.Table:
     graph = asdict(head)
+    layout = _FORMAT
+    if head.metadata_version is None:
+        graph.pop("metadata_version")
+        layout = _RANGE_FORMAT
     if head.edge_range_size is None:
         graph.pop("edge_range_size")
+        layout = _LEGACY_FORMAT
     payload = {
-        "format": _LEGACY_FORMAT if head.edge_range_size is None else _FORMAT,
+        "format": layout,
         "graph": graph,
         "catalog": serialize_catalog(catalog),
     }
-    return _rows(pa.table({"properties_json": [orjson.dumps(payload).decode()]}), "metadata")
+    return _rows(
+        pa.table(
+            {
+                "properties_json": [orjson.dumps(payload).decode()],
+                "key_hash": pa.array(
+                    [head.commit_id if head.metadata_version is not None else None],
+                    type=pa.string(),
+                ),
+            }
+        ),
+        "metadata",
+    )
 
 
 def _partition(
@@ -686,35 +814,53 @@ def _partition(
                 _EDGE_PARTITION_PREDICATE if kind == "edges" else [("kind", "=", kind)]
             )
         )
+        if kind == "metadata" or kind.startswith("receipt-"):
+            # Avoid background Parquet work on Delta's Python-backed filesystem
+            # when a writer exits immediately after reading metadata or receipts.
+            return dataset.to_table(
+                columns=columns,
+                filter=expression,
+                use_threads=False,
+                fragment_scan_options=ds.ParquetFragmentScanOptions(pre_buffer=False),
+            )
         return dataset.to_table(columns=columns, filter=expression)
     except (DeltaError, OSError, pa.ArrowException) as exc:
         raise StorageError(f"Could not read the Delta {kind} partition.") from exc
 
 
 def _metadata(table: DeltaTable) -> tuple[_Head, VersionedCatalog]:
-    rows = _partition(table, "metadata", ["properties_json"]).column(0)
-    if len(rows) != 1:
+    rows = _partition(table, "metadata", ["properties_json", "key_hash"])
+    if rows.num_rows != 1:
         raise StorageError("Expected exactly one metadata row at the captured Delta version.")
     try:
-        payload = orjson.loads(rows[0].as_py())
-        if payload["format"] not in {_FORMAT, _LEGACY_FORMAT}:
+        payload = orjson.loads(rows["properties_json"][0].as_py())
+        layout = payload["format"]
+        if layout not in {_FORMAT, _RANGE_FORMAT, _LEGACY_FORMAT}:
             raise ValueError("Unrecognized graph layout")
         data = payload["graph"]
-        if payload["format"] == _FORMAT:
+        if layout != _LEGACY_FORMAT:
             width = data["edge_range_size"]
             if type(width) is not int or not 0 <= width < 2**63:
                 raise ValueError("Invalid edge range size")
+        if layout == _FORMAT:
+            version, commit_id = data["metadata_version"], data["commit_id"]
+            if (
+                type(version) is not int
+                or not 0 <= version <= table.version()
+                or type(commit_id) is not str
+                or len(commit_id) != 32
+                or any(char not in "0123456789abcdef" for char in commit_id)
+                or rows["key_hash"][0].as_py() != commit_id
+            ):
+                raise ValueError("Invalid graph metadata guard")
+        elif "metadata_version" in data:
+            raise ValueError("Unexpected graph metadata version")
         receipt = data["receipt"]
         if receipt is not None:
             data["receipt"] = IdempotencyReceipt(**receipt)
         return _Head(**data), deserialize_catalog(payload["catalog"])
     except (CatalogError, KeyError, TypeError, ValueError) as exc:
         raise StorageError("Invalid GraphArrow metadata in the Delta log.") from exc
-
-
-def _manifest(table: DeltaTable) -> SnapshotManifest:
-    head, catalog = _metadata(table)
-    return head.manifest(SnapshotId(table.version() + 1), catalog.version)
 
 
 def _pointer(manifest: SnapshotManifest) -> CurrentSnapshotPointer:

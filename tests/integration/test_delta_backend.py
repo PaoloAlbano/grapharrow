@@ -476,15 +476,58 @@ def test_delta_compact_upgrades_legacy_edges_and_keeps_pinned_reads(
 
 
 @pytest.mark.parametrize("delta_database", ["local"], indirect=True)
-def test_delta_range_patches_are_published_only_from_the_captured_version(
+def test_delta_point_set_upgrades_v2_metadata_and_preserves_historical_reads(
     delta_database: tuple[str | Path, GraphArrowSettings],
 ) -> None:
+    from dataclasses import replace
+
+    from deltalake import DeltaTable, write_deltalake
+
+    from grapharrow.storage.delta import _metadata, _metadata_table
+
+    path, settings = delta_database
+    app = build_application(path, settings=settings)
+    app.use_cases.cypher.execute(CREATE_EDGE_RANGES)
+    table = DeltaTable(str(app.layout.delta_dir))
+    head, catalog = _metadata(table)
+    write_deltalake(
+        table,
+        _metadata_table(replace(head, metadata_version=None), catalog),
+        mode="overwrite",
+        predicate="kind = 'metadata'",
+    )
+    historical = app.storage_backend.capture_snapshot()
+    edge_files = _active_edge_files(table)
+
+    app.use_cases.cypher.execute(SET_EDGE, {"id": 3, "since": 2025})
+    upgraded = DeltaTable(str(app.layout.delta_dir))
+    assert _metadata(upgraded)[0].metadata_version == upgraded.version()
+    assert upgraded.version() == historical.snapshot_id.value
+    assert len(_active_edge_files(upgraded)) == len(edge_files)
+    assert app.use_cases.graph.load_state(snapshot=historical).edges[2].properties == {
+        "since": 2020
+    }
+    app.use_cases.cypher.execute(SET_EDGE, {"id": 3, "since": 2026})
+    assert app.use_cases.graph.load_state().edges[2].properties == {"since": 2026}
+
+
+@pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
+def test_delta_point_sets_rebase_disjoint_ranges_without_rewriting_metadata(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+) -> None:
+    from deltalake import DeltaTable
+
+    from grapharrow.storage.delta import _storage_options
+
     path, settings = delta_database
     settings = settings.model_copy(update={"edge_parquet_range_size": 2})
     first = build_application(path, settings=settings)
     second = build_application(path, settings=settings)
     first.use_cases.cypher.execute(CREATE_EDGE_RANGES)
     base = first.storage_backend.capture_snapshot()
+    uri = str(first.layout.delta_dir)
+    options = _storage_options(path, settings)
+    before = DeltaTable(uri, storage_options=options).file_uris()
 
     with (
         pytest.raises(RuntimeError, match="Result creation failed"),
@@ -496,6 +539,36 @@ def test_delta_range_patches_are_published_only_from_the_captured_version(
         raise RuntimeError("Result creation failed")
     assert first.storage_backend.capture_snapshot() == base
 
+    with first.storage_backend.edit_edge_properties_by_id(
+        edge_id=1, rel_type="WROTE", properties={"since": 2025}
+    ) as pending:
+        assert pending is not None and pending[0] is not None
+        second.use_cases.cypher.execute(SET_EDGE, {"id": 3, "since": 2026})
+        intermediate = second.storage_backend.capture_snapshot()
+    current = first.use_cases.graph.load_state()
+    assert current.snapshot.snapshot_id.value == base.snapshot_id.value + 2
+    assert current.edges[0].properties == {"since": 2025}
+    assert current.edges[2].properties == {"since": 2026}
+    assert first.use_cases.graph.load_state(snapshot=intermediate).edges[0].properties == {
+        "since": 2020,
+    }
+    after = DeltaTable(uri, storage_options=options).file_uris()
+    assert sorted(file for file in after if "kind=metadata/" in file) == sorted(
+        file for file in before if "kind=metadata/" in file
+    )
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+@pytest.mark.parametrize("concurrent_change", ["same_range", "catalog", "compact"])
+def test_delta_point_set_rejects_conflicting_changes(
+    delta_database: tuple[str | Path, GraphArrowSettings], concurrent_change: str
+) -> None:
+    path, settings = delta_database
+    settings = settings.model_copy(update={"edge_parquet_range_size": 2})
+    first = build_application(path, settings=settings)
+    second = build_application(path, settings=settings)
+    first.use_cases.cypher.execute(CREATE_EDGE_RANGES)
+
     with (
         pytest.raises(WriteConflictError),
         first.storage_backend.edit_edge_properties_by_id(
@@ -503,12 +576,146 @@ def test_delta_range_patches_are_published_only_from_the_captured_version(
         ) as pending,
     ):
         assert pending is not None and pending[0] is not None
-        second.use_cases.cypher.execute(SET_EDGE, {"id": 3, "since": 2026})
+        if concurrent_change == "same_range":
+            second.use_cases.cypher.execute(SET_EDGE, {"id": 2, "since": 2026})
+        elif concurrent_change == "compact":
+            second.use_cases.admin.compact()
+        else:
+            second.use_cases.indexes.create_index(
+                name="author_name",
+                kind="range",
+                owner_kind="label",
+                owner_name="Author",
+                property_names=("name",),
+            )
+        latest = second.storage_backend.capture_snapshot()
     current = first.use_cases.graph.load_state()
-    assert current.snapshot.snapshot_id.value == base.snapshot_id.value + 1
+    assert current.snapshot == latest
     assert current.edges[0].properties == {"since": 2020}
-    assert current.edges[2].properties == {"since": 2026}
-    assert first.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025}).rows == (
-        {"since": 2025},
+    if concurrent_change == "catalog":
+        assert [index.name for index in current.catalog.indexes] == ["author_name"]
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+@pytest.mark.parametrize("reported_conflict", [False, True])
+def test_delta_finds_rebased_commit_after_lost_acknowledgment(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    reported_conflict: bool,
+) -> None:
+    from deltalake import DeltaTable
+    from deltalake.exceptions import CommitFailedError
+
+    path, settings = delta_database
+    settings = settings.model_copy(update={"edge_parquet_range_size": 2})
+    first = build_application(path, settings=settings)
+    second = build_application(path, settings=settings)
+    first.use_cases.cypher.execute(CREATE_EDGE_RANGES)
+    assert (
+        _post(TestClient(create_rest_app(path, settings=settings)), "Replay", "receipt").status_code
+        == 200
     )
-    assert first.use_cases.graph.load_state().edges[2].properties == {"since": 2026}
+    base = first.storage_backend.capture_snapshot()
+    assert base.idempotency_receipt is not None
+    original = DeltaTable.update
+
+    def lose_acknowledgment(table: Any, **kwargs: Any) -> Any:
+        metrics = original(table, **kwargs)
+        if "edge_id = 1)" in kwargs["predicate"]:
+            second.use_cases.cypher.execute(SET_EDGE, {"id": 3, "since": 2027})
+            if reported_conflict:
+                raise CommitFailedError("A retry encountered the already published commit.")
+            raise OSError("The write succeeded but the connection was lost.")
+        return metrics
+
+    monkeypatch.setattr(DeltaTable, "update", lose_acknowledgment)
+    with first.storage_backend.edit_edge_properties_by_id(
+        edge_id=1, rel_type="WROTE", properties={"since": 2025}
+    ) as pending:
+        assert pending is not None and pending[0] is not None
+        second.use_cases.cypher.execute(SET_EDGE, {"id": 3, "since": 2026})
+    state = first.use_cases.graph.load_state()
+    assert state.snapshot.snapshot_id.value == base.snapshot_id.value + 3
+    assert state.snapshot.idempotency_receipt is None
+    assert state.edges[0].properties == {"since": 2025}
+    assert state.edges[2].properties == {"since": 2027}
+    snapshots = first.repositories.snapshot
+    pointer = snapshots.load_current_pointer()
+    _, receipt = snapshots.idempotency_base(pointer, sha256(b"receipt").hexdigest())
+    assert receipt == base.idempotency_receipt
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+def test_delta_reuses_unchanged_ranges_in_cypher_projections_and_ana_tables(
+    delta_database: tuple[str | Path, GraphArrowSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from grapharrow.repositories.graph import _edge_property_schema, _edge_property_table
+    from grapharrow.storage import delta_graph
+
+    path, settings = delta_database
+    settings = settings.model_copy(update={"edge_parquet_range_size": 2})
+    writer = build_application(path, settings=settings)
+    reader = build_application(path, settings=settings)
+    writer.use_cases.cypher.execute(
+        "CREATE (a:Author)-[:WROTE {since:2020, mixed:42, local:true}]->(b:Book) "
+        "CREATE (a)-[:WROTE {since:2020, mixed:'text'}]->(b), "
+        "(a)-[:WROTE {since:2020, mixed:[1,2]}]->(b), (a)-[:WROTE {since:2020}]->(b) "
+        "CREATE (a)-[:WROTE {since:2020, mixed:3.5}]->(b)"
+    )
+    graph = reader.repositories.graph
+    load_partition = graph._read_partition
+    project_edges = delta_graph._edge_projection
+    reads: list[str] = []
+    projections: list[list[int]] = []
+
+    def observe_partition(
+        snapshot_id: Any, kind: str, columns: list[str], expression: object
+    ) -> Any:
+        if kind.startswith("edges-"):
+            reads.append(kind)
+        return load_partition(snapshot_id, kind, columns, expression)
+
+    def observe_projection(table: Any) -> Any:
+        projections.append(table["edge_id"].to_pylist())
+        return project_edges(table)
+
+    def project(snapshot: Any) -> Any:
+        return graph.load_edge_property_table(snapshot.edge_properties, rel_type="WROTE")
+
+    def ana_since(workflow: GraphArrowAgentBackend) -> list[list[object]]:
+        result = workflow.call(
+            "relationship_query",
+            {
+                "source_label": "Author",
+                "target_label": "Book",
+                "relationship_type": "WROTE",
+                "rel_as": "r",
+                "select": [{"var": "r", "property": "since", "alias": "since"}],
+            },
+        )
+        return workflow.call("fetch", {"from": result["handle"]})["rows"]
+
+    monkeypatch.setattr(graph, "_read_partition", observe_partition)
+    monkeypatch.setattr(delta_graph, "_edge_projection", observe_projection)
+    base = reader.storage_backend.capture_snapshot()
+    before = project(base)
+    assert projections == [[1, 2], [3, 4], [5]]
+    assert len(reads) == 3
+    with GraphArrowAgentBackend(reader) as pinned:
+        assert ana_since(pinned) == [[2020]] * 5
+        reads.clear()
+        projections.clear()
+        writer.use_cases.cypher.execute(SET_EDGE, {"id": 3, "since": 2025})
+        current = reader.storage_backend.capture_snapshot()
+        with GraphArrowAgentBackend(reader) as fresh:
+            assert sorted(ana_since(fresh)) == [[2020]] * 4 + [[2025]]
+        assert reads == ["edges-00000000000000000001"]
+        after = project(current)
+        assert projections == [[3, 4]]
+        assert reads == ["edges-00000000000000000001"]
+        assert project(base).equals(before, check_metadata=True)
+        assert ana_since(pinned) == [[2020]] * 5
+    records = list(reader.use_cases.graph.load_state(snapshot=current).edges)
+    assert after.equals(
+        _edge_property_table(records, _edge_property_schema(records)), check_metadata=True
+    )

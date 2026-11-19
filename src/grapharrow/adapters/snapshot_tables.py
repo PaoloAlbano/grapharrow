@@ -7,7 +7,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from threading import Lock
+from threading import RLock
 from typing import Literal, TypeAlias
 
 import pyarrow as pa  # type: ignore[import-untyped]
@@ -15,7 +15,15 @@ import pyarrow as pa  # type: ignore[import-untyped]
 from grapharrow.domain import DatasetFile
 
 _TableKey: TypeAlias = tuple[
-    Literal["nodes", "edges", "node_properties", "edge_properties", "edge_endpoints"],
+    Literal[
+        "nodes",
+        "edges",
+        "node_properties",
+        "edge_properties",
+        "edge_endpoints",
+        "edge_range",
+        "edge_range_properties",
+    ],
     tuple[DatasetFile, ...],
 ]
 
@@ -34,7 +42,8 @@ class SnapshotTableCache:
         self.max_bytes = max_bytes
         self.used_bytes = 0
         self._entries: OrderedDict[_TableKey, _Entry] = OrderedDict()
-        self._lock = Lock()
+        # A logical snapshot table can be assembled from separately cached immutable ranges.
+        self._lock = RLock()
 
     @contextmanager
     def borrow(self, key: _TableKey, load: Callable[[], pa.Table]) -> Iterator[pa.Table]:
