@@ -14,7 +14,10 @@ import pyarrow as pa  # type: ignore[import-untyped]
 
 from grapharrow.domain import DatasetFile
 
-_TableKey: TypeAlias = tuple[Literal["nodes", "edges", "node_properties"], tuple[DatasetFile, ...]]
+_TableKey: TypeAlias = tuple[
+    Literal["nodes", "edges", "node_properties", "edge_properties", "edge_endpoints"],
+    tuple[DatasetFile, ...],
+]
 
 
 @dataclass(slots=True)

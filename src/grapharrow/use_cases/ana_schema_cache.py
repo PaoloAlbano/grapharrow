@@ -15,6 +15,7 @@ from weakref import WeakValueDictionary
 from grapharrow.adapters.filesystem import FileSystemAdapter
 from grapharrow.domain import DatasetFile, SnapshotManifest
 from grapharrow.use_cases.ana_edge_statistics import EdgePropertyStatisticsCache
+from grapharrow.use_cases.ana_resources import retained_size
 
 # Bump this when the format or meaning of the observed schema changes.
 _FORMAT_VERSION = 2
@@ -65,18 +66,26 @@ class SnapshotSchema:
 
 
 class SnapshotSchemaCache:
-    """Keep weak entries in memory and optionally persist one entry per local database."""
+    """Share active schemas and optionally retain one bounded recent schema."""
 
     def __init__(
         self,
         disk: tuple[Path, FileSystemAdapter] | None = None,
         *,
         edge_stats_max_bytes: int = 0,
+        memory_max_bytes: int = 0,
     ) -> None:
         self._disk = disk
         edge_disk = (disk[0].with_name("ana-edge-schema.json"), disk[1]) if disk else None
-        self.edge_statistics = EdgePropertyStatisticsCache(edge_disk, edge_stats_max_bytes)
+        schema_bytes = memory_max_bytes // 2
+        self.edge_statistics = EdgePropertyStatisticsCache(
+            edge_disk,
+            edge_stats_max_bytes if edge_disk is not None else memory_max_bytes - schema_bytes,
+            retain_in_memory=memory_max_bytes > 0,
+        )
         self._entries: WeakValueDictionary[SnapshotManifest, SnapshotSchema] = WeakValueDictionary()
+        self._recent_max_bytes = schema_bytes
+        self._recent: SnapshotSchema | None = None
         self._lock = Lock()
 
     def get_or_create(
@@ -90,6 +99,8 @@ class SnapshotSchemaCache:
                 schema = self._load(snapshot, discover)
                 entry = SnapshotSchema(snapshot=snapshot, schema=_compact_schema(schema))
                 self._entries[snapshot] = entry
+                if self._recent_max_bytes and retained_size(entry) <= self._recent_max_bytes:
+                    self._recent = entry
             return entry
 
     def _load(

@@ -300,6 +300,12 @@ class GraphRepository:
                 by_label.setdefault(label, []).append(item)
         return {label: tuple(items) for label, items in by_label.items()}
 
+    def load_node_property_projection(
+        self, files: tuple[DatasetFile, ...], *, label: str
+    ) -> pa.Table:
+        """Load the full, unfiltered property projection for a shared snapshot lease."""
+        return self.load_node_property_table(files, label=label)
+
     def load_node_property_table(
         self,
         files: tuple[DatasetFile, ...],

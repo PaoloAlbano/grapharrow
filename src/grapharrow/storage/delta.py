@@ -5,10 +5,11 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import RLock
+from threading import Lock, RLock
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -22,6 +23,7 @@ from deltalake.exceptions import CommitFailedError, DeltaError, TableNotFoundErr
 from deltalake.fs import DeltaStorageHandler
 from deltalake.transaction import CommitProperties
 
+from grapharrow.adapters.snapshot_tables import SnapshotTableCache
 from grapharrow.adapters.writer import WriterLock, writer_locked
 from grapharrow.config import GraphArrowSettings
 from grapharrow.core import DatabaseLayout
@@ -129,6 +131,13 @@ class _Head:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _ReadVersion:
+    table: DeltaTable
+    manifest: SnapshotManifest
+    catalog: VersionedCatalog
+
+
 class DeltaStorageBackend:
     """Use a partitioned Delta table as the sole source of truth for one database."""
 
@@ -137,13 +146,23 @@ class DeltaStorageBackend:
         *,
         layout: DatabaseLayout,
         settings: GraphArrowSettings,
+        snapshot_tables: SnapshotTableCache | None = None,
     ) -> None:
         self._layout = layout
         self._uri = str(layout.delta_dir)
         self._options = _storage_options(layout.root, settings)
         self._writer = _DeltaWriter()
+        snapshot_tables = (
+            snapshot_tables
+            if snapshot_tables is not None
+            else SnapshotTableCache(settings.snapshot_table_cache_max_bytes)
+        )
+        self._retain_read_version = snapshot_tables.max_bytes > 0
+        self._read_version: _ReadVersion | None = None
+        self._read_version_lock = Lock()
         self._graph = DeltaGraphStore(
             self._read_partition,
+            snapshot_tables=snapshot_tables,
             filter_pushdown_enabled=settings.parquet_filter_pushdown_enabled,
         )
 
@@ -201,7 +220,28 @@ class DeltaStorageBackend:
     def _read_partition(
         self, snapshot_id: SnapshotId, kind: str, columns: list[str], expression: object
     ) -> pa.Table:
-        return _partition(self._require_table(snapshot_id), kind, columns, expression)
+        return _partition(self._read_table(snapshot_id), kind, columns, expression)
+
+    def _read_table(self, snapshot_id: SnapshotId) -> DeltaTable:
+        cached = self._read_version
+        if cached is not None and cached.manifest.snapshot_id == snapshot_id:
+            return cached.table
+        return self._require_table(snapshot_id)
+
+    def _describe_read_version(self, table: DeltaTable) -> _ReadVersion:
+        """Retain only the latest observed version, with a handle used exclusively for reads."""
+        snapshot_id = SnapshotId(table.version() + 1)
+        with self._read_version_lock:
+            cached = self._read_version
+            if cached is not None and cached.manifest.snapshot_id == snapshot_id:
+                return cached
+            head, catalog = _metadata(table)
+            entry = _ReadVersion(table, head.manifest(snapshot_id, catalog.version), catalog)
+            if self._retain_read_version and (
+                cached is None or cached.manifest.snapshot_id.value < snapshot_id.value
+            ):
+                self._read_version = entry
+            return entry
 
     def capture_snapshot(self) -> SnapshotManifest:
         return self.bootstrap_snapshot()
@@ -209,11 +249,11 @@ class DeltaStorageBackend:
     def bootstrap_snapshot(self) -> SnapshotManifest:
         table = self._try_open()
         if table is not None:
-            return _manifest(table)
+            return self._describe_read_version(table).manifest
         with self._writer.hold():
             table = self._try_open()
             if table is not None:
-                return _manifest(table)
+                return self._describe_read_version(table).manifest
             self._check_native_layout()
             catalog = VersionedCatalog.empty(version=CatalogVersion(1))
             head = _new_head(0, 0, {}, {}, None)
@@ -234,7 +274,7 @@ class DeltaStorageBackend:
                 table = self._try_open()
                 if table is None:
                     raise StorageError("Could not initialize the Delta graph.") from exc
-                return _manifest(table)
+                return self._describe_read_version(table).manifest
             return head.manifest(SnapshotId(1), catalog.version)
 
     def _check_native_layout(self) -> None:
@@ -259,11 +299,12 @@ class DeltaStorageBackend:
         return self._try_open() is not None
 
     def load_manifest(self, snapshot_id: SnapshotId | None = None) -> SnapshotManifest:
-        return _manifest(self._require_table(snapshot_id))
+        table = self._require_table(None) if snapshot_id is None else self._read_table(snapshot_id)
+        return self._describe_read_version(table).manifest
 
     def try_load_current_pointer(self) -> CurrentSnapshotPointer | None:
         table = self._try_open()
-        return _pointer(_manifest(table)) if table is not None else None
+        return _pointer(self._describe_read_version(table).manifest) if table is not None else None
 
     def load_current_pointer(self) -> CurrentSnapshotPointer:
         return _pointer(self.load_manifest())
@@ -290,8 +331,8 @@ class DeltaStorageBackend:
     def idempotency_base(
         self, pointer: CurrentSnapshotPointer, key_hash: str
     ) -> tuple[SnapshotManifest, IdempotencyReceipt | None]:
-        table = self._require_table(pointer.snapshot_id)
-        manifest = _manifest(table)
+        table = self._read_table(pointer.snapshot_id)
+        manifest = self._describe_read_version(table).manifest
         if pointer != _pointer(manifest):
             raise StorageError("The Delta snapshot pointer does not match the log.")
         rows = _partition(
@@ -321,15 +362,16 @@ class DeltaStorageBackend:
         return f"delta/{snapshot.snapshot_id.value}/catalog"
 
     def load_for_snapshot(self, manifest: SnapshotManifest) -> VersionedCatalog:
-        _, catalog = _metadata(self._require_table(manifest.snapshot_id))
+        catalog = self._describe_read_version(self._read_table(manifest.snapshot_id)).catalog
         if catalog.version != manifest.catalog_version:
             raise CatalogError("Catalog version does not match the Delta snapshot.")
-        return catalog
+        # Index options may contain mutable objects exposed by the catalog API.
+        return deepcopy(catalog) if catalog.indexes else catalog
 
     def load(self, version: CatalogVersion | None = None) -> VersionedCatalog:
         if version is None:
-            _, catalog = _metadata(self._require_table(None))
-            return catalog
+            catalog = self._describe_read_version(self._require_table(None)).catalog
+            return deepcopy(catalog) if catalog.indexes else catalog
         for _, manifest in self.history():
             if manifest.catalog_version == version:
                 return self.load_for_snapshot(manifest)
@@ -454,7 +496,7 @@ class DeltaStorageBackend:
             else ()
         )
         try:
-            manifest = self.load_manifest()
+            manifest = _manifest(self._require_table(None))
             self._verify_rows(manifest)
         except StorageError as exc:
             return VerificationReport(

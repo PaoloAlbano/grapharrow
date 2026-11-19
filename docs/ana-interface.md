@@ -64,7 +64,7 @@ Use `--no-ana` or `GRAPHARROW_ANA_ENABLED=false` to disable the interface.
 | `GRAPHARROW_ANA_MAX_BYTES_PER_SESSION` | `67108864` | Accounted snapshot, handle, lineage and page bytes (64 MiB) |
 | `GRAPHARROW_ANA_MAX_TOTAL_BYTES` | `536870912` | Shared accounted bytes for the HTTP application (512 MiB) |
 | `GRAPHARROW_ANA_PERSISTENT_SCHEMA_CACHE_ENABLED` | `true` | Reuse schema cache files on native local storage |
-| `GRAPHARROW_ANA_EDGE_SCHEMA_CACHE_MAX_BYTES` | `1048576` | Budget for the relationship statistics cache (1 MiB, `0` disables it) |
+| `GRAPHARROW_ANA_EDGE_SCHEMA_CACHE_MAX_BYTES` | `1048576` | Budget for Native relationship statistics on disk, or for the recent ANA schema and relationship statistics in Delta memory (1 MiB, `0` disables retention between workflows) |
 | `GRAPHARROW_SNAPSHOT_TABLE_CACHE_MAX_BYTES` | `67108864` | Per-application budget for shared Arrow tables used by ANA and Cypher (64 MiB, `0` disables sharing) |
 | `GRAPHARROW_ANA_READ_CACHE_ENABLED` | `false` | Enable workflow-local candidate caching for `entity_resolve` and `value_search` |
 | `GRAPHARROW_ANA_READ_CACHE_MAX_BYTES_PER_SESSION` | `4194304` | Reserved read-cache capacity inside workflow and server byte quotas (4 MiB, minimum 1024 bytes) |

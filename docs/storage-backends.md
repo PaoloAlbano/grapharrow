@@ -48,6 +48,11 @@ are resolved from that version, including after another replica commits. New
 readers can capture the next version. Keep ANA sessions on the replica that
 issued their session ID because handles live in the server process.
 
+Canonical tables and derived property projections share the Arrow table cache
+budget. A new snapshot capture checks the latest log version before reusing a
+pinned read handle or a table. ANA retains one recent schema and reuses
+relationship statistics for unchanged edge ranges within its schema cache budget.
+
 A writer publishes only against its captured base version. When two replicas
 write from the same base, one publishes and the other receives a write conflict.
 REST reports HTTP 409. Retry the whole operation in a new transaction. A retry

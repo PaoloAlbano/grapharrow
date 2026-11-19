@@ -16,6 +16,7 @@ import pyarrow.compute as pc  # type: ignore[import-untyped]
 from grapharrow.adapters.filesystem import FileSystemAdapter
 from grapharrow.core import property_codec
 from grapharrow.core.temporal import Duration, Instant
+from grapharrow.use_cases.ana_resources import retained_size
 
 # Bump when the persisted statistics or their meaning changes.
 _FORMAT_VERSION = 1
@@ -41,19 +42,26 @@ class _RangeEntry(TypedDict):
 
 
 class EdgePropertyStatisticsCache:
-    """Persist a bounded set of verified, stable edge ID ranges."""
+    """Reuse statistics for a bounded set of verified edge ID ranges."""
 
-    def __init__(self, disk: tuple[Path, FileSystemAdapter] | None, max_bytes: int) -> None:
+    def __init__(
+        self,
+        disk: tuple[Path, FileSystemAdapter] | None,
+        max_bytes: int,
+        *,
+        retain_in_memory: bool = False,
+    ) -> None:
         self._disk = disk
         self._max_bytes = max_bytes
+        self._memory: dict[str, _RangeEntry] | None = {} if retain_in_memory else None
 
     def discover(self, edges: pa.Table) -> tuple[list[str], list[dict[str, Any]]]:
         if not edges.num_rows:
             return [], []
-        if self._disk is None or not self._max_bytes:
+        if not self._max_bytes or (self._disk is None and self._memory is None):
             return _summarize((_collect_properties(edges),))
-        path, filesystem = self._disk
-        return _summarize(self._scan_ranges(edges, path, filesystem))
+        previous = self._load(self._disk[0]) if self._disk is not None else self._memory or {}
+        return _summarize(self._scan_ranges(edges, previous))
 
     def _load(self, path: Path) -> dict[str, _RangeEntry]:
         with suppress(OSError, ValueError, RecursionError):
@@ -73,11 +81,10 @@ class EdgePropertyStatisticsCache:
         return {}
 
     def _scan_ranges(
-        self, edges: pa.Table, path: Path, filesystem: FileSystemAdapter
+        self, edges: pa.Table, previous: dict[str, _RangeEntry]
     ) -> Iterator[_RangeStats]:
-        previous = self._load(path)
         updated: dict[str, _RangeEntry] = {}
-        compact_bytes = 0
+        used_bytes = 0
         fits = True
         for group, rows in _ranges(edges):
             if not fits and group not in previous:
@@ -88,9 +95,12 @@ class EdgePropertyStatisticsCache:
             if entry is None or entry["key"] != key:
                 entry = {"key": key, "stats": _collect_properties(rows)}
             if fits:
-                # The compact form bounds the retained entries before final serialization.
-                compact_bytes += len(json.dumps((group, entry), separators=(",", ":")))
-                if compact_bytes <= self._max_bytes:
+                if self._disk is None:
+                    used_bytes += retained_size((group, entry)) + 128
+                else:
+                    # Bound the retained entries before final serialization.
+                    used_bytes += len(json.dumps((group, entry), separators=(",", ":")))
+                if used_bytes <= self._max_bytes:
                     updated[group] = entry
                 else:
                     updated.clear()
@@ -98,6 +108,10 @@ class EdgePropertyStatisticsCache:
             yield entry["stats"]
 
         if fits and updated != previous:
+            if self._disk is None:
+                self._memory = updated
+                return
+            path, filesystem = self._disk
             payload = {
                 "version": _FORMAT_VERSION,
                 "width": _EDGE_ID_RANGE_SIZE,

@@ -17,6 +17,7 @@ from grapharrow.app import build_application
 from grapharrow.config import GraphArrowSettings
 from grapharrow.core.errors import StorageError
 from grapharrow.interfaces.rest import create_rest_app
+from grapharrow.use_cases.ana import GraphArrowAgentBackend
 from tests.integration.support import MotoS3Context
 
 pytestmark = pytest.mark.integration
@@ -29,6 +30,7 @@ READ = (
     "MATCH (a:Author)-[r:WROTE]->(b:Book) "
     "RETURN id(a) AS author, id(r) AS edge, b.name AS name ORDER BY name"
 )
+READ_PROPERTIES = "MATCH (a:Author)-[r:WROTE]->(b:Book) RETURN a.name AS author, r.since AS since"
 
 
 @pytest.fixture
@@ -250,6 +252,99 @@ def test_catalog_only_commits_and_compaction_keep_previous_snapshots_readable(
     state = reader.use_cases.graph.load_state(snapshot=pinned)
     assert len(state.nodes) == 2 and len(state.edges) == 1
     assert state.edges[0].properties == {"since": 2020}
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+@pytest.mark.parametrize("cache_enabled", [True, False])
+def test_delta_readers_reuse_projections_and_pin_ana_across_commits(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    cache_enabled: bool,
+) -> None:
+    path, settings = delta_database
+    if not cache_enabled:
+        settings = settings.model_copy(
+            update={"ana_edge_schema_cache_max_bytes": 0, "snapshot_table_cache_max_bytes": 0}
+        )
+    writer = build_application(path, settings=settings)
+    reader = build_application(path, settings=settings)
+    writer.use_cases.cypher.execute(CREATE, {"name": "Original"})
+
+    discover = GraphArrowAgentBackend._discover_schema
+    build_edge_projection = reader.repositories.graph._load_edge_property_projection
+    discoveries = projections = 0
+
+    def observe_discovery(self: GraphArrowAgentBackend, node_properties: Any = None) -> Any:
+        nonlocal discoveries
+        discoveries += 1
+        return discover(self, node_properties)
+
+    def observe_edge_projection(file: Any) -> Any:
+        nonlocal projections
+        projections += 1
+        return build_edge_projection(file)
+
+    monkeypatch.setattr(GraphArrowAgentBackend, "_discover_schema", observe_discovery)
+    monkeypatch.setattr(
+        reader.repositories.graph, "_load_edge_property_projection", observe_edge_projection
+    )
+
+    def ana_properties(workflow: GraphArrowAgentBackend) -> list[list[object]]:
+        result = workflow.call(
+            "relationship_query",
+            {
+                "source_label": "Author",
+                "source_as": "a",
+                "target_label": "Book",
+                "target_as": "b",
+                "relationship_type": "WROTE",
+                "rel_as": "r",
+                "select": [
+                    {"var": "a", "property": "name", "alias": "author"},
+                    {"var": "r", "property": "since", "alias": "since"},
+                ],
+            },
+        )
+        return workflow.call("fetch", {"from": result["handle"]})["rows"]
+
+    first = {"author": "Original", "since": 2020}
+    assert reader.use_cases.cypher.execute(READ_PROPERTIES).rows == (first,)
+    assert reader.use_cases.cypher.execute(READ_PROPERTIES).rows == (first,)
+    assert projections == (1 if cache_enabled else 2)
+    with GraphArrowAgentBackend(reader) as initial:
+        assert ana_properties(initial) == [["Original", 2020]]
+
+    with GraphArrowAgentBackend(reader) as pinned:
+        assert discoveries == (1 if cache_enabled else 2)
+        writer.use_cases.cypher.execute(
+            "MATCH (a:Author)-[r:WROTE]->() SET a.name = 'Changed', r.since = 2025"
+        )
+        assert reader.use_cases.cypher.execute(READ_PROPERTIES).rows == (
+            {"author": "Changed", "since": 2025},
+        )
+        with GraphArrowAgentBackend(reader) as fresh:
+            assert ana_properties(fresh) == [["Changed", 2025]]
+            assert ana_properties(pinned) == [["Original", 2020]]
+    cache = reader.use_cases.graph.snapshot_tables
+    assert cache.used_bytes <= cache.max_bytes
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+def test_delta_reads_edge_endpoints_without_decoding_properties(
+    delta_database: tuple[str | Path, GraphArrowSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, settings = delta_database
+    app = build_application(path, settings=settings)
+    app.use_cases.cypher.execute(CREATE, {"name": "Original"})
+    snapshot = app.storage_backend.capture_snapshot()
+
+    def unexpected_decode(*_: object) -> None:
+        pytest.fail("An endpoint-only scan must not decode relationship properties.")
+
+    monkeypatch.setattr(app.repositories.graph, "_load_edge_property_projection", unexpected_decode)
+    assert app.repositories.graph.load_edge_property_table(
+        snapshot.edge_properties, rel_type="WROTE", columns=["dst_id", "edge_id"]
+    ).to_pylist() == [{"dst_id": 2, "edge_id": 1}]
 
 
 @pytest.mark.parametrize("first", ["native", "delta"])

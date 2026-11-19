@@ -31,9 +31,10 @@ READS = [
     "MATCH (p:Person) RETURN coalesce(p.name,'?') AS name ORDER BY p.age DESC,name ASC LIMIT 2",
     "MATCH (p:Person) RETURN coalesce(p.country,'?') AS country "
     "ORDER BY p.country DESC,p.name ASC SKIP 1 LIMIT 2",
-    "MATCH (p:Person) RETURN coalesce(p.name,'?') AS name SKIP 1 LIMIT 1",
+    "MATCH (p:Person) RETURN coalesce(p.name,'?') AS name ORDER BY name SKIP 1 LIMIT 1",
     "MATCH (p:Person) RETURN coalesce(p.name,'?') AS name LIMIT 0",
-    "MATCH (p:Person) WHERE p.name CONTAINS 'a' RETURN coalesce(p.name,'?') AS name SKIP 1 LIMIT 1",
+    "MATCH (p:Person) WHERE p.name CONTAINS 'a' "
+    "RETURN coalesce(p.name,'?') AS name ORDER BY name SKIP 1 LIMIT 1",
     "MATCH (p:Person) WITH coalesce(p.name,'?') AS name ORDER BY name LIMIT 2 "
     "WHERE p.age<30 RETURN name",
     "MATCH (p:Person) WITH coalesce(p.country,'?') AS country "

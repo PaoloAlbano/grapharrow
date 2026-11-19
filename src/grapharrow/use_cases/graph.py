@@ -83,6 +83,7 @@ class GraphStateUseCase:
         storage_backend: StorageBackend | None = None,
         cypher_max_concurrent_queries: int = 0,
         snapshot_table_cache_max_bytes: int = 64 * 1024 * 1024,
+        snapshot_tables: SnapshotTableCache | None = None,
         property_index_max_bytes: int = 32 * 1024 * 1024,
         adjacency_index_max_bytes: int = 32 * 1024 * 1024,
     ) -> None:
@@ -113,7 +114,11 @@ class GraphStateUseCase:
             if cypher_max_concurrent_queries
             else None
         )
-        self.snapshot_tables = SnapshotTableCache(snapshot_table_cache_max_bytes)
+        self.snapshot_tables = (
+            snapshot_tables
+            if snapshot_tables is not None
+            else SnapshotTableCache(snapshot_table_cache_max_bytes)
+        )
         self.property_indexes = PropertyIndexStore(property_index_max_bytes)
         self.adjacency_indexes = AdjacencyIndexStore(adjacency_index_max_bytes)
 
@@ -258,7 +263,9 @@ class GraphStateUseCase:
                 label: leases.enter_context(
                     self.snapshot_tables.borrow(
                         ("node_properties", files),
-                        partial(self._graph_store.load_node_property_table, files, label=label),
+                        partial(
+                            self._graph_store.load_node_property_projection, files, label=label
+                        ),
                     )
                 )
                 for label, files in grouped.items()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator
+from functools import partial
 from urllib.parse import quote, unquote
 
 import pyarrow as pa  # type: ignore[import-untyped]
@@ -10,6 +11,7 @@ import pyarrow.compute as pc  # type: ignore[import-untyped]
 import pyarrow.dataset as ds  # type: ignore[import-untyped]
 
 from grapharrow.adapters.scan_filter import dataset_filter
+from grapharrow.adapters.snapshot_tables import SnapshotTableCache
 from grapharrow.domain import DatasetFile, SnapshotId, SnapshotManifest
 from grapharrow.domain.records import EdgeRecord, NodeRecord
 from grapharrow.domain.scan import ScanPredicate
@@ -53,9 +55,11 @@ class DeltaGraphStore:
         self,
         read_partition: Callable[[SnapshotId, str, list[str], object], pa.Table],
         *,
+        snapshot_tables: SnapshotTableCache,
         filter_pushdown_enabled: bool,
     ) -> None:
         self._read_partition = read_partition
+        self._snapshot_tables = snapshot_tables
         self._filter_pushdown_enabled = filter_pushdown_enabled
 
     def load_node_table(self, files: tuple[DatasetFile, ...]) -> pa.Table:
@@ -160,6 +164,15 @@ class DeltaGraphStore:
     ) -> dict[str, tuple[DatasetFile, ...]]:
         return {_name(file): (file,) for file in files}
 
+    def load_node_property_projection(
+        self, files: tuple[DatasetFile, ...], *, label: str
+    ) -> pa.Table:
+        selected = self.node_property_files(files, label=label)
+        if not selected:
+            return pa.table({})
+        nodes = self._nodes_for_label(selected[0], NODE_SCHEMA.names)
+        return _node_property_table(node_records_from_table(nodes))
+
     def load_node_property_table(
         self,
         files: tuple[DatasetFile, ...],
@@ -171,9 +184,11 @@ class DeltaGraphStore:
         selected = self.node_property_files(files, label=label)
         if not selected:
             return pa.table({})
-        nodes = self._nodes_for_label(selected[0], NODE_SCHEMA.names)
-        table = _node_property_table(node_records_from_table(nodes))
-        return self._select(table, columns, predicates)
+        with self._snapshot_tables.borrow(
+            ("node_properties", selected),
+            partial(self.load_node_property_projection, selected, label=label),
+        ) as table:
+            return self._select(table, columns, predicates)
 
     def iter_node_property_batches(
         self,
@@ -203,10 +218,26 @@ class DeltaGraphStore:
         selected = self.adjacency_files(files, rel_type=rel_type)
         if not selected:
             return pa.table({})
-        edges = edge_records_from_table(self._edge_rows(selected[0], EDGE_SCHEMA))
-        return self._select(
-            _edge_property_table(edges, _edge_property_schema(edges)), columns, predicates
-        )
+        endpoints = ADJACENCY_BY_SOURCE_SCHEMA.names
+        if (
+            columns is not None
+            and all(column in endpoints for column in columns)
+            and all(predicate.column in endpoints for predicate in predicates)
+        ):
+            with self._snapshot_tables.borrow(
+                ("edge_endpoints", selected),
+                partial(self._edge_rows, selected[0], ADJACENCY_BY_SOURCE_SCHEMA),
+            ) as table:
+                return self._select(table, columns, predicates)
+        with self._snapshot_tables.borrow(
+            ("edge_properties", selected),
+            partial(self._load_edge_property_projection, selected[0]),
+        ) as table:
+            return self._select(table, columns, predicates)
+
+    def _load_edge_property_projection(self, file: DatasetFile) -> pa.Table:
+        edges = edge_records_from_table(self._edge_rows(file, EDGE_SCHEMA))
+        return _edge_property_table(edges, _edge_property_schema(edges))
 
     def _select(
         self, table: pa.Table, columns: list[str] | None, predicates: tuple[ScanPredicate, ...]
@@ -214,6 +245,8 @@ class DeltaGraphStore:
         expression = (
             dataset_filter(table.schema, predicates) if self._filter_pushdown_enabled else None
         )
+        if columns is None and expression is None:
+            return table
         dataset = ds.dataset(table)
         try:
             return dataset.to_table(columns=columns, filter=expression)

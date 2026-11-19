@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from grapharrow.adapters import FileSystemAdapter, ParquetAdapter, PyArrowTabularAdapter
+from grapharrow.adapters.snapshot_tables import SnapshotTableCache
 from grapharrow.config import GraphArrowSettings
 from grapharrow.core import DatabaseLayout
 from grapharrow.core.errors import StorageError
@@ -16,6 +17,7 @@ def create_storage_backend(
     filesystem: FileSystemAdapter,
     parquet_adapter: ParquetAdapter,
     tabular_adapter: PyArrowTabularAdapter,
+    snapshot_tables: SnapshotTableCache | None = None,
 ) -> StorageBackend:
     """Build only the requested implementation and retain the supplied I/O adapters."""
     if settings.storage_backend == "delta":
@@ -25,7 +27,9 @@ def create_storage_backend(
             if exc.name != "deltalake":
                 raise
             raise StorageError("Install grapharrow[delta] to use the Delta backend.") from exc
-        return DeltaStorageBackend(layout=layout, settings=settings)
+        return DeltaStorageBackend(
+            layout=layout, settings=settings, snapshot_tables=snapshot_tables
+        )
 
     if settings.storage_backend != "native":
         raise StorageError(f"Unsupported Storage Backend: {settings.storage_backend}")

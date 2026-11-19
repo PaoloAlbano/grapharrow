@@ -126,6 +126,10 @@ class GraphStore(Protocol):
         files: tuple[DatasetFile, ...],
     ) -> dict[str, tuple[DatasetFile, ...]]: ...
 
+    def load_node_property_projection(
+        self, files: tuple[DatasetFile, ...], *, label: str
+    ) -> pa.Table: ...
+
     def load_node_property_table(
         self,
         files: tuple[DatasetFile, ...],

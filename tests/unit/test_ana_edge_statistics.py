@@ -24,6 +24,7 @@ def _edges(items: list[tuple[int, str, dict[str, Any]]]) -> pa.Table:
     )
 
 
+@pytest.mark.parametrize("storage", ["disk", "memory"])
 @pytest.mark.parametrize(
     ("change", "rescanned_ids"),
     [
@@ -36,7 +37,11 @@ def _edges(items: list[tuple[int, str, dict[str, Any]]]) -> pa.Table:
     ],
 )
 def test_only_changed_edge_ranges_are_decoded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str, rescanned_ids: list[list[int]]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+    rescanned_ids: list[list[int]],
+    storage: str,
 ) -> None:
     monkeypatch.setattr(ana_edge_statistics, "_EDGE_ID_RANGE_SIZE", 2)
     original = [
@@ -47,8 +52,8 @@ def test_only_changed_edge_ranges_are_decoded(
         (5, "T", {"flag": True}),
         (6, "T", {"flag": False}),
     ]
-    disk = tmp_path / "stats.json", FileSystemAdapter()
-    cache = EdgePropertyStatisticsCache(disk, 16_384)
+    disk = (tmp_path / "stats.json", FileSystemAdapter()) if storage == "disk" else None
+    cache = EdgePropertyStatisticsCache(disk, 16_384, retain_in_memory=storage == "memory")
     cache.discover(_edges(original))
 
     items = {
@@ -71,7 +76,9 @@ def test_only_changed_edge_ranges_are_decoded(
         return collect(rows)
 
     monkeypatch.setattr(ana_edge_statistics, "_collect_properties", record)
-    actual = EdgePropertyStatisticsCache(disk, 16_384).discover(changed)
+    if disk is not None:
+        cache = EdgePropertyStatisticsCache(disk, 16_384)
+    actual = cache.discover(changed)
     assert collected == rescanned_ids
     assert actual == expected
     if change == "float":

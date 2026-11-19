@@ -13,6 +13,7 @@ from grapharrow.adapters import (
     PyArrowTabularAdapter,
 )
 from grapharrow.adapters.query_cache import CypherParseCache
+from grapharrow.adapters.snapshot_tables import SnapshotTableCache
 from grapharrow.config import GraphArrowSettings
 from grapharrow.core import DatabaseLayout
 from grapharrow.storage import StorageBackend, create_storage_backend
@@ -94,12 +95,14 @@ def build_application(
         opencypher=OpenCypherAdapter(),
         tabular=PyArrowTabularAdapter(),
     )
+    snapshot_tables = SnapshotTableCache(resolved_settings.snapshot_table_cache_max_bytes)
     storage_backend = create_storage_backend(
         settings=resolved_settings,
         layout=layout,
         filesystem=adapters.filesystem,
         parquet_adapter=adapters.parquet,
         tabular_adapter=adapters.tabular,
+        snapshot_tables=snapshot_tables,
     )
     repositories = GraphArrowRepositories(
         catalog=storage_backend.catalog,
@@ -112,7 +115,7 @@ def build_application(
         catalog_store=repositories.catalog,
         snapshot_store=repositories.snapshot,
         graph_store=repositories.graph,
-        snapshot_table_cache_max_bytes=resolved_settings.snapshot_table_cache_max_bytes,
+        snapshot_tables=snapshot_tables,
         cypher_max_concurrent_queries=resolved_settings.cypher_max_concurrent_queries,
         property_index_max_bytes=resolved_settings.property_index_max_bytes,
         adjacency_index_max_bytes=resolved_settings.adjacency_index_max_bytes,
@@ -150,6 +153,11 @@ def build_application(
         _ana_schema_cache=SnapshotSchemaCache(
             disk=schema_cache_disk,
             edge_stats_max_bytes=resolved_settings.ana_edge_schema_cache_max_bytes,
+            memory_max_bytes=(
+                resolved_settings.ana_edge_schema_cache_max_bytes
+                if resolved_settings.storage_backend == "delta"
+                else 0
+            ),
         ),
     )
 
