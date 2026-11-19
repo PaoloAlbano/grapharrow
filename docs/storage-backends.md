@@ -53,11 +53,9 @@ each reader.
 
 `GRAPHARROW_EDGE_PARQUET_RANGE_SIZE` overrides the range width at database
 creation or explicit compaction. Set it to `0` for a single edge partition.
-The chosen width is stored with the graph. Compaction converts earlier Delta
-databases with one edge partition to ID ranges and preserves historical reads.
-GraphArrow still reads earlier Delta layouts. Writes to range-partitioned
-graphs upgrade their metadata to the guarded layout. Upgrade all GraphArrow
-replicas sharing a Delta database before allowing writes with this version.
+The chosen width is stored with the graph. Compaction publishes a new snapshot
+with the configured width and preserves historical reads.
+The GraphArrow Delta metadata format is `grapharrow-delta-v1`.
 
 Readers capture one Delta version. Catalog, adjacency and property projections
 are resolved from that version, including after another replica commits. New

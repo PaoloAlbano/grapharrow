@@ -433,82 +433,71 @@ def test_delta_point_set_reads_and_rewrites_only_its_range(
 
 
 @pytest.mark.parametrize("delta_database", ["local"], indirect=True)
-def test_delta_compact_upgrades_legacy_edges_and_keeps_pinned_reads(
+def test_delta_compact_changes_edge_range_size_and_keeps_pinned_reads(
     delta_database: tuple[str | Path, GraphArrowSettings],
 ) -> None:
-    import pyarrow as pa
-    from deltalake import DeltaTable, write_deltalake
-
-    from grapharrow.storage.delta import _SCHEMA
+    from deltalake import DeltaTable
 
     path, settings = delta_database
-    settings = settings.model_copy(update={"edge_parquet_range_size": 2})
-    app = build_application(path, settings=settings)
+    app = build_application(
+        path, settings=settings.model_copy(update={"edge_parquet_range_size": 0})
+    )
     uri = str(app.layout.delta_dir)
-    payload = {
-        "format": "grapharrow-delta-v1",
-        "graph": {
-            "commit_id": "legacy-initial",
-            "created_at": "2026-11-19T00:00:00+00:00",
-            "node_count": 0,
-            "edge_count": 0,
-            "labels": {},
-            "relationships": {},
-            "receipt": None,
-        },
-        "catalog": {"version": 1},
-    }
-    row = {"kind": "metadata", "properties_json": orjson.dumps(payload).decode()}
-    write_deltalake(uri, pa.Table.from_pylist([row], schema=_SCHEMA), partition_by=["kind"])
     app.use_cases.cypher.execute(CREATE_EDGE_RANGES)
     pinned = app.storage_backend.capture_snapshot()
     old = _active_edge_files(DeltaTable(uri))
     assert {Path(file).parent.name for file in old} == {"kind=edges"}
 
-    current = app.use_cases.admin.compact()
+    compactor = build_application(
+        path, settings=settings.model_copy(update={"edge_parquet_range_size": 2})
+    )
+    current = compactor.use_cases.admin.compact()
     new = _active_edge_files(DeltaTable(uri))
     assert len(new) == 2
     assert not old.intersection(new)
-    assert app.use_cases.graph.load_state(snapshot=current).edges == (
-        app.use_cases.graph.load_state(snapshot=pinned).edges
+    assert compactor.use_cases.graph.load_state(snapshot=current).edges == (
+        compactor.use_cases.graph.load_state(snapshot=pinned).edges
     )
-    assert app.use_cases.admin.verify().ok
+    assert compactor.use_cases.admin.verify().ok
 
 
 @pytest.mark.parametrize("delta_database", ["local"], indirect=True)
-def test_delta_point_set_upgrades_v2_metadata_and_preserves_historical_reads(
+@pytest.mark.parametrize("incompatible_field", ["format", "metadata_version"])
+def test_delta_rejects_incompatible_metadata_without_writing(
     delta_database: tuple[str | Path, GraphArrowSettings],
+    incompatible_field: str,
 ) -> None:
-    from dataclasses import replace
-
+    import pyarrow as pa
     from deltalake import DeltaTable, write_deltalake
 
-    from grapharrow.storage.delta import _metadata, _metadata_table
+    from grapharrow.storage.delta import _partition, _rows
 
     path, settings = delta_database
     app = build_application(path, settings=settings)
-    app.use_cases.cypher.execute(CREATE_EDGE_RANGES)
-    table = DeltaTable(str(app.layout.delta_dir))
-    head, catalog = _metadata(table)
+    app.use_cases.admin.initialize()
+    uri = str(app.layout.delta_dir)
+    table = DeltaTable(uri)
+    metadata = _partition(table, "metadata", ["properties_json", "key_hash"])
+    row = metadata.to_pylist()[0]
+    payload = orjson.loads(row["properties_json"])
+    assert payload["format"] == "grapharrow-delta-v1"
+    assert payload["graph"]["metadata_version"] == table.version() == 0
+    assert row["key_hash"] == payload["graph"]["commit_id"]
+    if incompatible_field == "format":
+        payload["format"] = "unknown-format"
+        payload["graph"]["metadata_version"] = table.version() + 1
+    else:
+        del payload["graph"]["metadata_version"]
+    row["properties_json"] = orjson.dumps(payload).decode()
     write_deltalake(
         table,
-        _metadata_table(replace(head, metadata_version=None), catalog),
+        _rows(pa.Table.from_pylist([row], schema=metadata.schema), "metadata"),
         mode="overwrite",
         predicate="kind = 'metadata'",
     )
-    historical = app.storage_backend.capture_snapshot()
-    edge_files = _active_edge_files(table)
-
-    app.use_cases.cypher.execute(SET_EDGE, {"id": 3, "since": 2025})
-    upgraded = DeltaTable(str(app.layout.delta_dir))
-    assert _metadata(upgraded)[0].metadata_version == upgraded.version()
-    assert upgraded.version() == historical.snapshot_id.value
-    assert len(_active_edge_files(upgraded)) == len(edge_files)
-    assert app.use_cases.graph.load_state(snapshot=historical).edges[2].properties == {
-        "since": 2020
-    }
-    app.use_cases.cypher.execute(SET_EDGE, {"id": 3, "since": 2026})
-    assert app.use_cases.graph.load_state().edges[2].properties == {"since": 2026}
+    with pytest.raises(StorageError, match="Unsupported GraphArrow Delta layout"):
+        build_application(path, settings=settings).use_cases.admin.initialize()
+    assert DeltaTable(uri).version() == 1
 
 
 @pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)

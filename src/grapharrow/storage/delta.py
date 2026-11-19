@@ -52,7 +52,6 @@ from grapharrow.repositories.graph import (
     _edge_ranges,
     _edges_table,
     _nodes_table,
-    _replace_row,
 )
 from grapharrow.storage.contracts import CatalogStore, GraphStore, SnapshotStore, StorageMaintenance
 from grapharrow.storage.delta_graph import DeltaEdgeRange, DeltaGraphStore, dataset_ref
@@ -66,9 +65,7 @@ from grapharrow.storage.models import (
 if TYPE_CHECKING:
     from grapharrow.use_cases.graph import GraphState
 
-_LEGACY_FORMAT = "grapharrow-delta-v1"
-_RANGE_FORMAT = "grapharrow-delta-v2"
-_FORMAT = "grapharrow-delta-v3"
+_FORMAT = "grapharrow-delta-v1"
 _POINT_COMMIT_ID = "grapharrowPointCommitId"
 _POINT_COMMIT_RETRIES = 10
 _DEFAULT_EDGE_RANGE_SIZE = 8192
@@ -111,8 +108,8 @@ class _Head:
     labels: dict[str, int]
     relationships: dict[str, int]
     receipt: IdempotencyReceipt | None
-    edge_range_size: int | None = None
-    metadata_version: int | None = None
+    edge_range_size: int
+    metadata_version: int
 
     def manifest(self, snapshot_id: SnapshotId, version: CatalogVersion) -> SnapshotManifest:
         return SnapshotManifest(
@@ -313,7 +310,7 @@ class DeltaStorageBackend:
         self, table: DeltaTable, head: _Head, catalog: VersionedCatalog
     ) -> SnapshotManifest:
         version = table.version()
-        if head.metadata_version is not None and head.metadata_version != version:
+        if head.metadata_version != version:
             commit = self._commit_info(version)
             timestamp = commit.get("timestamp")
             if not isinstance(commit.get(_POINT_COMMIT_ID), str) or type(timestamp) is not int:
@@ -337,8 +334,14 @@ class DeltaStorageBackend:
                 return self._describe_read_version(table).manifest
             self._check_native_layout()
             catalog = VersionedCatalog.empty(version=CatalogVersion(1))
-            head = replace(
-                _new_head(0, 0, {}, {}, None, self._compaction_range_size(None)), metadata_version=0
+            head = _new_head(
+                0,
+                0,
+                {},
+                {},
+                None,
+                self._configured_range_size(_DEFAULT_EDGE_RANGE_SIZE),
+                metadata_version=0,
             )
             data = _metadata_table(head, catalog)
             try:
@@ -445,6 +448,7 @@ class DeltaStorageBackend:
             head.relationships,
             None,
             head.edge_range_size,
+            metadata_version=table.version() + 1,
         )
         snapshot = self._commit(table, candidate, catalog, {})
         return f"delta/{snapshot.snapshot_id.value}/catalog"
@@ -516,6 +520,7 @@ class DeltaStorageBackend:
             dict(Counter(edge.rel_type for edge in edges)),
             idempotency_receipt,
             previous_head.edge_range_size,
+            metadata_version=base.version() + 1,
         )
         manifest = self._commit(base, head, catalog, partitions)
         return GraphState(catalog, manifest, node_table, edge_table, node_records, edge_records)
@@ -529,9 +534,7 @@ class DeltaStorageBackend:
         *,
         replace_all_edges: bool = False,
     ) -> SnapshotManifest:
-        snapshot_id = SnapshotId(base.version() + 2)
-        if head.edge_range_size is not None:
-            head = replace(head, metadata_version=snapshot_id.value - 1)
+        snapshot_id = SnapshotId(head.metadata_version + 1)
         data = pa.concat_tables(
             [
                 _metadata_table(head, catalog),
@@ -608,21 +611,7 @@ class DeltaStorageBackend:
             if before == after:
                 return
             base = self._require_table(snapshot.snapshot_id)
-            if current.head.metadata_version is None:
-                head = replace(
-                    current.head,
-                    commit_id=uuid4().hex,
-                    created_at=datetime.now(UTC).isoformat(timespec="seconds"),
-                    receipt=None,
-                )
-                self._commit(
-                    base,
-                    head,
-                    current.catalog,
-                    {kind: _replace_row(table, position, _edges_table([after]))},
-                )
-            else:
-                self._commit_point(base, current.head.commit_id, kind, after)
+            self._commit_point(base, current.head.commit_id, kind, after)
 
     def _commit_point(
         self, base: DeltaTable, metadata_id: str, kind: str, edge: EdgeRecord
@@ -716,9 +705,15 @@ class DeltaStorageBackend:
         base = self._require_table(None)
         head, catalog = _metadata(base)
         manifest = head.manifest(SnapshotId(base.version() + 1), catalog.version)
-        width = self._compaction_range_size(head.edge_range_size)
+        width = self._configured_range_size(head.edge_range_size)
         candidate = _new_head(
-            head.node_count, head.edge_count, head.labels, head.relationships, None, width
+            head.node_count,
+            head.edge_count,
+            head.labels,
+            head.relationships,
+            None,
+            width,
+            metadata_version=base.version() + 1,
         )
         partitions = _edge_partitions(self._graph.load_edge_table(manifest.edges), width)
         partitions["nodes"] = self._graph.load_node_table(manifest.nodes)
@@ -730,10 +725,10 @@ class DeltaStorageBackend:
             replace_all_edges=True,
         )
 
-    def _compaction_range_size(self, previous: int | None) -> int:
+    def _configured_range_size(self, default: int) -> int:
         if self._edge_range_size is not None:
             return self._edge_range_size
-        return previous if previous is not None else _DEFAULT_EDGE_RANGE_SIZE
+        return default
 
     def vacuum(self) -> tuple[str, ...]:
         raise StorageError("Delta vacuum is unavailable while historical snapshots are retained.")
@@ -748,7 +743,9 @@ def _new_head(
     labels: dict[str, int],
     relationships: dict[str, int],
     receipt: IdempotencyReceipt | None,
-    edge_range_size: int | None,
+    edge_range_size: int,
+    *,
+    metadata_version: int,
 ) -> _Head:
     return _Head(
         uuid4().hex,
@@ -759,6 +756,7 @@ def _new_head(
         relationships,
         receipt,
         edge_range_size,
+        metadata_version,
     )
 
 
@@ -778,27 +776,16 @@ def _rows(table: pa.Table, kind: str) -> pa.Table:
 
 
 def _metadata_table(head: _Head, catalog: VersionedCatalog) -> pa.Table:
-    graph = asdict(head)
-    layout = _FORMAT
-    if head.metadata_version is None:
-        graph.pop("metadata_version")
-        layout = _RANGE_FORMAT
-    if head.edge_range_size is None:
-        graph.pop("edge_range_size")
-        layout = _LEGACY_FORMAT
     payload = {
-        "format": layout,
-        "graph": graph,
+        "format": _FORMAT,
+        "graph": asdict(head),
         "catalog": serialize_catalog(catalog),
     }
     return _rows(
         pa.table(
             {
                 "properties_json": [orjson.dumps(payload).decode()],
-                "key_hash": pa.array(
-                    [head.commit_id if head.metadata_version is not None else None],
-                    type=pa.string(),
-                ),
+                "key_hash": [head.commit_id],
             }
         ),
         "metadata",
@@ -834,27 +821,22 @@ def _metadata(table: DeltaTable) -> tuple[_Head, VersionedCatalog]:
         raise StorageError("Expected exactly one metadata row at the captured Delta version.")
     try:
         payload = orjson.loads(rows["properties_json"][0].as_py())
-        layout = payload["format"]
-        if layout not in {_FORMAT, _RANGE_FORMAT, _LEGACY_FORMAT}:
-            raise ValueError("Unrecognized graph layout")
         data = payload["graph"]
-        if layout != _LEGACY_FORMAT:
-            width = data["edge_range_size"]
-            if type(width) is not int or not 0 <= width < 2**63:
-                raise ValueError("Invalid edge range size")
-        if layout == _FORMAT:
-            version, commit_id = data["metadata_version"], data["commit_id"]
-            if (
-                type(version) is not int
-                or not 0 <= version <= table.version()
-                or type(commit_id) is not str
-                or len(commit_id) != 32
-                or any(char not in "0123456789abcdef" for char in commit_id)
-                or rows["key_hash"][0].as_py() != commit_id
-            ):
-                raise ValueError("Invalid graph metadata guard")
-        elif "metadata_version" in data:
-            raise ValueError("Unexpected graph metadata version")
+        if payload["format"] != _FORMAT or "metadata_version" not in data:
+            raise StorageError("Unsupported GraphArrow Delta layout. Use a new database path.")
+        width = data["edge_range_size"]
+        if type(width) is not int or not 0 <= width < 2**63:
+            raise ValueError("Invalid edge range size")
+        version, commit_id = data["metadata_version"], data["commit_id"]
+        if (
+            type(version) is not int
+            or not 0 <= version <= table.version()
+            or type(commit_id) is not str
+            or len(commit_id) != 32
+            or any(char not in "0123456789abcdef" for char in commit_id)
+            or rows["key_hash"][0].as_py() != commit_id
+        ):
+            raise ValueError("Invalid graph metadata guard")
         receipt = data["receipt"]
         if receipt is not None:
             data["receipt"] = IdempotencyReceipt(**receipt)
@@ -881,7 +863,7 @@ def _edge_partition(bucket: int) -> str:
     return f"edges-{bucket:020d}"
 
 
-def _edge_partitions(table: pa.Table, width: int | None) -> dict[str, pa.Table]:
+def _edge_partitions(table: pa.Table, width: int) -> dict[str, pa.Table]:
     if not width:
         return {"edges": table}
     if not table.num_rows:
@@ -890,7 +872,7 @@ def _edge_partitions(table: pa.Table, width: int | None) -> dict[str, pa.Table]:
 
 
 def _changed_edge_partitions(
-    table: pa.Table, previous: pa.Table, width: int | None
+    table: pa.Table, previous: pa.Table, width: int
 ) -> dict[str, pa.Table]:
     if not width:
         return {"edges": table}
