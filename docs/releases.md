@@ -109,7 +109,7 @@ For `v0.1.0`, the workflow creates a GitHub Release containing:
 
 - `grapharrow-0.1.0-py3-none-any.whl`;
 - `grapharrow-0.1.0.tar.gz`;
-- `runtime-requirements.txt`, the exported runtime lock used by Docker, including the `cloud` extra;
+- `runtime-requirements.txt`, the exported runtime lock used by Docker, including the `cloud` and `delta` extras;
 - `SHA256SUMS`, covering those artifacts.
 
 Install the wheel downloaded from the release with:

@@ -6,38 +6,22 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING
 
 import pyarrow as pa  # type: ignore[import-untyped]
 
 from grapharrow.adapters import FileSystemAdapter
 from grapharrow.adapters.writer import WriterLock, writer_locked
 from grapharrow.core.errors import WriteConflictError
-from grapharrow.domain import DatasetFile, SnapshotId, SnapshotManifest, VersionedCatalog
+from grapharrow.domain import SnapshotId, SnapshotManifest, VersionedCatalog
 from grapharrow.domain.records import EdgeRecord, NodeRecord
 from grapharrow.domain.snapshot import IdempotencyReceipt
+from grapharrow.repositories import CatalogRepository, GraphRepository, SnapshotRepository
 from grapharrow.storage.contracts import CatalogStore, GraphStore, SnapshotStore, StorageMaintenance
-from grapharrow.storage.models import EdgePropertyPatch
 from grapharrow.storage.native_maintenance import NativeStorageMaintenance
 
 if TYPE_CHECKING:
     from grapharrow.use_cases.graph import GraphState
-
-
-class NativeGraphStore(GraphStore, Protocol):
-    """Native-only preparation of a canonical range and its typed projection."""
-
-    def prepare_edge_property_patch(
-        self,
-        snapshot: SnapshotManifest,
-        *,
-        edge_id: int,
-        rel_type: str | None,
-        properties: dict[str, object],
-    ) -> tuple[bool, EdgePropertyPatch | None]: ...
-    def persist_edge_property_patch(
-        self, patch: EdgePropertyPatch, snapshot_id: SnapshotId
-    ) -> tuple[DatasetFile, DatasetFile]: ...
 
 
 class NativeStorageBackend:
@@ -46,9 +30,9 @@ class NativeStorageBackend:
     def __init__(
         self,
         *,
-        catalog: CatalogStore,
-        snapshot: SnapshotStore,
-        graph: NativeGraphStore,
+        catalog: CatalogRepository,
+        snapshot: SnapshotRepository,
+        graph: GraphRepository,
         filesystem: FileSystemAdapter | None = None,
     ) -> None:
         self._catalog = catalog

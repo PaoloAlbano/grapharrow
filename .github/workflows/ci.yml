@@ -112,7 +112,7 @@ jobs:
             python .github/release_metadata.py --build-version "$BUILD_VERSION"
           fi
           uv build --no-sources --out-dir dist
-          uv export --locked --no-dev --no-emit-project --extra cloud --output-file dist/runtime-requirements.txt
+          uv export --locked --no-dev --no-emit-project --extra cloud --extra delta --output-file dist/runtime-requirements.txt
           version="${BUILD_VERSION:-$(python .github/release_metadata.py --version)}"
           python .github/check_distribution.py dist --archives-only --expected-version "$version"
           python .github/release_metadata.py --checksums dist
@@ -194,8 +194,10 @@ jobs:
           BUILD_VERSION: ${{ inputs.build-version }}
         run: |
           version="${BUILD_VERSION:-$(python .github/release_metadata.py --version)}"
-          uv run --frozen --all-extras python .github/smoke_docker.py "grapharrow:check-$ARCH" \
-            --expected-version "$version"
+          for backend in native delta; do
+            uv run --frozen --all-extras python .github/smoke_docker.py "grapharrow:check-$ARCH" \
+              --storage-backend "$backend" --expected-version "$version"
+          done
       - name: Preserve the tested image for publication
         if: inputs.release-build
         env:

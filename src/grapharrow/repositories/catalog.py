@@ -11,7 +11,7 @@ from uuid import uuid4
 from grapharrow.adapters import FileSystemAdapter
 from grapharrow.adapters.writer import WriterCoordinator, writer_locked
 from grapharrow.core import DatabaseLayout
-from grapharrow.core.errors import CatalogError, WriteConflictError
+from grapharrow.core.errors import CatalogError, StorageError, WriteConflictError
 from grapharrow.domain import (
     CatalogVersion,
     LabelDefinition,
@@ -63,7 +63,7 @@ class CatalogRepository:
     def stage(self, catalog: VersionedCatalog) -> str:
         """Write an immutable candidate and return its database-relative path."""
         path = f"catalog/catalog-{catalog.version.value:06d}-{uuid4().hex}.json"
-        self._filesystem.write_json(self._absolute_path(path), self._serialize_catalog(catalog))
+        self._filesystem.write_json(self._absolute_path(path), serialize_catalog(catalog))
         return path
 
     def bootstrap_snapshot(self) -> SnapshotManifest:
@@ -73,6 +73,11 @@ class CatalogRepository:
             return self._snapshots.load_at(pointer)
         with self._writer.hold():
             if self._snapshots.try_load_current_pointer() is None:
+                if self._filesystem.exists(self._layout.delta_initial_commit_path):
+                    raise StorageError(
+                        "This database uses the Delta backend. "
+                        "Set GRAPHARROW_STORAGE_BACKEND=delta."
+                    )
                 catalog = VersionedCatalog.empty(version=CatalogVersion(1))
                 if self._filesystem.exists(self._layout.current_catalog_path):
                     catalog = self.load()
@@ -154,7 +159,7 @@ class CatalogRepository:
             payload = cast(dict[str, Any], self._filesystem.read_json(self._absolute_path(path)))
         except FileNotFoundError as exc:
             raise CatalogError(f"Catalog file does not exist: {path}") from exc
-        return self._deserialize_catalog(payload)
+        return deserialize_catalog(payload)
 
     def _snapshot_catalog_path(self, manifest: SnapshotManifest) -> str:
         return manifest.catalog_path or f"catalog/catalog-{manifest.catalog_version.value:06d}.json"
@@ -163,98 +168,101 @@ class CatalogRepository:
         root = self._layout.root
         return root / relative if isinstance(root, Path) else f"{root.rstrip('/')}/{relative}"
 
-    def _serialize_catalog(self, catalog: VersionedCatalog) -> dict[str, Any]:
-        """Handle this internal helper step for the surrounding public workflow."""
-        return {
-            "version": catalog.version.value,
-            "labels": [self._serialize_label(item) for item in catalog.labels],
-            "relationship_types": [
-                self._serialize_relationship_type(item) for item in catalog.relationship_types
-            ],
-            "properties": [asdict(item) for item in catalog.properties],
-            "constraints": [asdict(item) for item in catalog.constraints],
-            "indexes": [asdict(item) for item in catalog.indexes],
-        }
 
-    def _serialize_label(self, definition: LabelDefinition) -> dict[str, Any]:
-        """Handle this internal helper step for the surrounding public workflow."""
-        return {
-            "id": definition.id.value,
-            "name": definition.name,
-        }
+def serialize_catalog(catalog: VersionedCatalog) -> dict[str, Any]:
+    """Encode a catalog for either storage layout."""
+    return {
+        "version": catalog.version.value,
+        "labels": [_serialize_label(item) for item in catalog.labels],
+        "relationship_types": [
+            _serialize_relationship_type(item) for item in catalog.relationship_types
+        ],
+        "properties": [asdict(item) for item in catalog.properties],
+        "constraints": [asdict(item) for item in catalog.constraints],
+        "indexes": [asdict(item) for item in catalog.indexes],
+    }
 
-    def _serialize_relationship_type(
-        self,
-        definition: RelationshipTypeDefinition,
-    ) -> dict[str, Any]:
-        """Handle this internal helper step for the surrounding public workflow."""
-        return {
-            "id": definition.id.value,
-            "name": definition.name,
-        }
 
-    def _deserialize_catalog(self, payload: dict[str, Any]) -> VersionedCatalog:
-        """Handle this internal helper step for the surrounding public workflow."""
-        try:
-            version = CatalogVersion(int(payload["version"]))
-        except (KeyError, TypeError, ValueError) as exc:
-            raise CatalogError("Catalog payload is missing a valid version.") from exc
+def _serialize_label(definition: LabelDefinition) -> dict[str, Any]:
+    """Handle this internal helper step for the surrounding public workflow."""
+    return {
+        "id": definition.id.value,
+        "name": definition.name,
+    }
 
-        return VersionedCatalog(
-            version=version,
-            labels=tuple(
-                LabelDefinition(
-                    id=LabelId(int(item["id"])),
-                    name=str(item["name"]),
-                )
-                for item in payload.get("labels", [])
-            ),
-            relationship_types=tuple(
-                RelationshipTypeDefinition(
-                    id=RelationshipTypeId(int(item["id"])),
-                    name=str(item["name"]),
-                )
-                for item in payload.get("relationship_types", [])
-            ),
-            properties=tuple(
-                PropertyDefinition(
-                    name=str(item["name"]),
-                    owner_kind=cast(PropertyOwnerKind, item["owner_kind"]),
-                    owner_name=str(item["owner_name"]),
-                    data_type=str(item["data_type"]),
-                    nullable=bool(item.get("nullable", True)),
-                    deprecated=bool(item.get("deprecated", False)),
-                )
-                for item in payload.get("properties", [])
-            ),
-            constraints=tuple(
-                ConstraintDefinition(
-                    kind=cast(ConstraintKind, item["kind"]),
-                    owner_kind=cast(PropertyOwnerKind, item["owner_kind"]),
-                    owner_name=str(item["owner_name"]),
-                    property_name=item.get("property_name"),
-                    source_labels=tuple(str(label) for label in item.get("source_labels", [])),
-                    target_labels=tuple(str(label) for label in item.get("target_labels", [])),
-                )
-                for item in payload.get("constraints", [])
-            ),
-            indexes=tuple(
-                IndexDefinition(
-                    name=str(item["name"]),
-                    kind=cast(IndexKind, item["kind"]),
-                    owner_kind=cast(PropertyOwnerKind, item["owner_kind"]),
-                    owner_name=str(item["owner_name"]),
-                    property_names=tuple(
-                        str(property_name) for property_name in item.get("property_names", [])
-                    ),
-                    status=cast(IndexStatus, item.get("status", "declared")),
-                    backend=str(item.get("backend", "metadata")),
-                    case_sensitive=bool(item.get("case_sensitive", True)),
-                    options=dict(cast(dict[str, object], item.get("options", {}))),
-                )
-                for item in payload.get("indexes", [])
-            ),
-        )
+
+def _serialize_relationship_type(
+    definition: RelationshipTypeDefinition,
+) -> dict[str, Any]:
+    """Handle this internal helper step for the surrounding public workflow."""
+    return {
+        "id": definition.id.value,
+        "name": definition.name,
+    }
+
+
+def deserialize_catalog(payload: dict[str, Any]) -> VersionedCatalog:
+    """Read a versioned catalog from its persisted representation."""
+    try:
+        version = CatalogVersion(int(payload["version"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CatalogError("Catalog payload is missing a valid version.") from exc
+
+    return VersionedCatalog(
+        version=version,
+        labels=tuple(
+            LabelDefinition(
+                id=LabelId(int(item["id"])),
+                name=str(item["name"]),
+            )
+            for item in payload.get("labels", [])
+        ),
+        relationship_types=tuple(
+            RelationshipTypeDefinition(
+                id=RelationshipTypeId(int(item["id"])),
+                name=str(item["name"]),
+            )
+            for item in payload.get("relationship_types", [])
+        ),
+        properties=tuple(
+            PropertyDefinition(
+                name=str(item["name"]),
+                owner_kind=cast(PropertyOwnerKind, item["owner_kind"]),
+                owner_name=str(item["owner_name"]),
+                data_type=str(item["data_type"]),
+                nullable=bool(item.get("nullable", True)),
+                deprecated=bool(item.get("deprecated", False)),
+            )
+            for item in payload.get("properties", [])
+        ),
+        constraints=tuple(
+            ConstraintDefinition(
+                kind=cast(ConstraintKind, item["kind"]),
+                owner_kind=cast(PropertyOwnerKind, item["owner_kind"]),
+                owner_name=str(item["owner_name"]),
+                property_name=item.get("property_name"),
+                source_labels=tuple(str(label) for label in item.get("source_labels", [])),
+                target_labels=tuple(str(label) for label in item.get("target_labels", [])),
+            )
+            for item in payload.get("constraints", [])
+        ),
+        indexes=tuple(
+            IndexDefinition(
+                name=str(item["name"]),
+                kind=cast(IndexKind, item["kind"]),
+                owner_kind=cast(PropertyOwnerKind, item["owner_kind"]),
+                owner_name=str(item["owner_name"]),
+                property_names=tuple(
+                    str(property_name) for property_name in item.get("property_names", [])
+                ),
+                status=cast(IndexStatus, item.get("status", "declared")),
+                backend=str(item.get("backend", "metadata")),
+                case_sensitive=bool(item.get("case_sensitive", True)),
+                options=dict(cast(dict[str, object], item.get("options", {}))),
+            )
+            for item in payload.get("indexes", [])
+        ),
+    )
 
 
 __all__ = ["CatalogRepository"]

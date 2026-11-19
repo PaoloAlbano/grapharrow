@@ -21,7 +21,7 @@ class GraphArrowSettings(BaseSettings):
 
     environment: str = Field(default="development")
     database_path: str | Path | None = Field(default=None)
-    storage_backend: Literal["native"] = Field(default="native")
+    storage_backend: Literal["native", "delta"] = Field(default="native")
     verify_checksums_on_verify: bool = Field(default=False)
     server_host: str = Field(default="127.0.0.1")
     server_port: int = Field(default=8000)

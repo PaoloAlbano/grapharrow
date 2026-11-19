@@ -1,65 +1,85 @@
-# Storage Backend
+# Storage Backends
 
-A Storage Backend owns graph snapshot access, atomic publication and maintenance.
-The graph engine uses typed contracts for catalog, snapshot and graph stores.
-The current implementation is `NativeStorageBackend`.
+The Storage Backend controls how GraphArrow stores and publishes graph snapshots.
+Cypher, ANA, REST, Bolt, MCP, and the embedded API use the same graph engine and
+select the backend when the application starts.
 
-## Configuration
+| Backend | Graph storage | Writer deployment |
+| --- | --- | --- |
+| `native` (default) | Immutable Parquet files and a conditionally updated snapshot head | One writer instance and any number of readers |
+| `delta` (experimental) | One Delta Lake table per graph | Independent replicas can write through the same Delta transaction log |
 
-`GRAPHARROW_STORAGE_BACKEND` defaults to `native`. It is currently the only
-supported value. Other values fail settings validation before the application
-opens the database.
+The database path selects the physical storage. Use a filesystem path, an
+`s3://` URI, or an `az://` URI with Delta. Native also supports `gs://` URIs.
+Use the same backend and database URI on every replica. Start a Delta database at
+a new path. The Native and Delta formats require separate database roots.
+
+## Delta Lake setup
+
+The default runtime Docker image includes Delta support. For a source checkout,
+install the optional extra and select the backend:
 
 ```sh
-GRAPHARROW_STORAGE_BACKEND=native
-GRAPHARROW_DATABASE_PATH=/data/grapharrow
+GRAPHARROW_STORAGE_BACKEND=delta uv run --locked --extra delta grapharrow-server --path /data/delta-graph
 ```
 
-The database path identifies the physical storage location. For example,
-`s3://my-bucket/my-db` selects S3 access through the filesystem adapter while
-retaining the native backend. Credentials and endpoints remain provider settings.
-See [Dependencies and Installation](dependency-compatibility.md) and
-[Real Object Storage Testing](real-object-storage-testing.md).
+For a release wheel, install `pip install './grapharrow-<version>-py3-none-any.whl[delta]'`
+and set `GRAPHARROW_STORAGE_BACKEND=delta` in the environment of the server, Bolt
+process, CLI, or embedded client. Embedded clients can also pass
+`GraphArrowSettings(storage_backend="delta")` to `Database`.
 
-## Application construction
+Delta uses the delta-rs object store client. Set the S3 and Azure credentials
+with the [GraphArrow storage settings](../README.md#real-object-storage) or the
+credential environment variables supported by delta-rs. S3 needs atomic
+create-if-absent writes for `_delta_log` objects. GraphArrow selects the ETag
+conditional mode for S3-compatible storage.
 
-`build_application()` invokes `create_storage_backend()` once. The factory retains
-the supplied filesystem, Parquet and Arrow adapters. Its stores are shared by the
-engine, index operations and interface-facing repository view. The same writer
-coordinator governs catalog changes, graph commits and maintenance.
+## Atomicity and concurrency
 
-`StorageBackend` is a Python `Protocol`. Its contracts include:
+The table at `<database path>/delta` partitions canonical nodes, edges, graph
+metadata, and REST idempotency receipts. Every mutation replaces the metadata
+partition and any changed canonical partitions in a single log commit. A
+catalog-only change leaves the canonical partitions in place. Receipt keys are
+bucketed by hash prefix. A keyed REST write publishes its response in the same
+commit as its graph updates.
 
-- snapshot capture and catalog access;
-- canonical and property-table reads, filtered projections and batch iteration;
-- publication of complete graph changes;
-- an optional selective relationship-property edit, which can decline to the
-  complete transaction path;
-- initialization, verification, recovery, compaction, vacuum and retention previews.
+Readers capture one Delta version. Catalog, adjacency and property projections
+are resolved from that version, including after another replica commits. New
+readers can capture the next version. Keep ANA sessions on the replica that
+issued their session ID because handles live in the server process.
 
-The graph engine handles query execution and validation. The native backend owns
-its immutable object publication and selective range replacement. Native
-maintenance owns filesystem traversal and cleanup. Store implementations resolve
-their dataset references and select the applicable label and adjacency data.
+A writer publishes only against its captured base version. When two replicas
+write from the same base, one publishes and the other receives a write conflict.
+REST reports HTTP 409. Retry the whole operation in a new transaction. A retry
+with the same REST idempotency key and payload replays a committed response
+byte for byte. See [Transactions and Sessions](transactions.md).
 
-The application exposes the selected instance as `application.storage_backend`.
-`application.repositories` continues to refer to the same store instances.
+## Current Delta scope
 
-## Native behavior
+- Node or edge changes can rewrite the corresponding whole partition. Property
+  projections are rebuilt from canonical rows. This first version guarantees
+  atomicity and snapshot isolation with conservative conflicts, including for
+  writes to different parts of the graph.
+- `verify` checks the captured metadata and reads active Parquet data.
+  `compact` rewrites the active graph partitions as a new snapshot.
+  Historical reads remain available. `vacuum` and retention planning are
+  currently available only with Native. Use GraphArrow as the sole writer to
+  its table, including for maintenance.
+- Integration tests cover local disk and Moto S3. A separate local test also
+  verified Azure Blob behavior with Azurite 3.37. Tests against real S3 and
+  Azure accounts are pending.
 
-The extraction preserves the native manifest, catalog and Parquet layout. Existing
-databases reopen without conversion. Snapshot references, checksums, Arrow buffer
-reuse and caches retain their existing behavior; there is no additional backend
-metadata file in this refactor.
+## Native behavior and storage contracts
 
-Atomic commits still publish through the database head, and explicit transactions
-still stage until commit. Selective SET keeps its result-before-publication and
-conflict checks. See [Transactions and Sessions](transactions.md) for the interface
-contracts, and [Engine Performance](engine-performance.md) for selective updates.
+Native keeps its existing Parquet layout and snapshot history. It serializes
+writes through one writer instance and uses conditional head publication.
+Selective relationship property updates use immutable Parquet ranges. See
+[Engine Performance](engine-performance.md) for the selective path and
+[Dependencies and Installation](dependency-compatibility.md) for cloud extras.
 
-## Verification
-
-[Storage Backend contract tests](../tests/unit/test_storage_backends.py) check
-configuration, adapter and writer sharing, publication delegation, maintenance,
-format preservation and reopening. Existing persistence, concurrency, rollback,
-cache and interface tests exercise the native implementation through the factory.
+The application exposes the selected backend as `application.storage_backend`.
+Catalog, snapshot and graph contracts remain shared by the engine and public
+interfaces. Backend implementations resolve dataset references and handle
+publication and maintenance. [Concurrent Delta tests](../tests/integration/test_delta_backend.py)
+and the [interface comparison](../tests/integration/test_interface_comparison.py)
+verify these behaviors.

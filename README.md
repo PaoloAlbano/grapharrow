@@ -63,6 +63,11 @@ SDKs optional; the default Docker image includes them for all providers. SDKs ar
 imported only when their provider is used. See
 [Dependencies and Installation](docs/dependency-compatibility.md) for details.
 
+Native is the default Storage Backend. To run the experimental Delta Lake
+backend, use `--extra delta` with uv and set `GRAPHARROW_STORAGE_BACKEND=delta`.
+The runtime Docker image includes both backends. See
+[Storage Backends](docs/storage-backends.md) for setup and write-conflict behavior.
+
 ### Start authenticated HTTP and Bolt servers
 
 First follow [Prepare a local configuration](docs/server-configuration.md#prepare-a-local-configuration)
@@ -378,8 +383,9 @@ The most relevant environment variables are:
   - `GRAPHARROW_AZURE_DFS_STORAGE_AUTHORITY`
   - `GRAPHARROW_AZURE_DFS_STORAGE_SCHEME`
 
-If these are not set, GraphArrow falls back to the default credential resolution provided by
-`pyarrow.fs` and the underlying cloud provider environment.
+Without explicit settings, Native uses the default provider credentials from
+`pyarrow.fs` and the provider SDKs. Delta uses the delta-rs object store client.
+See [Storage Backends](docs/storage-backends.md) for Delta setup.
 
 ## Docker
 

@@ -18,6 +18,15 @@ def create_storage_backend(
     tabular_adapter: PyArrowTabularAdapter,
 ) -> StorageBackend:
     """Build only the requested implementation and retain the supplied I/O adapters."""
+    if settings.storage_backend == "delta":
+        try:
+            from grapharrow.storage.delta import DeltaStorageBackend
+        except ModuleNotFoundError as exc:
+            if exc.name != "deltalake":
+                raise
+            raise StorageError("Install grapharrow[delta] to use the Delta backend.") from exc
+        return DeltaStorageBackend(layout=layout, settings=settings)
+
     if settings.storage_backend != "native":
         raise StorageError(f"Unsupported Storage Backend: {settings.storage_backend}")
 

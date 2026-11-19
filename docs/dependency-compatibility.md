@@ -76,26 +76,24 @@ load them. To build an image with only one provider SDK from the checkout:
 docker build --build-arg STORAGE_EXTRA=s3 -t grapharrow:s3 .
 ```
 
-Use `azure`, `gcs`, or `cloud` for the other extras. `STORAGE_EXTRA` defaults to
-`cloud`; set it to an empty value for a local-only image. The source-build option
-above regenerates locked requirements with the selected extra. Release builds
-export `runtime-requirements.txt` with `--extra cloud`; the prebuilt image path
-uses those supplied requirements. Installing the wheel without extras keeps
-cloud SDKs optional regardless of the Docker configuration.
+`STORAGE_EXTRA` accepts a space-separated list and defaults to `cloud delta`.
+An empty value builds an image with only Native and local storage dependencies.
+The source-build option above regenerates locked requirements with the selected
+extras. Release builds export `runtime-requirements.txt` with `--extra cloud --extra delta`
+for the prebuilt image. Wheel installations select cloud SDKs and Delta separately.
 Development environments using Moto also install boto3 as an emulator dependency;
 that does not make it a dependency of the base GraphArrow package.
 
 ## Storage Backend
 
 A **Storage Backend** defines how GraphArrow reads and writes graph snapshots,
-publishes atomic commits, and performs compaction and vacuum. GraphArrow's current
-Storage Backend is `native`: immutable Parquet files, snapshot manifests, and a
-conditionally updated database head.
+publishes atomic commits, and performs maintenance. `native` is the default.
+`delta` uses a Delta Lake transaction log for independent reader and writer processes.
 
 Filesystem paths, S3, Azure Blob Storage, and Google Cloud Storage identify the
 physical storage location. Filesystem adapters provide access to those locations.
 Cypher, ANA, REST, Bolt, and the embedded API use the graph engine above this layer.
-See [Storage Backend](storage-backends.md) for the native factory and contracts.
+See [Storage Backends](storage-backends.md) for backend selection and guarantees.
 
 ## Storage compatibility
 

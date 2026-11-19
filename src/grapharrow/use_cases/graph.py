@@ -31,8 +31,11 @@ from grapharrow.domain import (
 from grapharrow.domain.scan import ScanPredicate
 from grapharrow.domain.snapshot import IdempotencyReceipt
 from grapharrow.repositories import (
+    CatalogRepository,
     EdgeRecord,
+    GraphRepository,
     NodeRecord,
+    SnapshotRepository,
 )
 from grapharrow.repositories.graph import EDGE_SCHEMA, _edges_table, _nodes_table
 from grapharrow.storage.contracts import CatalogStore, GraphStore, SnapshotStore, StorageBackend
@@ -88,12 +91,12 @@ class GraphStateUseCase:
         self._snapshot_store = snapshot_store
         self._graph_store = graph_store
         if storage_backend is None:
-            from grapharrow.storage.native import NativeGraphStore, NativeStorageBackend
+            from grapharrow.storage.native import NativeStorageBackend
 
             storage_backend = NativeStorageBackend(
-                catalog=catalog_store,
-                snapshot=snapshot_store,
-                graph=cast(NativeGraphStore, graph_store),
+                catalog=cast(CatalogRepository, catalog_store),
+                snapshot=cast(SnapshotRepository, snapshot_store),
+                graph=cast(GraphRepository, graph_store),
             )
         elif not (
             storage_backend.catalog is catalog_store

@@ -1,5 +1,7 @@
 """Compare graph results and snapshot visibility across the public interfaces."""
 
+from __future__ import annotations
+
 import json
 import os
 import subprocess
@@ -24,21 +26,28 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.fixture(scope="session")
-def comparison_report() -> Any:
+def comparison_reports() -> Any:
     report: dict[str, Any] = {
         "query_interfaces": ["embedded", "rest", "bolt", "mcp", "ana"],
         "cases": {},
+        "delta_cases": {},
     }
-    yield report["cases"]
+    yield report
     if destination := os.environ.get("GRAPHARROW_INTERFACE_COMPARISON_REPORT"):
         path = Path(destination)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(report, indent=2) + "\n")
 
 
+@pytest.fixture
+def comparison_report(interfaces: Interfaces, comparison_reports: Any) -> Any:
+    return comparison_reports["delta_cases" if interfaces.backend == "delta" else "cases"]
+
+
 @dataclass
 class Interfaces:
     path: Path
+    backend: str
     embedded: Database
     rest: TestClient
     bolt: Any
@@ -125,8 +134,14 @@ class Interfaces:
             raise AssertionError(interface)
 
 
-@pytest.fixture
-def interfaces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+@pytest.fixture(params=["native", "delta"])
+def interfaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> Any:
+    backend = request.param
+    if backend == "delta":
+        pytest.importorskip("deltalake")
+    monkeypatch.setenv("GRAPHARROW_STORAGE_BACKEND", backend)
     path = tmp_path / "db"
     embedded = Database(path)
     with embedded.write_transaction() as session:
@@ -164,7 +179,9 @@ def interfaces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
         with GraphDatabase.driver(
             f"bolt://127.0.0.1:{server.port}", auth=("neo4j", "bolt-secret")
         ) as driver:
-            yield Interfaces(path, embedded, client, driver, create_mcp_cypher_interface(path))
+            yield Interfaces(
+                path, backend, embedded, client, driver, create_mcp_cypher_interface(path)
+            )
     assert app.state.ana_resource_budget.used_bytes == 0
 
 

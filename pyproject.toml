@@ -28,6 +28,7 @@ dependencies = [
 s3 = ["boto3>=1.37"]
 azure = ["azure-identity>=1.19", "azure-storage-blob>=12.24"]
 gcs = ["google-cloud-storage>=3.0"]
+delta = ["deltalake>=1.6.6,<2"]
 cloud = [
   "azure-identity>=1.19",
   "azure-storage-blob>=12.24",

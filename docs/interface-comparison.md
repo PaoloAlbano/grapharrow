@@ -50,11 +50,12 @@ This writes the actual rows, expected values and per-case outcomes to
 
 ```bash
 GRAPHARROW_INTERFACE_COMPARISON_REPORT=/tmp/comparison.json \
-  uv run pytest -v tests/integration/test_interface_comparison.py \
+  uv run --extra delta pytest -v tests/integration/test_interface_comparison.py \
   --junitxml=/tmp/comparison.xml
 ```
 
-The suite requires local loopback sockets and standard development dependencies.
+The suite runs against Native and Delta and reports their results separately.
+It requires local loopback sockets and standard development dependencies.
 It uses a fresh temporary database, test-only credentials and no cloud account,
 Neo4j database service or model endpoint. The ordinary CI test matrix includes
 these cases. The separate [ANA reference suite](ana-interface.md#validation)

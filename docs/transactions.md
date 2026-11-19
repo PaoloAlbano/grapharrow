@@ -54,11 +54,15 @@ log, and an uncommitted transaction is not recovered after a process crash.
 
 ## Atomic Publication
 
-Each commit prepares immutable Parquet files, a catalog version when needed,
+On Native, each commit prepares immutable Parquet files, a catalog version when needed,
 and a manifest that names the complete snapshot. A single update to
 `current_snapshot.json` makes the commit visible. Catalog-only changes and
 compaction publish through the same pointer. Each attempt uses unique object
 names, so another writer cannot overwrite the winner's files.
+
+On Delta, one table log commit publishes graph mutations, catalog updates, and
+REST receipts. Independent writer processes can share that log. Each commit
+requires its original base version. See [Storage Backends](storage-backends.md).
 
 Readers capture the head once per operation. Graph records, catalog and
 derived indexes come from the same manifest. ANA keeps that snapshot for the
@@ -76,7 +80,7 @@ and the temporary pointer before replacing the head with an atomic rename.
 It also flushes their directories on platforms that support directory
 `fsync`. The filesystem must support advisory locks and atomic rename.
 
-On object storage, S3 and Azure Blob compare the head's ETag before replacing
+With Native on object storage, S3 and Azure Blob compare the head's ETag before replacing
 it. Google Cloud Storage compares the object generation. Bootstrap uses a
 conditional create. All replicas must use the same bucket or container and
 database prefix.
@@ -98,14 +102,15 @@ explicit transaction. The embedded API raises `WriteConflictError`.
 [Neo4j status-code reference](https://neo4j.com/docs/status-codes/current/errors/all-errors/)
 
 If the storage provider may have accepted the update before the response was
-lost, GraphArrow checks the published ancestry for that commit. When the
+lost, GraphArrow checks the published ancestry on Native or the exact Delta log
+version for that commit. When the
 result remains ambiguous, it raises `CommitOutcomeUnknownError`. REST
 returns HTTP 500 with `COMMIT_OUTCOME_UNKNOWN`. For a write without an
 idempotency key, verify the outcome before retrying.
 
 ## Retrying REST Cypher Writes
 
-On the Native backend, send `Idempotency-Key` with a Cypher data write to
+Send `Idempotency-Key` with a Cypher data write to
 `POST /v1/query`. Choose a unique key for each intended write and reuse it
 with the same statement text and JSON parameter values on every attempt.
 Keys contain 1–128 printable ASCII characters without spaces and are scoped
@@ -127,6 +132,7 @@ publishes the index root together with the snapshot. An indexed lookup reads at
 most one index root and one shard before reading the receipt manifest. A keyed
 commit replaces the root and the affected shard. When opening an older head
 without an index, the first new keyed commit builds one from published history.
+Delta stores receipts in partitions keyed by that same hash prefix.
 Keyed writes use the transaction path so GraphArrow can prepare the response
 before publication. Successful keys and their responses are retained for the
 lifetime of the database.

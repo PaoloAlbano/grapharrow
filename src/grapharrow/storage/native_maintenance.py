@@ -17,7 +17,7 @@ from grapharrow.domain import (
     SnapshotManifest,
     VersionedCatalog,
 )
-from grapharrow.storage.contracts import CatalogStore, GraphStore, SnapshotStore
+from grapharrow.repositories import CatalogRepository, GraphRepository, SnapshotRepository
 from grapharrow.storage.models import (
     InitializationResult,
     RecoveryReport,
@@ -34,9 +34,9 @@ class NativeStorageMaintenance:
         self,
         *,
         layout: DatabaseLayout,
-        catalog_store: CatalogStore,
-        snapshot_store: SnapshotStore,
-        graph_store: GraphStore,
+        catalog_store: CatalogRepository,
+        snapshot_store: SnapshotRepository,
+        graph_store: GraphRepository,
         filesystem: FileSystemAdapter | None = None,
     ) -> None:
         """Wire the storage collaborators used by bootstrap, verification, and maintenance flows."""

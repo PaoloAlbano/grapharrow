@@ -45,6 +45,14 @@ class DatabaseLayout:
         return self._join("catalog")
 
     @property
+    def delta_dir(self) -> Location:
+        return self._join("delta")
+
+    @property
+    def delta_initial_commit_path(self) -> Location:
+        return self._join("delta", "_delta_log", "00000000000000000000.json")
+
+    @property
     def manifests_dir(self) -> Location:
         return self._join("manifests")
 

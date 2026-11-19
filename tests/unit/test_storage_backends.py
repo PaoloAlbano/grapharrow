@@ -1,6 +1,7 @@
 """The native Storage Backend preserves the existing engine and persistence contract."""
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -58,7 +59,19 @@ def test_settings_select_native_from_the_environment(
     assert build_application(tmp_path).storage_backend.name == "native"
 
 
-@pytest.mark.parametrize("name", ["delta", "iceberg", "unknown"])
+def test_delta_dependency_is_only_required_for_delta(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setitem(sys.modules, "deltalake", None)
+    monkeypatch.delitem(sys.modules, "grapharrow.storage.delta", raising=False)
+    app = build_application(tmp_path, settings=GraphArrowSettings(storage_backend="native"))
+    assert app.storage_backend.name == "native"
+    with pytest.raises(StorageError, match=r"Install grapharrow\[delta\]"):
+        build_application(tmp_path, settings=GraphArrowSettings(storage_backend="delta"))
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("name", ["iceberg", "unknown"])
 def test_unavailable_backends_are_rejected_without_initializing_a_database(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
 ) -> None:

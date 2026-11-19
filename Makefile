@@ -90,7 +90,7 @@ test:
 	$(UV) run pytest
 
 test-interface-comparison:
-	GRAPHARROW_INTERFACE_COMPARISON_REPORT=/tmp/grapharrow-interface-comparison.json $(UV) run pytest -v tests/integration/test_interface_comparison.py --junitxml=/tmp/grapharrow-interface-comparison.xml
+	GRAPHARROW_INTERFACE_COMPARISON_REPORT=/tmp/grapharrow-interface-comparison.json $(UV) run --extra delta pytest -v tests/integration/test_interface_comparison.py --junitxml=/tmp/grapharrow-interface-comparison.xml
 
 test-unit:
 	$(UV) run pytest tests/unit

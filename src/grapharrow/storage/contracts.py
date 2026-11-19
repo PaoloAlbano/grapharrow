@@ -28,7 +28,6 @@ from grapharrow.domain.scan import ScanPredicate
 from grapharrow.domain.snapshot import IdempotencyReceipt
 from grapharrow.storage.models import (
     InitializationResult,
-    PersistedGraph,
     RecoveryReport,
     RetentionPlan,
     VerificationReport,
@@ -46,8 +45,6 @@ class CatalogStore(Protocol):
 
     @property
     def layout(self) -> DatabaseLayout: ...
-
-    def stage(self, catalog: VersionedCatalog) -> str: ...
 
     def bootstrap_snapshot(self) -> SnapshotManifest: ...
 
@@ -81,8 +78,6 @@ class SnapshotStore(Protocol):
         self, pointer: CurrentSnapshotPointer | None = None
     ) -> Iterator[tuple[str, SnapshotManifest]]: ...
 
-    def retained_paths(self, pointer: CurrentSnapshotPointer) -> Iterator[str]: ...
-
     def idempotency_base(
         self, pointer: CurrentSnapshotPointer, key_hash: str
     ) -> tuple[SnapshotManifest, IdempotencyReceipt | None]: ...
@@ -92,8 +87,6 @@ class SnapshotStore(Protocol):
     def load_current_pointer(self) -> CurrentSnapshotPointer: ...
 
     def try_load_current_pointer(self) -> CurrentSnapshotPointer | None: ...
-
-    def validate_manifest(self, manifest: SnapshotManifest) -> None: ...
 
 
 class GraphStore(Protocol):
@@ -172,19 +165,6 @@ class GraphStore(Protocol):
     def node_records_from_table(self, table: pa.Table) -> list[NodeRecord]: ...
 
     def edge_records_from_table(self, table: pa.Table) -> list[EdgeRecord]: ...
-
-    def persist_snapshot(
-        self,
-        *,
-        snapshot_id: SnapshotId,
-        nodes: list[NodeRecord],
-        edges: list[EdgeRecord],
-        previous_snapshot: SnapshotManifest | None = None,
-        previous_nodes: tuple[NodeRecord, ...] | None = None,
-        previous_edges: tuple[EdgeRecord, ...] | None = None,
-        previous_edge_table: pa.Table | None = None,
-        edge_table: pa.Table | None = None,
-    ) -> PersistedGraph: ...
 
 
 class StorageMaintenance(Protocol):

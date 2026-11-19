@@ -44,6 +44,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image")
     parser.add_argument("--expected-version", default=version("grapharrow"))
+    parser.add_argument("--storage-backend", choices=("native", "delta"), default="native")
     args = parser.parse_args()
     expected = args.expected_version
     installed = docker(
@@ -56,12 +57,12 @@ def main() -> None:
         "from importlib.metadata import version; from importlib.util import find_spec; "
         "import sys, tempfile; "
         "[version(name) for name in ('boto3', 'azure-identity', 'azure-storage-blob', "
-        "'google-cloud-storage')]; "
+        "'google-cloud-storage', 'deltalake')]; "
         "from grapharrow.app import build_application; "
         "app = build_application(tempfile.mkdtemp()); "
         "app.use_cases.cypher.execute('CREATE (:Local {value:1})'); "
         "sdk_modules = ('boto3', 'botocore', 'azure.identity', 'azure.storage.blob', "
-        "'google.cloud.storage'); "
+        "'google.cloud.storage', 'deltalake'); "
         "assert not [name for name in sys.modules if any("
         "name == sdk or name.startswith(sdk + '.') for sdk in sdk_modules)]; "
         "assert find_spec('agent_native_graph') is None; assert find_spec('neo4j') is None; "
@@ -83,6 +84,7 @@ def main() -> None:
             environment.write_text(
                 f"GRAPHARROW_SERVER_AUTH_TOKEN={rest_key}\n"
                 f"GRAPHARROW_BOLT_AUTH_TOKEN={bolt_key}\n"
+                f"GRAPHARROW_STORAGE_BACKEND={args.storage_backend}\n"
                 "ANA_AUTH_FILE=/run/grapharrow/clients.json\n"
             )
             environment.chmod(0o600)

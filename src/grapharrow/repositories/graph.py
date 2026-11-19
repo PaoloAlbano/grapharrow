@@ -57,6 +57,58 @@ _EDGE_RANGE_PATH = re.compile(
 _DEFAULT_EDGE_RANGE_SIZE = 32_768
 
 
+def node_records_from_table(table: pa.Table) -> list[NodeRecord]:
+    """Convert a node Arrow table into canonical ``NodeRecord`` objects."""
+
+    node_ids = table["node_id"].to_pylist()
+    labels_values = table["labels"].to_pylist()
+    properties_values = table["properties_json"].to_pylist()
+    records: list[NodeRecord] = []
+    for node_id, labels, properties_json in zip(
+        node_ids,
+        labels_values,
+        properties_values,
+        strict=True,
+    ):
+        records.append(
+            NodeRecord(
+                node_id=int(node_id),
+                labels=tuple(labels or []),
+                properties=property_codec.loads(properties_json),
+            )
+        )
+    return records
+
+
+def edge_records_from_table(table: pa.Table) -> list[EdgeRecord]:
+    """Convert an edge Arrow table into canonical ``EdgeRecord`` objects."""
+
+    edge_ids = table["edge_id"].to_pylist()
+    rel_types = table["rel_type"].to_pylist()
+    src_ids = table["src_id"].to_pylist()
+    dst_ids = table["dst_id"].to_pylist()
+    properties_values = table["properties_json"].to_pylist()
+    records: list[EdgeRecord] = []
+    for edge_id, rel_type, src_id, dst_id, properties_json in zip(
+        edge_ids,
+        rel_types,
+        src_ids,
+        dst_ids,
+        properties_values,
+        strict=True,
+    ):
+        records.append(
+            EdgeRecord(
+                edge_id=int(edge_id),
+                rel_type=str(rel_type),
+                src_id=int(src_id),
+                dst_id=int(dst_id),
+                properties=property_codec.loads(properties_json),
+            )
+        )
+    return records
+
+
 class GraphRepository:
     """Persist and load graph records from Parquet files."""
 
@@ -327,55 +379,8 @@ class GraphRepository:
 
         return self.edge_records_from_table(self.load_edge_table(files))
 
-    def node_records_from_table(self, table: pa.Table) -> list[NodeRecord]:
-        """Convert a node Arrow table into canonical ``NodeRecord`` objects."""
-
-        node_ids = table["node_id"].to_pylist()
-        labels_values = table["labels"].to_pylist()
-        properties_values = table["properties_json"].to_pylist()
-        records: list[NodeRecord] = []
-        for node_id, labels, properties_json in zip(
-            node_ids,
-            labels_values,
-            properties_values,
-            strict=True,
-        ):
-            records.append(
-                NodeRecord(
-                    node_id=int(node_id),
-                    labels=tuple(labels or []),
-                    properties=property_codec.loads(properties_json),
-                )
-            )
-        return records
-
-    def edge_records_from_table(self, table: pa.Table) -> list[EdgeRecord]:
-        """Convert an edge Arrow table into canonical ``EdgeRecord`` objects."""
-
-        edge_ids = table["edge_id"].to_pylist()
-        rel_types = table["rel_type"].to_pylist()
-        src_ids = table["src_id"].to_pylist()
-        dst_ids = table["dst_id"].to_pylist()
-        properties_values = table["properties_json"].to_pylist()
-        records: list[EdgeRecord] = []
-        for edge_id, rel_type, src_id, dst_id, properties_json in zip(
-            edge_ids,
-            rel_types,
-            src_ids,
-            dst_ids,
-            properties_values,
-            strict=True,
-        ):
-            records.append(
-                EdgeRecord(
-                    edge_id=int(edge_id),
-                    rel_type=str(rel_type),
-                    src_id=int(src_id),
-                    dst_id=int(dst_id),
-                    properties=property_codec.loads(properties_json),
-                )
-            )
-        return records
+    node_records_from_table = staticmethod(node_records_from_table)
+    edge_records_from_table = staticmethod(edge_records_from_table)
 
     def persist_snapshot(
         self,

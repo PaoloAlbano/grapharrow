@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 from grapharrow.adapters import FileSystemAdapter
 from grapharrow.core import DatabaseLayout
 from grapharrow.domain import SnapshotManifest
+from grapharrow.repositories import CatalogRepository, GraphRepository, SnapshotRepository
 from grapharrow.storage.contracts import CatalogStore, GraphStore, SnapshotStore, StorageBackend
 from grapharrow.storage.models import InitializationResult as InitializationResult
 from grapharrow.storage.models import RecoveryReport as RecoveryReport
@@ -44,9 +47,9 @@ class DatabaseAdminUseCase:
 
             self._maintenance = NativeStorageMaintenance(
                 layout=layout,
-                catalog_store=catalog_store,
-                snapshot_store=snapshot_store,
-                graph_store=graph_store,
+                catalog_store=cast(CatalogRepository, catalog_store),
+                snapshot_store=cast(SnapshotRepository, snapshot_store),
+                graph_store=cast(GraphRepository, graph_store),
                 filesystem=filesystem,
             )
 

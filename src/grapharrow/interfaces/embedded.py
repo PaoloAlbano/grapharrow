@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Literal
 
 from grapharrow.adapters import FileSystemAdapter
 from grapharrow.app import GraphArrowApplication, build_application
+from grapharrow.config import GraphArrowSettings
 from grapharrow.core import DatabaseLayout
 from grapharrow.core.errors import TransactionError
 from grapharrow.domain import (
@@ -216,12 +217,14 @@ class Database:
         path: str | Path,
         *,
         filesystem: FileSystemAdapter | None = None,
+        settings: GraphArrowSettings | None = None,
     ) -> None:
         """Build the embedded application container for one local or object-store database."""
         self._path = path
         self._app: GraphArrowApplication = build_application(
             self._path,
             filesystem=filesystem,
+            settings=settings,
         )
 
     @property
