@@ -12,8 +12,15 @@ uv sync --locked
 make lint
 make format-check
 make typecheck
-uv run pytest -m "not live_storage"
+make test
 ```
+
+The ordinary CI suite, coverage, and the standard Make test targets use
+`pytest-xdist` to select workers from the available CPU cores. Use
+`make test TEST_WORKERS=4` to set the worker count or `TEST_WORKERS=0` to
+run serially. Make runs serially when a shared Neo4j reference database or
+interface comparison report is configured. CI runs its Neo4j reference suite
+in a dedicated serial job.
 
 ANA is included in the standard installation and uses GraphArrow's own runtime,
 tool schemas and descriptions. No reference ANA package or adjacent checkout is

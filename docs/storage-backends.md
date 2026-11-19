@@ -43,6 +43,17 @@ catalog-only change leaves the canonical partitions in place. Receipt keys are
 bucketed by hash prefix. A keyed REST write publishes its response in the same
 commit as its graph updates.
 
+New Delta databases partition edges into ranges of 8,192 IDs by default.
+A compatible autocommit `SET` by edge ID reads and replaces only the affected
+edge range and publishes the result with the graph metadata. The full graph
+write path also reuses unchanged edge range files. Property projections are
+derived from the graph version selected by each reader.
+
+`GRAPHARROW_EDGE_PARQUET_RANGE_SIZE` overrides the range width at database
+creation or explicit compaction. Set it to `0` for a single edge partition.
+The chosen width is stored with the graph. Compaction converts earlier Delta
+databases with one edge partition to ID ranges and preserves historical reads.
+
 Readers capture one Delta version. Catalog, adjacency and property projections
 are resolved from that version, including after another replica commits. New
 readers can capture the next version. Keep ANA sessions on the replica that
@@ -61,10 +72,9 @@ byte for byte. See [Transactions and Sessions](transactions.md).
 
 ## Current Delta scope
 
-- Node or edge changes can rewrite the corresponding whole partition. Property
-  projections are rebuilt from canonical rows. This first version guarantees
-  atomicity and snapshot isolation with conservative conflicts, including for
-  writes to different parts of the graph.
+- Node changes can rewrite the full node partition. Edge changes can rewrite
+  the affected ID ranges. Publication still checks the shared graph version,
+  so writes to different ranges can conflict.
 - `verify` checks the captured metadata and reads active Parquet data.
   `compact` rewrites the active graph partitions as a new snapshot.
   Historical reads remain available. `vacuum` and retention planning are

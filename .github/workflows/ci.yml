@@ -87,7 +87,9 @@ jobs:
           enable-cache: true
       - run: uv sync --locked --all-extras --python ${{ matrix.python-version }}
       - name: Test local backends and interfaces
-        run: uv run --frozen --all-extras pytest -m "not live_storage and not neo4j_reference"
+        run: >-
+          uv run --frozen --all-extras pytest -n auto
+          -m "not live_storage and not neo4j_reference"
 
   distributions:
     name: Build wheel and source distribution

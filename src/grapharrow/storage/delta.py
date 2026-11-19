@@ -6,7 +6,7 @@ from collections import Counter
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock, RLock
@@ -16,6 +16,7 @@ from uuid import uuid4
 
 import orjson
 import pyarrow as pa  # type: ignore[import-untyped]
+import pyarrow.compute as pc  # type: ignore[import-untyped]
 import pyarrow.dataset as ds  # type: ignore[import-untyped]
 import pyarrow.fs as pafs  # type: ignore[import-untyped]
 from deltalake import DeltaTable, write_deltalake
@@ -43,7 +44,14 @@ from grapharrow.domain import (
 from grapharrow.domain.records import EdgeRecord, NodeRecord
 from grapharrow.domain.snapshot import IdempotencyReceipt
 from grapharrow.repositories.catalog import deserialize_catalog, serialize_catalog
-from grapharrow.repositories.graph import EDGE_SCHEMA, NODE_SCHEMA, _edges_table, _nodes_table
+from grapharrow.repositories.graph import (
+    EDGE_SCHEMA,
+    NODE_SCHEMA,
+    _edge_ranges,
+    _edges_table,
+    _nodes_table,
+    _replace_row,
+)
 from grapharrow.storage.contracts import CatalogStore, GraphStore, SnapshotStore, StorageMaintenance
 from grapharrow.storage.delta_graph import DeltaGraphStore, dataset_ref
 from grapharrow.storage.models import (
@@ -56,7 +64,11 @@ from grapharrow.storage.models import (
 if TYPE_CHECKING:
     from grapharrow.use_cases.graph import GraphState
 
-_FORMAT = "grapharrow-delta-v1"
+_LEGACY_FORMAT = "grapharrow-delta-v1"
+_FORMAT = "grapharrow-delta-v2"
+_DEFAULT_EDGE_RANGE_SIZE = 8192
+# The string interval contains exactly the partition names with the 'edges-' prefix.
+_EDGE_PARTITION_PREDICATE = "kind = 'edges' OR (kind >= 'edges-' AND kind < 'edges.')"
 _SCHEMA = pa.schema(
     [
         ("kind", pa.string()),
@@ -94,6 +106,7 @@ class _Head:
     labels: dict[str, int]
     relationships: dict[str, int]
     receipt: IdempotencyReceipt | None
+    edge_range_size: int | None = None
 
     def manifest(self, snapshot_id: SnapshotId, version: CatalogVersion) -> SnapshotManifest:
         return SnapshotManifest(
@@ -136,6 +149,7 @@ class _ReadVersion:
     table: DeltaTable
     manifest: SnapshotManifest
     catalog: VersionedCatalog
+    head: _Head
 
 
 class DeltaStorageBackend:
@@ -152,6 +166,7 @@ class DeltaStorageBackend:
         self._uri = str(layout.delta_dir)
         self._options = _storage_options(layout.root, settings)
         self._writer = _DeltaWriter()
+        self._edge_range_size = settings.edge_parquet_range_size
         snapshot_tables = (
             snapshot_tables
             if snapshot_tables is not None
@@ -236,7 +251,7 @@ class DeltaStorageBackend:
             if cached is not None and cached.manifest.snapshot_id == snapshot_id:
                 return cached
             head, catalog = _metadata(table)
-            entry = _ReadVersion(table, head.manifest(snapshot_id, catalog.version), catalog)
+            entry = _ReadVersion(table, head.manifest(snapshot_id, catalog.version), catalog, head)
             if self._retain_read_version and (
                 cached is None or cached.manifest.snapshot_id.value < snapshot_id.value
             ):
@@ -256,7 +271,7 @@ class DeltaStorageBackend:
                 return self._describe_read_version(table).manifest
             self._check_native_layout()
             catalog = VersionedCatalog.empty(version=CatalogVersion(1))
-            head = _new_head(0, 0, {}, {}, None)
+            head = _new_head(0, 0, {}, {}, None, self._compaction_range_size(None))
             data = _metadata_table(head, catalog)
             try:
                 write_deltalake(
@@ -356,7 +371,12 @@ class DeltaStorageBackend:
                 return f"delta/{current.snapshot_id.value}/catalog"
             raise WriteConflictError("Catalog changed. Reload it before writing a new version.")
         candidate = _new_head(
-            head.node_count, head.edge_count, head.labels, head.relationships, None
+            head.node_count,
+            head.edge_count,
+            head.labels,
+            head.relationships,
+            None,
+            head.edge_range_size,
         )
         snapshot = self._commit(table, candidate, catalog, {})
         return f"delta/{snapshot.snapshot_id.value}/catalog"
@@ -393,6 +413,9 @@ class DeltaStorageBackend:
         from grapharrow.use_cases.graph import GraphState
 
         base = self._require_table(previous_state.snapshot.snapshot_id)
+        previous_head = self._describe_read_version(
+            self._read_table(previous_state.snapshot.snapshot_id)
+        ).head
         partitions: dict[str, pa.Table] = {}
         node_records = tuple(nodes)
         edge_records = tuple(edges)
@@ -402,7 +425,11 @@ class DeltaStorageBackend:
             partitions["nodes"] = node_table
         if edge_records != previous_state.edges:
             edge_table = edge_table if edge_table is not None else _edges_table(edges)
-            partitions["edges"] = edge_table
+            partitions.update(
+                _changed_edge_partitions(
+                    edge_table, previous_state.edge_table, previous_head.edge_range_size
+                )
+            )
         else:
             edge_table = previous_state.edge_table
         if idempotency_receipt is not None:
@@ -420,6 +447,7 @@ class DeltaStorageBackend:
             dict(Counter(label for node in nodes for label in set(node.labels))),
             dict(Counter(edge.rel_type for edge in edges)),
             idempotency_receipt,
+            previous_head.edge_range_size,
         )
         manifest = self._commit(base, head, catalog, partitions)
         return GraphState(catalog, manifest, node_table, edge_table, node_records, edge_records)
@@ -430,6 +458,8 @@ class DeltaStorageBackend:
         head: _Head,
         catalog: VersionedCatalog,
         partitions: dict[str, pa.Table],
+        *,
+        replace_all_edges: bool = False,
     ) -> SnapshotManifest:
         snapshot_id = SnapshotId(base.version() + 2)
         data = pa.concat_tables(
@@ -438,7 +468,14 @@ class DeltaStorageBackend:
                 *(_rows(part, kind) for kind, part in partitions.items()),
             ]
         )
-        kinds = ", ".join(f"'{kind}'" for kind in ("metadata", *partitions))
+        kinds = ", ".join(
+            f"'{kind}'"
+            for kind in ("metadata", *partitions)
+            if (not replace_all_edges or not kind.startswith("edges"))
+        )
+        predicate = f"kind IN ({kinds})"
+        if replace_all_edges:
+            predicate += f" OR ({_EDGE_PARTITION_PREDICATE})"
         try:
             # The Python writer reloads the table URI when passed a string. Pass the
             # pinned table, and disallow rebasing a graph mutation on a newer version.
@@ -446,7 +483,7 @@ class DeltaStorageBackend:
                 base,
                 data,
                 mode="overwrite",
-                predicate=f"kind IN ({kinds})",
+                predicate=predicate,
                 commit_properties=CommitProperties(max_commit_retries=0),
             )
         except (DeltaError, OSError) as exc:
@@ -472,7 +509,48 @@ class DeltaStorageBackend:
     def edit_edge_properties_by_id(
         self, *, edge_id: int, rel_type: str | None, properties: dict[str, object]
     ) -> Generator[tuple[EdgeRecord | None] | None, None, None]:
-        yield None
+        """Replace one canonical range after the caller builds its result successfully."""
+        with self._writer.hold():
+            snapshot = self.capture_snapshot()
+            current = self._describe_read_version(self._read_table(snapshot.snapshot_id))
+            width = current.head.edge_range_size
+            if not width or current.catalog.constraints:
+                yield None
+                return
+            kind = _edge_partition((edge_id - 1) // width)
+            table = _partition(current.table, kind, EDGE_SCHEMA.names).cast(EDGE_SCHEMA)
+            positions = pc.indices_nonzero(pc.equal(table["edge_id"], edge_id))
+            if not len(positions):
+                yield (None,)
+                return
+            if len(positions) != 1:
+                yield None
+                return
+            position = positions[0].as_py()
+            before = self._graph.edge_records_from_table(table.slice(position, 1))[0]
+            if (rel_type is not None and before.rel_type != rel_type) or not _can_patch_properties(
+                before, properties
+            ):
+                yield None
+                return
+            after = replace(before, properties={**before.properties, **properties})
+            yield (after,)
+            if before == after:
+                return
+            head = _new_head(
+                current.head.node_count,
+                current.head.edge_count,
+                current.head.labels,
+                current.head.relationships,
+                None,
+                width,
+            )
+            self._commit(
+                self._require_table(snapshot.snapshot_id),
+                head,
+                current.catalog,
+                {kind: _replace_row(table, position, _edges_table([after]))},
+            )
 
     def initialize(self) -> InitializationResult:
         snapshot = self.bootstrap_snapshot()
@@ -526,18 +604,24 @@ class DeltaStorageBackend:
         base = self._require_table(None)
         head, catalog = _metadata(base)
         manifest = head.manifest(SnapshotId(base.version() + 1), catalog.version)
+        width = self._compaction_range_size(head.edge_range_size)
         candidate = _new_head(
-            head.node_count, head.edge_count, head.labels, head.relationships, None
+            head.node_count, head.edge_count, head.labels, head.relationships, None, width
         )
+        partitions = _edge_partitions(self._graph.load_edge_table(manifest.edges), width)
+        partitions["nodes"] = self._graph.load_node_table(manifest.nodes)
         return self._commit(
             base,
             candidate,
             catalog,
-            {
-                "nodes": self._graph.load_node_table(manifest.nodes),
-                "edges": self._graph.load_edge_table(manifest.edges),
-            },
+            partitions,
+            replace_all_edges=True,
         )
+
+    def _compaction_range_size(self, previous: int | None) -> int:
+        if self._edge_range_size is not None:
+            return self._edge_range_size
+        return previous if previous is not None else _DEFAULT_EDGE_RANGE_SIZE
 
     def vacuum(self) -> tuple[str, ...]:
         raise StorageError("Delta vacuum is unavailable while historical snapshots are retained.")
@@ -552,6 +636,7 @@ def _new_head(
     labels: dict[str, int],
     relationships: dict[str, int],
     receipt: IdempotencyReceipt | None,
+    edge_range_size: int | None,
 ) -> _Head:
     return _Head(
         uuid4().hex,
@@ -561,6 +646,7 @@ def _new_head(
         labels,
         relationships,
         receipt,
+        edge_range_size,
     )
 
 
@@ -580,7 +666,14 @@ def _rows(table: pa.Table, kind: str) -> pa.Table:
 
 
 def _metadata_table(head: _Head, catalog: VersionedCatalog) -> pa.Table:
-    payload = {"format": _FORMAT, "graph": asdict(head), "catalog": serialize_catalog(catalog)}
+    graph = asdict(head)
+    if head.edge_range_size is None:
+        graph.pop("edge_range_size")
+    payload = {
+        "format": _LEGACY_FORMAT if head.edge_range_size is None else _FORMAT,
+        "graph": graph,
+        "catalog": serialize_catalog(catalog),
+    }
     return _rows(pa.table({"properties_json": [orjson.dumps(payload).decode()]}), "metadata")
 
 
@@ -588,7 +681,11 @@ def _partition(
     table: DeltaTable, kind: str, columns: list[str], expression: object = None
 ) -> pa.Table:
     try:
-        dataset = table.to_pyarrow_dataset(file_pruning_predicate=[("kind", "=", kind)])
+        dataset = table.to_pyarrow_dataset(
+            file_pruning_predicate=(
+                _EDGE_PARTITION_PREDICATE if kind == "edges" else [("kind", "=", kind)]
+            )
+        )
         return dataset.to_table(columns=columns, filter=expression)
     except (DeltaError, OSError, pa.ArrowException) as exc:
         raise StorageError(f"Could not read the Delta {kind} partition.") from exc
@@ -600,9 +697,13 @@ def _metadata(table: DeltaTable) -> tuple[_Head, VersionedCatalog]:
         raise StorageError("Expected exactly one metadata row at the captured Delta version.")
     try:
         payload = orjson.loads(rows[0].as_py())
-        if payload["format"] != _FORMAT:
+        if payload["format"] not in {_FORMAT, _LEGACY_FORMAT}:
             raise ValueError("Unrecognized graph layout")
         data = payload["graph"]
+        if payload["format"] == _FORMAT:
+            width = data["edge_range_size"]
+            if type(width) is not int or not 0 <= width < 2**63:
+                raise ValueError("Invalid edge range size")
         receipt = data["receipt"]
         if receipt is not None:
             data["receipt"] = IdempotencyReceipt(**receipt)
@@ -628,6 +729,43 @@ def _pointer(manifest: SnapshotManifest) -> CurrentSnapshotPointer:
 
 def _receipt_partition(key_hash: str) -> str:
     return f"receipt-{key_hash[:2]}"
+
+
+def _edge_partition(bucket: int) -> str:
+    return f"edges-{bucket:020d}"
+
+
+def _edge_partitions(table: pa.Table, width: int | None) -> dict[str, pa.Table]:
+    if not width:
+        return {"edges": table}
+    if not table.num_rows:
+        return {}
+    return {_edge_partition(bucket): rows for bucket, rows in _edge_ranges(table, width)}
+
+
+def _changed_edge_partitions(
+    table: pa.Table, previous: pa.Table, width: int | None
+) -> dict[str, pa.Table]:
+    if not width:
+        return {"edges": table}
+    old = _edge_partitions(previous, width)
+    current = _edge_partitions(table, width)
+    changed = {
+        kind: rows
+        for kind, rows in current.items()
+        if kind not in old or not rows.equals(old[kind])
+    }
+    changed.update({kind: EDGE_SCHEMA.empty_table() for kind in old.keys() - current.keys()})
+    return changed
+
+
+def _can_patch_properties(edge: EdgeRecord, properties: dict[str, object]) -> bool:
+    return all(
+        type(value) in (str, bool, int, float)
+        and type(edge.properties.get(name)) is type(value)
+        and (type(value) is not int or -(2**63) <= value < 2**63)
+        for name, value in properties.items()
+    )
 
 
 def _storage_options(root: str | Path, settings: GraphArrowSettings) -> dict[str, str]:

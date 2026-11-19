@@ -1,5 +1,8 @@
 UV ?= uv
 PYTHON ?= python3
+TEST_WORKERS ?= auto
+# Reference fixtures and the comparison report use shared resources.
+PYTEST_WORKERS = $(if $(or $(GRAPHARROW_TEST_NEO4J_URI),$(GRAPHARROW_INTERFACE_COMPARISON_REPORT)),0,$(TEST_WORKERS))
 PACKAGE ?= grapharrow
 SRC_DIRS := src tests
 ANTLR_JAR ?=
@@ -87,22 +90,22 @@ generate-cypher-parser:
 	java -jar "$(ANTLR_JAR)" -Dlanguage=Python3 -visitor -no-listener -Xexact-output-dir -lib vendor/opencypher -o "$(CYPHER_GENERATED)" vendor/opencypher/GraphArrowCypher.g4
 
 test:
-	$(UV) run pytest
+	$(UV) run pytest -n "$(PYTEST_WORKERS)"
 
 test-interface-comparison:
 	GRAPHARROW_INTERFACE_COMPARISON_REPORT=/tmp/grapharrow-interface-comparison.json $(UV) run --extra delta pytest -v tests/integration/test_interface_comparison.py --junitxml=/tmp/grapharrow-interface-comparison.xml
 
 test-unit:
-	$(UV) run pytest tests/unit
+	$(UV) run pytest -n "$(TEST_WORKERS)" tests/unit
 
 test-integration:
-	$(UV) run pytest -m integration tests/integration
+	$(UV) run pytest -n "$(PYTEST_WORKERS)" -m integration tests/integration
 
 test-integration-live:
 	$(UV) run --extra cloud pytest -m "integration and live_storage" tests/integration
 
 coverage:
-	$(UV) run pytest --cov=grapharrow tests
+	$(UV) run pytest -n "$(PYTEST_WORKERS)" --cov=grapharrow tests
 
 $(TCK_ARCHIVE):
 	@set -eu; \

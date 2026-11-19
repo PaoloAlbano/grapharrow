@@ -25,7 +25,8 @@ jobs:
       - run: uv sync --locked --all-extras --python 3.12
       - name: Measure coverage of the local test suite
         run: >-
-          uv run --frozen --all-extras pytest -m "not live_storage and not neo4j_reference"
+          uv run --frozen --all-extras pytest -n auto
+          -m "not live_storage and not neo4j_reference"
           --cov=grapharrow --cov-report=xml:coverage.xml
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5

@@ -105,9 +105,9 @@ credentials. Bolt query logging is disabled; it is enabled by default.
 ### Run tests
 
 ```bash
-uv run pytest
-# or
 make test
+# or choose the number of workers explicitly
+make test TEST_WORKERS=4
 ```
 
 ### Audit openCypher compatibility
