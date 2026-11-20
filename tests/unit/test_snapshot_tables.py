@@ -109,3 +109,60 @@ def test_snapshot_table_loader_can_retry_and_disable_caching() -> None:
         pass
     with pytest.raises(OSError, match="Read failed"), disabled.borrow(("nodes", files), fail):
         pytest.fail("The disabled cache should always call the table loader")
+
+
+def test_snapshot_table_cache_counts_shared_range_buffers_once() -> None:
+    left = pa.table({"value": range(1024)})
+    right = pa.table({"value": range(1024, 1536)})
+    assembled = pa.concat_tables([left, right])
+    left_key = ("edge_range", (DatasetFile("left.parquet", 1024, "edges"),))
+    right_key = ("edge_range", (DatasetFile("right.parquet", 512, "edges"),))
+    assembled_key = ("edges", (DatasetFile("snapshot.parquet", 1536, "edges"),))
+    cache = SnapshotTableCache(18_100)
+
+    def fail() -> pa.Table:
+        pytest.fail("Expected a retained table")
+
+    with (
+        cache.borrow(left_key, lambda: left),
+        cache.borrow(right_key, lambda: right),
+        cache.borrow(assembled_key, lambda: assembled),
+        cache.borrow(assembled_key, fail) as reused,
+    ):
+        assert reused is assembled
+        assert assembled.get_total_buffer_size() < cache.used_bytes <= cache.max_bytes
+
+
+def test_snapshot_table_cache_only_reclaims_unreferenced_buffers() -> None:
+    table = pa.table({"value": range(1024)})
+    alias = table.slice(20)
+    replacement = pa.table({"value": range(1024, 2048)})
+    first_key = ("edges", (DatasetFile("first.parquet", 1024, "edges"),))
+    alias_key = ("edges", (DatasetFile("alias.parquet", 1004, "edges"),))
+    next_key = ("edges", (DatasetFile("next.parquet", 1024, "edges"),))
+    cache = SnapshotTableCache(15_500)
+
+    def fail() -> pa.Table:
+        pytest.fail("Expected a retained table")
+
+    with cache.borrow(first_key, lambda: table), cache.borrow(alias_key, lambda: alias):
+        pass
+    with cache.borrow(alias_key, fail):
+        before = cache.used_bytes
+        with cache.borrow(next_key, lambda: replacement):
+            assert cache.used_bytes == before
+        with cache.borrow(first_key, fail):
+            pass
+    with cache.borrow(next_key, lambda: replacement), cache.borrow(next_key, fail) as reused:
+        assert reused is replacement
+        assert replacement.get_total_buffer_size() < cache.used_bytes < before
+
+
+def test_snapshot_table_cache_includes_dictionary_values_in_the_budget() -> None:
+    column = pa.DictionaryArray.from_arrays(pa.array([0]), pa.array(["a" * 4096]))
+    table = pa.table({"value": column})
+    files = (DatasetFile("dictionary.parquet", 1, "nodes"),)
+    cache = SnapshotTableCache(3_000)
+
+    with cache.borrow(("nodes", files), lambda: table):
+        assert cache.used_bytes == 0

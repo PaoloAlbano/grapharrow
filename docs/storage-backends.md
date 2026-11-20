@@ -63,11 +63,16 @@ readers can capture the next version. Keep ANA sessions on the replica that
 issued their session ID because handles live in the server process.
 
 Canonical tables and derived property projections share the Arrow table cache
-budget. A new snapshot capture checks the latest log version before reusing a
+budget. Tables that share Arrow buffers are charged once for those buffers.
+A new snapshot capture checks the latest log version before reusing a
 pinned read handle or a table. Cypher reuses typed projections of unchanged
 edge range files and ANA reuses their canonical Arrow tables across snapshots.
 ANA also retains one recent schema and reuses relationship statistics for
-unchanged edge ranges within its schema cache budget.
+unchanged edge ranges within its schema cache budget. Unchanged node files
+can share node tables, label projections, observed node properties, and node
+lookups across Delta snapshots. `GRAPHARROW_ANA_NODE_LOOKUP_CACHE_MAX_BYTES`
+bounds the most recent Delta node lookup retained between sessions. It
+defaults to 16 MiB. Set it to `0` to retain lookups only while sessions use them.
 
 A general mutation publishes only against its captured base version. For
 compatible point `SET` operations on disjoint edge ranges, Delta can rebase
@@ -91,9 +96,12 @@ committed response byte for byte. See [Transactions and Sessions](transactions.m
   Historical reads remain available. `vacuum` and retention planning are
   currently available only with Native. Use GraphArrow as the sole writer to
   its table, including for maintenance.
-- Integration tests cover local disk and Moto S3. A separate local test also
-  verified Azure Blob behavior with Azurite 3.37. Tests against real S3 and
-  Azure accounts are pending.
+- Integration tests cover local disk and Moto S3. Simulated object-store
+  tests kill a writer after staging Parquet files, and again after the
+  provider accepts the log commit but before the writer receives its
+  response. In both cases, readers and REST retries see an atomic graph
+  and receipt. The same tests were verified with Azurite 3.37. Tests
+  against real S3 and Azure accounts are pending.
 
 ## Native behavior and storage contracts
 

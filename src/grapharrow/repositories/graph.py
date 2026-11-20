@@ -217,6 +217,10 @@ class GraphRepository:
         projected = self._write_edge_property_table(patch.property_table, property_parts)
         return canonical, projected
 
+    @staticmethod
+    def node_cache_files(files: tuple[DatasetFile, ...]) -> tuple[DatasetFile, ...]:
+        return files
+
     def load_node_table(self, files: tuple[DatasetFile, ...]) -> pa.Table:
         """Load node tables referenced by ``files`` into one Arrow table."""
 

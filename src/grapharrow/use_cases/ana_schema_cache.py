@@ -86,30 +86,45 @@ class SnapshotSchemaCache:
         self._entries: WeakValueDictionary[SnapshotManifest, SnapshotSchema] = WeakValueDictionary()
         self._recent_max_bytes = schema_bytes
         self._recent: SnapshotSchema | None = None
+        self._recent_node_files: tuple[DatasetFile, ...] | None = None
         self._lock = Lock()
 
     def get_or_create(
         self,
         snapshot: SnapshotManifest,
         discover: Callable[[list[dict[str, Any]] | None], dict[str, Any]],
+        *,
+        node_files: tuple[DatasetFile, ...] | None = None,
     ) -> SnapshotSchema:
         with self._lock:
             entry = self._entries.get(snapshot)
             if entry is None:
-                schema = self._load(snapshot, discover)
+                schema = self._load(snapshot, discover, node_files)
                 entry = SnapshotSchema(snapshot=snapshot, schema=_compact_schema(schema))
                 self._entries[snapshot] = entry
-                if self._recent_max_bytes and retained_size(entry) <= self._recent_max_bytes:
+                if (
+                    self._recent_max_bytes
+                    and retained_size((entry, node_files)) <= self._recent_max_bytes
+                ):
                     self._recent = entry
+                    self._recent_node_files = node_files
             return entry
 
     def _load(
         self,
         snapshot: SnapshotManifest,
         discover: Callable[[list[dict[str, Any]] | None], dict[str, Any]],
+        node_files: tuple[DatasetFile, ...] | None,
     ) -> dict[str, Any]:
         if self._disk is None:
-            return discover(None)
+            node_properties = None
+            if (
+                self._recent is not None
+                and node_files is not None
+                and node_files == self._recent_node_files
+            ):
+                node_properties = self._recent.schema["node_properties"]
+            return discover(node_properties)
         if any(
             not file.checksum or not file.checksum_algorithm
             for file in (*snapshot.nodes, *snapshot.edges)

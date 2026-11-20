@@ -17,8 +17,10 @@ from starlette.types import Message, Receive, Scope, Send
 from grapharrow.app import build_application
 from grapharrow.config import GraphArrowSettings
 from grapharrow.core.errors import StorageError, WriteConflictError
+from grapharrow.domain.snapshot import IdempotencyReceipt
 from grapharrow.interfaces.rest import create_rest_app
 from grapharrow.use_cases.ana import GraphArrowAgentBackend
+from tests.integration.delta_log_gate import pause_delta_log_put
 from tests.integration.support import MotoS3Context
 
 pytestmark = pytest.mark.integration
@@ -117,6 +119,115 @@ def test_lost_response_replays_one_complete_delta_commit(
         {"author": 1, "edge": 1, "name": "Graph"},
         {"author": 3, "edge": 2, "name": "Other"},
     )
+
+
+def _write_until_killed(path: str, settings: GraphArrowSettings, key: str) -> None:
+    with TestClient(create_rest_app(path, settings=settings)) as client:
+        response = _post(client, "Graph", key)
+        raise AssertionError(f"The writer returned before it was killed: {response.status_code}")
+
+
+@pytest.mark.parametrize("delta_database", ["s3"], indirect=True)
+@pytest.mark.parametrize("after_publish", [False, True], ids=["before-log-put", "after-log-put"])
+def test_killed_delta_writer_leaves_one_atomic_rest_effect(
+    delta_database: tuple[str | Path, GraphArrowSettings], after_publish: bool
+) -> None:
+    path, settings = delta_database
+    assert isinstance(path, str)
+    key = "crashed-writer"
+    key_hash = sha256(key.encode()).hexdigest()
+    reader = build_application(path, settings=settings)
+    reader.use_cases.admin.initialize()
+    snapshots = reader.repositories.snapshot
+    initial = snapshots.load_current_pointer()
+    graph = reader.use_cases.graph
+
+    def assert_visible_state(published: bool) -> IdempotencyReceipt | None:
+        head = snapshots.load_current_pointer()
+        assert head.snapshot_id.value == initial.snapshot_id.value + int(published)
+        manifest, receipt = snapshots.idempotency_base(head, key_hash)
+        visible = graph.load_state(snapshot=manifest)
+        if published:
+            assert len(visible.nodes) == 2 and len(visible.edges) == 1
+            assert {label.name for label in visible.catalog.labels} == {"Author", "Book"}
+            assert {kind.name for kind in visible.catalog.relationship_types} == {"WROTE"}
+            assert receipt is not None
+            assert reader.use_cases.cypher.execute(READ).rows == (
+                {"author": 1, "edge": 1, "name": "Graph"},
+            )
+        else:
+            assert head == initial and receipt is None
+            assert visible.nodes == visible.edges == ()
+            assert visible.catalog.labels == visible.catalog.relationship_types == ()
+        with GraphArrowAgentBackend(reader) as current:
+            assert current._state.snapshot.snapshot_id == head.snapshot_id
+            overview = current.call("schema_overview", {})
+            assert {entry["label"]: entry["count"] for entry in overview["labels"]} == (
+                {"Author": 1, "Book": 1} if published else {}
+            )
+        return receipt
+
+    endpoint_option = "s3_endpoint" if path.startswith("s3://") else "azure_blob_storage_authority"
+    upstream = getattr(settings, endpoint_option)
+    assert upstream is not None
+    authority, slash, account = upstream.partition("/")
+
+    with (
+        GraphArrowAgentBackend(reader) as pinned,
+        pause_delta_log_put(
+            authority, version=initial.snapshot_id.value, after_publish=after_publish
+        ) as gate,
+    ):
+        assert pinned._state.snapshot.snapshot_id == initial.snapshot_id
+        writer_settings = settings.model_copy(
+            update={endpoint_option: gate.authority + slash + account}
+        )
+        writer = multiprocessing.get_context("spawn").Process(
+            target=_write_until_killed, args=(path, writer_settings, key)
+        )
+        writer.start()
+        try:
+            assert gate.reached.wait(30), "The writer did not reach the Delta log PUT"
+            assert writer.is_alive()
+            assert {
+                "nodes",
+                "edges-00000000000000000000",
+                "metadata",
+                f"receipt-{key_hash[:2]}",
+            } <= gate.staged_partitions
+            assert_visible_state(after_publish)
+            assert writer.is_alive()
+            writer.kill()
+            writer.join(timeout=10)
+            assert writer.exitcode not in (None, 0)
+        finally:
+            if writer.is_alive():
+                writer.kill()
+                writer.join(timeout=10)
+
+        persisted = assert_visible_state(after_publish)
+        with TestClient(create_rest_app(path, settings=settings)) as restarted:
+            replay = _post(restarted, "Graph", key)
+            assert replay.status_code == 200
+            receipt = assert_visible_state(True)
+            assert receipt is not None
+            assert replay.content == receipt.response_json.encode()
+            if persisted is not None:
+                assert receipt == persisted
+
+            mismatch = _post(restarted, "Different", key)
+            assert mismatch.status_code == 409
+            assert mismatch.json()["error"]["code"] == "IDEMPOTENCY_KEY_CONFLICT"
+            assert _post(restarted, "Other", "after-restart").status_code == 200
+            later = snapshots.load_current_pointer()
+            assert later.snapshot_id.value == initial.snapshot_id.value + 2
+            assert _post(restarted, "Graph", key).content == replay.content
+            assert snapshots.load_current_pointer() == later
+        assert pinned.call("schema_overview", {})["labels"] == []
+        assert reader.use_cases.cypher.execute(READ).rows == (
+            {"author": 1, "edge": 1, "name": "Graph"},
+            {"author": 3, "edge": 2, "name": "Other"},
+        )
 
 
 def _paused_writer(
@@ -708,3 +819,65 @@ def test_delta_reuses_unchanged_ranges_in_cypher_projections_and_ana_tables(
     assert after.equals(
         _edge_property_table(records, _edge_property_schema(records)), check_metadata=True
     )
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+def test_delta_ana_reuses_node_data_until_node_files_change(
+    delta_database: tuple[str | Path, GraphArrowSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections import Counter
+    from functools import wraps
+
+    from grapharrow.use_cases import ana_node_lookup
+
+    path, settings = delta_database
+    writer = build_application(path, settings=settings)
+    reader = build_application(path, settings=settings)
+    writer.use_cases.cypher.execute(CREATE, {"name": "Original"})
+    calls: Counter[str] = Counter()
+
+    def count(owner: object, name: str) -> None:
+        original = getattr(owner, name)
+
+        @wraps(original)
+        def observed(*args: Any, **kwargs: Any) -> Any:
+            calls[name] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, observed)
+
+    count(ana_node_lookup, "_build_lookup")
+    count(reader.repositories.graph, "load_node_table")
+    count(reader.repositories.graph, "load_node_property_projection")
+    count(GraphArrowAgentBackend, "_discover_node_properties")
+
+    def author_properties(workflow: GraphArrowAgentBackend) -> set[str]:
+        response = workflow.call("schema_describe_label", {"label": "Author"})
+        return {prop["name"] for prop in response["properties"]}
+
+    with GraphArrowAgentBackend(reader) as initial:
+        assert author_properties(initial) == {"name"}
+    baseline = calls.copy()
+    assert baseline == {
+        "_build_lookup": 1,
+        "load_node_table": 1,
+        "load_node_property_projection": 2,
+        "_discover_node_properties": 1,
+    }
+    with GraphArrowAgentBackend(reader) as pinned:
+        assert calls == baseline
+        writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025})
+        with GraphArrowAgentBackend(reader) as edge_update:
+            assert edge_update._state.snapshot != pinned._state.snapshot
+            assert edge_update._state.node_table is pinned._state.node_table
+            assert edge_update._property_tables["Author"] is pinned._property_tables["Author"]
+            assert author_properties(edge_update) == {"name"}
+            assert calls == baseline
+
+        writer.use_cases.cypher.execute("MATCH (a:Author) SET a.rank = 7")
+        with GraphArrowAgentBackend(reader) as node_update:
+            assert author_properties(node_update) == {"name", "rank"}
+            assert node_update._state.node_table is not pinned._state.node_table
+            assert node_update._property_tables["Author"]["rank"].to_pylist() == [7]
+            assert calls == {name: times * 2 for name, times in baseline.items()}
+        assert author_properties(pinned) == {"name"}

@@ -4,12 +4,13 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pytest
 from neo4j import GraphDatabase
 
 from grapharrow.app import build_application
 from grapharrow.use_cases.ana import GraphArrowAgentBackend
-from grapharrow.use_cases.ana_patterns import edges_for_sources
+from grapharrow.use_cases.ana_patterns import TraversalScan, edges_for_sources
 
 
 @pytest.mark.parametrize(
@@ -23,14 +24,44 @@ from grapharrow.use_cases.ana_patterns import edges_for_sources
 def test_edges_for_sources_preserves_parallel_edges_and_input_order(
     columns: tuple[str, ...], from_one: list[int], from_two: list[int]
 ) -> None:
-    edges = pa.table({"edge_id": [5, 7, 2, 9], "src_id": [1, 1, 2, 1], "dst_id": [1, 2, 1, 2]})
+    edges = pa.table(
+        {
+            "edge_id": [5, 6, 7, 2, 9],
+            "src_id": [1, 1, 1, 2, 1],
+            "dst_id": [1, 3, 2, 1, 2],
+            "rel_type": ["LINK", "OTHER", "LINK", "LINK", "LINK"],
+        }
+    )
+    edges = pa.concat_tables([edges.slice(0, 3), edges.slice(3)])
+    relationship_mask = pc.equal(edges["rel_type"], "LINK")
     sources = [1, 3, 2, 1, 3, 2, 3, 1]
     expected = [from_one, [], from_two, from_one, [], from_two, [], from_one]
     for batch, max_batch_rows in ((False, None), (True, None), (True, 1)):
         groups = edges_for_sources(
-            edges, sources, columns, batch=batch, max_batch_rows=max_batch_rows
+            edges,
+            sources,
+            columns,
+            relationship_mask=relationship_mask,
+            batch=batch,
+            max_batch_rows=max_batch_rows,
         )
         assert [[edge["edge_id"] for edge in group] for group in groups] == expected
+
+
+@pytest.mark.parametrize("count", [0, 1, 4, 8])
+def test_traversal_scan_compacts_only_selective_relationship_types(count: int) -> None:
+    edges = pa.table({"edge_id": range(8), "rel_type": ["LINK"] * count + ["OTHER"] * (8 - count)})
+    scan = TraversalScan.for_relationship(edges, "LINK")
+    if scan.relationship_mask is not None:
+        assert scan.edges is edges
+        assert scan.edges.filter(scan.relationship_mask)["edge_id"].to_pylist() == list(
+            range(count)
+        )
+    else:
+        assert scan.edges["edge_id"].to_pylist() == list(range(count))
+    assert (scan.relationship_mask is not None) == (count == 4)
+    if count == 8:
+        assert scan.edges is edges
 
 
 @pytest.fixture
@@ -427,6 +458,84 @@ def test_pattern_zero_aggregates_and_grouped_empty_results(graph: Any) -> None:
         )
         == []
     )
+
+
+@pytest.mark.parametrize("scan", [False, True])
+def test_pattern_aggregate_skips_unused_target_payloads(
+    graph: Any, monkeypatch: pytest.MonkeyPatch, scan: bool
+) -> None:
+    if scan:
+        monkeypatch.setattr(graph, "_adjacency", None)
+
+    def unexpected_node(node_id: int) -> None:
+        pytest.fail(f"Aggregate should not materialize the unused target {node_id}")
+
+    monkeypatch.setattr(graph, "_node", unexpected_node)
+    args = {
+        "start_label": "Device",
+        "hops": [
+            {"relationship_type": "IN_ZONE", "target_label": "Zone", "as": "zone", "rel_as": "r"}
+        ],
+        "metrics": [
+            {"var": "r", "op": "count", "alias": "paths"},
+            {"var": "r", "property": "year", "op": "max", "alias": "latest"},
+        ],
+    }
+    assert result_rows(graph, "pattern_query", args) == [[4, 2022]]
+
+
+def test_pattern_aggregate_keeps_target_bindings_for_filters_and_groups(graph: Any) -> None:
+    args = {
+        "start_label": "Device",
+        "hops": [
+            {"relationship_type": "IN_ZONE", "target_label": "Zone", "as": "zone", "rel_as": "r"}
+        ],
+        "metrics": [{"var": "r", "op": "count", "alias": "paths"}],
+    }
+    assert result_rows(
+        graph,
+        "pattern_query",
+        {**args, "filters": [{"var": "zone", "property": "name", "op": "eq", "value": "North"}]},
+    ) == [[3]]
+    assert result_rows(
+        graph,
+        "pattern_query",
+        {**args, "group_by": [{"var": "zone", "property": "name", "alias": "zone"}]},
+    ) == [["North", 3], ["South", 1]]
+
+
+def test_multi_hop_aggregate_materializes_intermediate_nodes(
+    graph: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = graph._node
+    loaded = []
+
+    def node(node_id: int) -> Any:
+        payload = original(node_id)
+        loaded.append(payload["properties"]["name"])
+        return payload
+
+    monkeypatch.setattr(graph, "_node", node)
+    assert result_rows(
+        graph,
+        "multi_hop_query",
+        {
+            "start_label": "Device",
+            "start_as": "device",
+            "hops": [
+                {"relationship_type": "IN_ZONE", "target_label": "Zone", "as": "zone"},
+                {
+                    "relationship_type": "IN_ZONE",
+                    "target_label": "Device",
+                    "as": "peer",
+                    "direction": "in",
+                    "rel_as": "other",
+                },
+            ],
+            "metrics": [{"var": "other", "op": "count", "alias": "paths"}],
+        },
+    ) == [[6]]
+    assert loaded == ["North", "North", "North", "South"]
 
 
 def test_optional_count_keeps_zeros_and_distinguishes_parallel_edges(graph: Any) -> None:

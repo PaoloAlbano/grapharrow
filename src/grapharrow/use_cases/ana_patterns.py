@@ -6,6 +6,7 @@ import math
 import sys
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from functools import cmp_to_key
 from heapq import nlargest, nsmallest
 from itertools import islice
@@ -38,6 +39,25 @@ _BATCH_SOURCE_THRESHOLD = 8
 _EDGE_ROW_BATCH_SIZE = 256
 
 
+@dataclass(frozen=True, slots=True)
+class TraversalScan:
+    """Share the snapshot columns and reuse the relationship type mask across batches."""
+
+    edges: pa.Table
+    relationship_mask: pa.ChunkedArray | None
+
+    @classmethod
+    def for_relationship(cls, edges: pa.Table, rel_type: str) -> TraversalScan:
+        mask = pc.equal(edges["rel_type"], rel_type)
+        matches = pc.sum(mask).as_py() or 0
+        if matches == edges.num_rows:
+            return cls(edges, None)
+        # A small relation is cheaper to scan repeatedly after one compaction.
+        if matches * 4 <= edges.num_rows:
+            return cls(edges.filter(mask), None)
+        return cls(edges, mask)
+
+
 def source_node_id(value: Any, owner: str) -> int:
     reference = entity_identity(value)
     if not isinstance(reference, EntityReference) or reference.owner != owner:
@@ -50,6 +70,7 @@ def edges_for_sources(
     node_ids: list[int],
     source_columns: tuple[str, ...],
     *,
+    relationship_mask: pa.ChunkedArray | None = None,
     batch: bool = True,
     max_batch_rows: int | None = None,
 ) -> Iterator[Iterable[dict[str, Any]]]:
@@ -59,6 +80,8 @@ def edges_for_sources(
             mask = pc.equal(edges[source_columns[0]], node_id)
             if len(source_columns) == 2:
                 mask = pc.or_(mask, pc.equal(edges[source_columns[1]], node_id))
+            if relationship_mask is not None:
+                mask = pc.and_(mask, relationship_mask)
             yield _edge_rows(edges.filter(mask))
         return
 
@@ -67,6 +90,8 @@ def edges_for_sources(
     mask = pc.is_in(edges[source_columns[0]], keys)
     if len(source_columns) == 2:
         mask = pc.or_(mask, pc.is_in(edges[source_columns[1]], keys))
+    if relationship_mask is not None:
+        mask = pc.and_(mask, relationship_mask)
     candidates = edges.filter(mask)
     if max_batch_rows is not None and candidates.num_rows > max_batch_rows:
         yield from edges_for_sources(candidates, node_ids, source_columns, batch=False)
@@ -196,6 +221,7 @@ def iter_extend_rows(
     max_rows: int | None = None,
     distinct: bool = False,
     matched_node_ids: set[int] | None = None,
+    required_bindings: set[str] | None = None,
 ) -> tuple[Iterator[dict[str, Any]], str]:
     """Validate a hop eagerly and expand bounded input batches in binding order."""
     rel_type = str(hop["relationship_type"])
@@ -209,11 +235,12 @@ def iter_extend_rows(
         raise ValueError(f"Unknown relationship_type {rel_type!r}")
     if rel_var in {source, target}:
         raise ValueError("Relationship and node variables must be distinct")
-    scan_edges = backend._traversal_edges(rel_type, properties=True)
+    scan = backend._traversal_scan(rel_type, properties=True)
     source_column, target_column = (
         ("src_id", "dst_id") if direction == "out" else ("dst_id", "src_id")
     )
     target_ids = set(backend._label_ids.get(target_label, []))
+    keep_target = required_bindings is None or target in required_bindings
 
     def expand() -> Iterator[dict[str, Any]]:
         inputs = iter(rows)
@@ -226,7 +253,7 @@ def iter_extend_rows(
                 (source_column,),
                 properties=True,
                 max_batch_rows=4096,
-                scan_edges=scan_edges,
+                scan=scan,
             )
             for row, selected in zip(batch, candidates, strict=True):
                 for edge in selected:
@@ -248,20 +275,18 @@ def iter_extend_rows(
                         if (max_rows is not None and emitted >= max_rows) or distinct and duplicate:
                             continue
                     emitted += 1
-                    yield {
-                        **row,
-                        target: backend._node(target_id),
-                        rel_var: {
-                            "id": edge_id,
-                            "type": rel_type,
-                            "start": str(edge["src_id"]),
-                            "end": str(edge["dst_id"]),
-                            "properties": property_codec.loads(
-                                edge["properties_json"], public=True
-                            ),
-                        },
-                        "__rel_ids": [*row.get("__rel_ids", []), edge_id],
+                    expanded = row.copy()
+                    if keep_target:
+                        expanded[target] = backend._node(target_id)
+                    expanded[rel_var] = {
+                        "id": edge_id,
+                        "type": rel_type,
+                        "start": str(edge["src_id"]),
+                        "end": str(edge["dst_id"]),
+                        "properties": property_codec.loads(edge["properties_json"], public=True),
                     }
+                    expanded["__rel_ids"] = [*row.get("__rel_ids", []), edge_id]
+                    yield expanded
 
     return expand(), target
 
@@ -292,6 +317,7 @@ def prepare_pattern(
     *,
     require_hops: bool = False,
     limit_final_rows: bool = False,
+    project_aggregate_bindings: bool = False,
 ) -> tuple[Iterable[dict[str, Any]], str, dict[str, Any], set[int] | None]:
     hops = list(args.get("hops") or [])
     if require_hops and not hops:
@@ -343,11 +369,21 @@ def prepare_pattern(
 
     bound = {current}
     filter_bound(bound)
+    aggregate_bindings = None
+    if project_aggregate_bindings and normalized.get("metrics"):
+        aggregate_bindings = {str(flt["var"]) for flt in normalized_filters}
+        aggregate_bindings.update(
+            str(item["var"])
+            for key in ("select", "group_by", "metrics", "order_by")
+            for item in normalized.get(key) or []
+            if item.get("var") is not None
+        )
     for index, hop in enumerate(hops):
         max_rows = None
+        final_hop = index == len(hops) - 1
         if (
             limit_final_rows
-            and index == len(hops) - 1
+            and final_hop
             and normalized.get("limit") is not None
             and not pending
             and not any(
@@ -365,6 +401,9 @@ def prepare_pattern(
             max_rows=max_rows,
             distinct=_bool_arg(normalized.get("distinct")),
             matched_node_ids=matched_node_ids,
+            required_bindings=(
+                bound | aggregate_bindings if final_hop and aggregate_bindings is not None else None
+            ),
         )
         bound.update({current, str(hop.get("rel_as") or f"r{index}")})
         filter_bound(bound)
@@ -388,9 +427,13 @@ def aggregate_rows(
     metrics = list(args.get("metrics") or [])
     columns = [str(item.get("alias") or item["property"]) for item in grouping]
     columns += [str(metric["alias"]) for metric in metrics]
-    groups: dict[Any, tuple[list[Any], list[_MetricAccumulator]]] = {}
     if not grouping:
-        groups[()] = ([], [_MetricAccumulator(metric) for metric in metrics])
+        accumulators = [_MetricAccumulator(metric) for metric in metrics]
+        for row in rows:
+            for accumulator in accumulators:
+                accumulator.add(row)
+        return [dict(zip(columns, (acc.result() for acc in accumulators), strict=True))], columns
+    groups: dict[Any, tuple[list[Any], list[_MetricAccumulator]]] = {}
     for row in rows:
         values = [_row_property(row, str(item["var"]), str(item["property"])) for item in grouping]
         key = freeze(values)
@@ -680,7 +723,11 @@ def pattern_query(backend: Any, args: dict[str, Any], *, multi_hop: bool = False
             var = str(normalized.get("start_as") or str(normalized["start_label"]).lower())
             normalized["select"] = [{"var": var, "property": "name", "alias": "name"}]
     rows, focus, normalized, node_ids = prepare_pattern(
-        backend, normalized, require_hops=multi_hop, limit_final_rows=True
+        backend,
+        normalized,
+        require_hops=multi_hop,
+        limit_final_rows=True,
+        project_aggregate_bindings=True,
     )
     return finish_pattern(backend, rows, focus, normalized, node_ids=node_ids)
 

@@ -159,6 +159,11 @@ def build_application(
                 else 0
             ),
         ),
+        _ana_node_lookups=AnaNodeLookupCache(
+            resolved_settings.ana_node_lookup_cache_max_bytes
+            if resolved_settings.storage_backend == "delta"
+            else 0
+        ),
     )
 
 

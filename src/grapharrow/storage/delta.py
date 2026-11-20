@@ -155,24 +155,36 @@ class _ReadVersion:
     head: _Head
 
     @cached_property
-    def edge_ranges(self) -> tuple[DeltaEdgeRange, ...]:
-        if not self.head.edge_range_size or not self.head.edge_count:
-            return ()
+    def graph_files(self) -> dict[str, tuple[DatasetFile, ...]]:
         try:
             actions = pa.table(self.table.get_add_actions(flatten=True))
             rows = actions.select(["path", "partition.kind", "num_records"]).to_pylist()
         except (DeltaError, pa.ArrowException, OSError) as exc:
-            raise StorageError("Could not read the active Delta edge files.") from exc
+            raise StorageError("Could not read the active Delta graph files.") from exc
         files: dict[str, list[DatasetFile]] = {}
         for row in rows:
             kind = row["partition.kind"]
-            if kind.startswith("edges-"):
+            if kind == "nodes" or kind.startswith("edges-"):
                 files.setdefault(kind, []).append(
-                    DatasetFile(row["path"], row["num_records"] or 0, "edges")
+                    DatasetFile(
+                        row["path"],
+                        row["num_records"] or 0,
+                        "nodes" if kind == "nodes" else "edges",
+                    )
                 )
-        return tuple(
-            DeltaEdgeRange(kind, tuple(sorted(items, key=lambda item: item.path)))
+        return {
+            kind: tuple(sorted(items, key=lambda item: item.path))
             for kind, items in sorted(files.items())
+        }
+
+    @cached_property
+    def edge_ranges(self) -> tuple[DeltaEdgeRange, ...]:
+        if not self.head.edge_range_size or not self.head.edge_count:
+            return ()
+        return tuple(
+            DeltaEdgeRange(kind, files)
+            for kind, files in self.graph_files.items()
+            if kind.startswith("edges-")
         )
 
 
@@ -202,6 +214,7 @@ class DeltaStorageBackend:
         self._graph = DeltaGraphStore(
             self._read_partition,
             edge_ranges=self._read_edge_ranges,
+            node_files=self._read_node_files,
             snapshot_tables=snapshot_tables,
             filter_pushdown_enabled=settings.parquet_filter_pushdown_enabled,
         )
@@ -264,6 +277,10 @@ class DeltaStorageBackend:
 
     def _read_edge_ranges(self, snapshot_id: SnapshotId) -> tuple[DeltaEdgeRange, ...]:
         return self._describe_read_version(self._read_table(snapshot_id)).edge_ranges
+
+    def _read_node_files(self, snapshot_id: SnapshotId) -> tuple[DatasetFile, ...]:
+        version = self._describe_read_version(self._read_table(snapshot_id))
+        return version.graph_files.get("nodes", ())
 
     def _read_table(self, snapshot_id: SnapshotId) -> DeltaTable:
         cached = self._read_version

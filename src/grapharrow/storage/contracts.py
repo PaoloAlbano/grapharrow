@@ -92,6 +92,10 @@ class SnapshotStore(Protocol):
 class GraphStore(Protocol):
     """GraphStore operations used by storage clients."""
 
+    def node_cache_files(self, files: tuple[DatasetFile, ...]) -> tuple[DatasetFile, ...]:
+        """Identify immutable node data or one label projection for caching."""
+        ...
+
     def load_node_table(self, files: tuple[DatasetFile, ...]) -> pa.Table: ...
 
     def load_edge_table(self, files: tuple[DatasetFile, ...]) -> pa.Table: ...

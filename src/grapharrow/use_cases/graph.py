@@ -220,6 +220,9 @@ class GraphStateUseCase:
             snapshot = self.capture_snapshot()
         catalog = self._catalog_store.load_for_snapshot(snapshot)
         nodes, edges = snapshot.nodes, snapshot.edges
+        node_key = (
+            self._graph_store.node_cache_files(nodes) if self.snapshot_tables.max_bytes else nodes
+        )
         edge_table = (
             self.snapshot_tables.borrow(
                 ("edges", edges), lambda: self._graph_store.load_edge_table(edges)
@@ -229,7 +232,7 @@ class GraphStateUseCase:
         )
         with (
             self.snapshot_tables.borrow(
-                ("nodes", nodes), lambda: self._graph_store.load_node_table(nodes)
+                ("nodes", node_key), lambda: self._graph_store.load_node_table(nodes)
             ) as node_table,
             edge_table as borrowed_edges,
         ):
@@ -262,7 +265,12 @@ class GraphStateUseCase:
             yield {
                 label: leases.enter_context(
                     self.snapshot_tables.borrow(
-                        ("node_properties", files),
+                        (
+                            "node_properties",
+                            self._graph_store.node_cache_files(files)
+                            if self.snapshot_tables.max_bytes
+                            else files,
+                        ),
                         partial(
                             self._graph_store.load_node_property_projection, files, label=label
                         ),

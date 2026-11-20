@@ -23,12 +23,14 @@ class AnaNodeLookup:
 
 
 class AnaNodeLookupCache:
-    """Keep lookups while at least one workflow uses the immutable node files."""
+    """Share active lookups and optionally retain the most recent one within a budget."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_bytes: int = 0) -> None:
         self._entries: WeakValueDictionary[tuple[DatasetFile, ...], AnaNodeLookup] = (
             WeakValueDictionary()
         )
+        self._max_bytes = max_bytes
+        self._recent: AnaNodeLookup | None = None
         self._lock = Lock()
 
     def get_or_create(self, files: tuple[DatasetFile, ...], nodes: pa.Table) -> AnaNodeLookup:
@@ -37,6 +39,10 @@ class AnaNodeLookupCache:
             if lookup is None:
                 lookup = _build_lookup(nodes)
                 self._entries[files] = lookup
+            if self._max_bytes and self._recent is not lookup:
+                # Include the weak-map key and the lookup wrapper in the retained entry.
+                if lookup.retained_bytes + retained_size(files) + 1024 <= self._max_bytes:
+                    self._recent = lookup
             return lookup
 
 

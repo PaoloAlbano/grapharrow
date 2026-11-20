@@ -66,13 +66,30 @@ class DeltaGraphStore:
         read_partition: Callable[[SnapshotId, str, list[str], object], pa.Table],
         *,
         edge_ranges: Callable[[SnapshotId], tuple[DeltaEdgeRange, ...]],
+        node_files: Callable[[SnapshotId], tuple[DatasetFile, ...]],
         snapshot_tables: SnapshotTableCache,
         filter_pushdown_enabled: bool,
     ) -> None:
         self._read_partition = read_partition
         self._edge_ranges = edge_ranges
+        self._node_files = node_files
         self._snapshot_tables = snapshot_tables
         self._filter_pushdown_enabled = filter_pushdown_enabled
+
+    def node_cache_files(self, files: tuple[DatasetFile, ...]) -> tuple[DatasetFile, ...]:
+        if not files:
+            return ()
+        ref = files[0]
+        active = self._node_files(_snapshot_id(ref))
+        if not active:
+            return files
+        if ref.kind == "node_properties":
+            label = quote(_name(ref), safe="")
+            return tuple(
+                DatasetFile(f"{item.path}#{label}", item.row_count, "node_properties")
+                for item in active
+            )
+        return active
 
     def load_node_table(self, files: tuple[DatasetFile, ...]) -> pa.Table:
         if not files:
@@ -219,7 +236,7 @@ class DeltaGraphStore:
         if not selected:
             return pa.table({})
         with self._snapshot_tables.borrow(
-            ("node_properties", selected),
+            ("node_properties", self.node_cache_files(selected)),
             partial(self.load_node_property_projection, selected, label=label),
         ) as table:
             return self._select(table, columns, predicates)

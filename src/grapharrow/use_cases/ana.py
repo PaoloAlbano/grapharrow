@@ -66,10 +66,11 @@ class GraphArrowAgentBackend(AnaRuntime):
                 graph.borrow_node_property_tables(snapshot=self._state.snapshot)
             )
         state = self._state
-        lookup = application._ana_node_lookups.get_or_create(state.snapshot.nodes, state.node_table)
+        node_files = application.repositories.graph.node_cache_files(state.snapshot.nodes)
+        lookup = application._ana_node_lookups.get_or_create(node_files, state.node_table)
         self._node_lookup: AnaNodeLookup | None = lookup
         self._schema_snapshot: SnapshotSchema | None = application._ana_schema_cache.get_or_create(
-            self._state.snapshot, self._discover_schema
+            state.snapshot, self._discover_schema, node_files=node_files
         )
         # Responses can expose nested schema values to native callers.
         self._schema = deepcopy(self._schema_snapshot.schema)
@@ -360,14 +361,16 @@ class GraphArrowAgentBackend(AnaRuntime):
             )
         )
 
-    def _traversal_edges(self, rel_type: str, *, properties: bool = False) -> pa.Table | None:
+    def _traversal_scan(
+        self, rel_type: str, *, properties: bool = False
+    ) -> ana_patterns.TraversalScan | None:
         """Prepare the scan fallback once per expansion or pattern hop."""
         if self._adjacency is not None:
             return None
         edges = self._state.edge_table
         if not properties:
             edges = edges.select(["edge_id", "rel_type", "src_id", "dst_id"])
-        return edges.filter(pc.equal(edges["rel_type"], rel_type))
+        return ana_patterns.TraversalScan.for_relationship(edges, rel_type)
 
     def _edges_for_sources(
         self,
@@ -378,20 +381,23 @@ class GraphArrowAgentBackend(AnaRuntime):
         properties: bool = False,
         batch: bool = True,
         max_batch_rows: int | None = None,
-        scan_edges: pa.Table | None = None,
+        scan: ana_patterns.TraversalScan | None = None,
     ) -> Iterator[Iterable[dict[str, Any]]]:
         edges = self._state.edge_table
         if self._adjacency is not None:
             return self._adjacency.rows_for_sources(
                 edges, rel_type, node_ids, columns, properties=properties
             )
-        if scan_edges is not None:
-            edges = scan_edges
-        else:
-            edges = self._traversal_edges(rel_type, properties=properties)
-            assert edges is not None
+        if scan is None:
+            scan = self._traversal_scan(rel_type, properties=properties)
+            assert scan is not None
         return ana_patterns.edges_for_sources(
-            edges, node_ids, columns, batch=batch, max_batch_rows=max_batch_rows
+            scan.edges,
+            node_ids,
+            columns,
+            relationship_mask=scan.relationship_mask,
+            batch=batch,
+            max_batch_rows=max_batch_rows,
         )
 
     def _traversal_targets(
@@ -400,23 +406,24 @@ class GraphArrowAgentBackend(AnaRuntime):
         node_ids: list[int],
         columns: tuple[str, ...],
         allowed: set[int],
-        scan_edges: pa.Table | None = None,
+        scan: ana_patterns.TraversalScan | None = None,
     ) -> set[int]:
         if not node_ids:
             return set()
         edges = self._state.edge_table
         if self._adjacency is not None:
             return self._adjacency.targets(edges, rel_type, node_ids, columns, allowed)
-        if scan_edges is not None:
-            edges = scan_edges
-        else:
-            edges = self._traversal_edges(rel_type)
-            assert edges is not None
+        if scan is None:
+            scan = self._traversal_scan(rel_type)
+            assert scan is not None
         sources = pa.array(node_ids, type=pa.int64())
         targets: set[int] = set()
         for column in columns:
             target = "dst_id" if column == "src_id" else "src_id"
-            selected = pc.filter(edges[target], pc.is_in(edges[column], sources))
+            mask = pc.is_in(scan.edges[column], sources)
+            if scan.relationship_mask is not None:
+                mask = pc.and_(scan.relationship_mask, mask)
+            selected = pc.filter(scan.edges[target], mask)
             targets.update(set(pc.unique(selected).to_pylist()) & allowed)
         return targets
 
@@ -440,7 +447,7 @@ class GraphArrowAgentBackend(AnaRuntime):
             args=args,
             alternatives=["use a selective node_search"],
         )
-        scan_edges = self._traversal_edges(rel_type)
+        scan = self._traversal_scan(rel_type)
         targets = set(self._label_ids.get(label, ()))
         output = []
         inputs = [row for row in handle.rows if source in row]
@@ -458,7 +465,7 @@ class GraphArrowAgentBackend(AnaRuntime):
             source_columns,
             batch=limit >= len(node_ids),
             max_batch_rows=max(1024, limit),
-            scan_edges=scan_edges,
+            scan=scan,
         )
         processed = 0
         for row, node_id, selected in zip(inputs, node_ids, matches_by_source, strict=True):
@@ -483,9 +490,7 @@ class GraphArrowAgentBackend(AnaRuntime):
                 break
         # The reference keeps a full query branch for union counts. Its branch
         # uses input entities independently of the materialized traversal limit.
-        full_targets = self._traversal_targets(
-            rel_type, node_ids, source_columns, targets, scan_edges
-        )
+        full_targets = self._traversal_targets(rel_type, node_ids, source_columns, targets, scan)
         metadata = self._entity_query_metadata(full_targets, var, label) if inputs else None
         result = self._store(output, focus=var, metadata=metadata)
         result.update(
