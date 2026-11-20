@@ -290,6 +290,8 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
         except (ConnectionError, OSError):
             return
         finally:
+            if state.transaction is not None:
+                state.transaction.close()
             _bolt_log(server, "connection closed")
 
     def _negotiate_protocol(self) -> bool:
@@ -412,7 +414,11 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
             self._fail(state, "BEGIN requires one metadata dictionary.")
             return
 
-        transaction = GraphTransactionUseCase(server.bolt_app.grapharrow.use_cases.graph)
+        try:
+            transaction = GraphTransactionUseCase(server.bolt_app.grapharrow.use_cases.graph)
+        except GraphArrowError as exc:
+            self._fail(state, str(exc))
+            return
         state.transaction = transaction
         state.transaction_cypher = CypherQueryUseCase(
             graph_service=transaction,

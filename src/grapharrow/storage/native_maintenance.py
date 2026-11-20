@@ -19,6 +19,9 @@ from grapharrow.domain import (
 )
 from grapharrow.repositories import CatalogRepository, GraphRepository, SnapshotRepository
 from grapharrow.storage.models import (
+    DeltaPinRecoveryResult,
+    DeltaRetentionResult,
+    DeltaStorageInventory,
     InitializationResult,
     RecoveryReport,
     RetentionFile,
@@ -181,7 +184,26 @@ class NativeStorageMaintenance:
         self._snapshot_store.publish(manifest, base=current_manifest)
         return manifest
 
-    def plan_retention(self, *, keep_last: int, min_age_hours: int = 0) -> RetentionPlan:
+    def storage_inventory(self) -> DeltaStorageInventory:
+        raise StorageError("Storage inventory is currently available for Delta storage.")
+
+    def apply_retention(
+        self, *, minimum_snapshot_id: int, online: bool = False
+    ) -> DeltaRetentionResult:
+        raise StorageError("Applying retention requires a Delta database with managed retention.")
+
+    def recover_retention_pins(
+        self, incarnation_id: str, *, verifier: Path | None = None
+    ) -> DeltaPinRecoveryResult:
+        raise StorageError("Recovering pins requires a Delta database with managed retention.")
+
+    def plan_retention(
+        self,
+        *,
+        keep_last: int,
+        min_age_hours: int = 0,
+        protect_from_snapshot_id: int | None = None,
+    ) -> RetentionPlan:
         """Estimate reclaimable Parquet bytes without changing the database."""
         if keep_last < 1:
             raise ValueError("keep_last must be at least 1.")
@@ -189,6 +211,11 @@ class NativeStorageMaintenance:
             raise ValueError("min_age_hours must be nonnegative.")
 
         head = self._snapshot_store.load_current_pointer()
+        if (
+            protect_from_snapshot_id is not None
+            and not 1 <= protect_from_snapshot_id <= head.snapshot_id.value
+        ):
+            raise ValueError("protect_from_snapshot_id must identify a published snapshot.")
         now = datetime.now(UTC)
         retained_ids: list[int] = []
         older_ids: list[int] = []
@@ -201,8 +228,12 @@ class NativeStorageMaintenance:
                 for entry in _iter_manifest_files(snapshot)
                 if entry.path.endswith(".parquet")
             )
-            if position < keep_last or (
-                min_age_hours and _age_in_hours(snapshot, now) <= min_age_hours
+            if (
+                position < keep_last
+                or (
+                    protect_from_snapshot_id is not None and snapshot_id >= protect_from_snapshot_id
+                )
+                or (min_age_hours and _age_in_hours(snapshot, now) <= min_age_hours)
             ):
                 # Keep a contiguous range even if an ancestor has a newer timestamp.
                 retained_ids.extend(older_ids)

@@ -27,6 +27,9 @@ from grapharrow.domain.records import EdgeRecord, NodeRecord
 from grapharrow.domain.scan import ScanPredicate
 from grapharrow.domain.snapshot import IdempotencyReceipt
 from grapharrow.storage.models import (
+    DeltaPinRecoveryResult,
+    DeltaRetentionResult,
+    DeltaStorageInventory,
     InitializationResult,
     RecoveryReport,
     RetentionPlan,
@@ -189,7 +192,20 @@ class StorageMaintenance(Protocol):
     ) -> RecoveryReport: ...
     def compact(self) -> SnapshotManifest: ...
     def vacuum(self) -> tuple[str, ...]: ...
-    def plan_retention(self, *, keep_last: int, min_age_hours: int = 0) -> RetentionPlan: ...
+    def storage_inventory(self) -> DeltaStorageInventory: ...
+    def apply_retention(
+        self, *, minimum_snapshot_id: int, online: bool = False
+    ) -> DeltaRetentionResult: ...
+    def recover_retention_pins(
+        self, incarnation_id: str, *, verifier: Path | None = None
+    ) -> DeltaPinRecoveryResult: ...
+    def plan_retention(
+        self,
+        *,
+        keep_last: int,
+        min_age_hours: int = 0,
+        protect_from_snapshot_id: int | None = None,
+    ) -> RetentionPlan: ...
 
 
 @runtime_checkable
@@ -210,6 +226,8 @@ class StorageBackend(Protocol):
     def maintenance(self) -> StorageMaintenance: ...
 
     def capture_snapshot(self) -> SnapshotManifest: ...
+    def borrow_current_snapshot(self) -> AbstractContextManager[SnapshotManifest]: ...
+    def pin_snapshot(self, snapshot_id: SnapshotId) -> AbstractContextManager[None]: ...
 
     def publish_graph(
         self,

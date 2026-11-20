@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -73,6 +73,12 @@ class NativeStorageBackend:
 
     def capture_snapshot(self) -> SnapshotManifest:
         return self._catalog.bootstrap_snapshot()
+
+    def borrow_current_snapshot(self) -> AbstractContextManager[SnapshotManifest]:
+        return nullcontext(self.capture_snapshot())
+
+    def pin_snapshot(self, snapshot_id: SnapshotId) -> AbstractContextManager[None]:
+        return nullcontext()
 
     @contextmanager
     def edit_edge_properties_by_id(

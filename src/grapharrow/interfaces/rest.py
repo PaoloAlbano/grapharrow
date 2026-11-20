@@ -328,15 +328,26 @@ def create_rest_app(
         payload = VacuumResponse(removed_paths=list(removed_paths))
         return _ok(data=payload.model_dump())
 
+    @protected_router.get("/admin/storage/inventory")
+    def storage_inventory() -> dict[str, object]:
+        """Report the physical footprint of a Delta database."""
+        return _ok(data=asdict(container.use_cases.admin.storage_inventory()))
+
     @protected_router.get("/admin/retention/plan")
     def plan_retention(
         keep_last: Annotated[int, Query(ge=1)],
         min_age_hours: Annotated[int, Query(ge=0)] = 0,
+        protect_from_snapshot_id: Annotated[int | None, Query(ge=1)] = None,
     ) -> dict[str, object]:
         """Estimate a retention policy against the published snapshot history."""
-        plan = container.use_cases.admin.plan_retention(
-            keep_last=keep_last, min_age_hours=min_age_hours
-        )
+        try:
+            plan = container.use_cases.admin.plan_retention(
+                keep_last=keep_last,
+                min_age_hours=min_age_hours,
+                protect_from_snapshot_id=protect_from_snapshot_id,
+            )
+        except ValueError as exc:
+            raise QueryError(str(exc)) from exc
         return _ok(data=asdict(plan))
 
     app.include_router(public_router)

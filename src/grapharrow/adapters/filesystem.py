@@ -121,9 +121,13 @@ class FileSystemAdapter:
                 client_id=settings.azure_client_id,
                 client_secret=settings.azure_client_secret,
                 tenant_id=settings.azure_tenant_id,
-                blob_storage_authority=settings.azure_blob_storage_authority,
+                blob_storage_authority=_azure_arrow_authority(
+                    settings.azure_blob_storage_authority, settings.azure_account_name
+                ),
                 blob_storage_scheme=settings.azure_blob_storage_scheme,
-                dfs_storage_authority=settings.azure_dfs_storage_authority,
+                dfs_storage_authority=_azure_arrow_authority(
+                    settings.azure_dfs_storage_authority, settings.azure_account_name
+                ),
                 dfs_storage_scheme=settings.azure_dfs_storage_scheme,
             )
 
@@ -401,6 +405,12 @@ class FileSystemAdapter:
         if netloc and path:
             return f"{netloc}/{path}"
         return netloc or path
+
+
+def _azure_arrow_authority(authority: str | None, account_name: str) -> str | None:
+    # In path-style endpoints Arrow adds the account itself, while Delta accepts
+    # an endpoint that already includes the account segment.
+    return None if authority is None else authority.removesuffix(f"/{account_name}")
 
 
 def _sync_directory(path: Path) -> None:

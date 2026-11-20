@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Generator, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -25,6 +25,7 @@ from deltalake.exceptions import CommitFailedError, DeltaError, TableNotFoundErr
 from deltalake.fs import DeltaStorageHandler
 from deltalake.transaction import CommitProperties
 
+from grapharrow.adapters import FileSystemAdapter
 from grapharrow.adapters.snapshot_tables import SnapshotTableCache
 from grapharrow.adapters.writer import WriterLock, writer_locked
 from grapharrow.config import GraphArrowSettings
@@ -55,7 +56,12 @@ from grapharrow.repositories.graph import (
 )
 from grapharrow.storage.contracts import CatalogStore, GraphStore, SnapshotStore, StorageMaintenance
 from grapharrow.storage.delta_graph import DeltaEdgeRange, DeltaGraphStore, dataset_ref
+from grapharrow.storage.delta_inventory import inspect_delta_storage, plan_delta_retention
+from grapharrow.storage.delta_retention import MANAGED_DESCRIPTION, DeltaRetentionCoordinator
 from grapharrow.storage.models import (
+    DeltaPinRecoveryResult,
+    DeltaRetentionResult,
+    DeltaStorageInventory,
     InitializationResult,
     RecoveryReport,
     RetentionPlan,
@@ -66,6 +72,7 @@ if TYPE_CHECKING:
     from grapharrow.use_cases.graph import GraphState
 
 _FORMAT = "grapharrow-delta-v1"
+_MANAGED_FORMAT = "grapharrow-delta-managed-v1"
 _POINT_COMMIT_ID = "grapharrowPointCommitId"
 _POINT_COMMIT_RETRIES = 10
 _DEFAULT_EDGE_RANGE_SIZE = 8192
@@ -196,13 +203,19 @@ class DeltaStorageBackend:
         *,
         layout: DatabaseLayout,
         settings: GraphArrowSettings,
+        filesystem: FileSystemAdapter,
         snapshot_tables: SnapshotTableCache | None = None,
     ) -> None:
         self._layout = layout
+        self._filesystem = filesystem
         self._uri = str(layout.delta_dir)
         self._options = _storage_options(layout.root, settings)
         self._writer = _DeltaWriter()
         self._edge_range_size = settings.edge_parquet_range_size
+        self._checkpoint_interval = settings.delta_checkpoint_interval
+        self._manage_new_table = settings.delta_managed_retention
+        self._replica_id = settings.delta_replica_id
+        self._managed: bool | None = None
         snapshot_tables = (
             snapshot_tables
             if snapshot_tables is not None
@@ -250,7 +263,10 @@ class DeltaStorageBackend:
         if version is not None and version < 0:
             raise StorageError("Delta snapshot IDs start at 1.")
         try:
-            return DeltaTable(self._uri, version=version, storage_options=self._options)
+            table = DeltaTable(self._uri, version=version, storage_options=self._options)
+            if self._managed is None:
+                self._managed = table.metadata().description == MANAGED_DESCRIPTION
+            return table
         except TableNotFoundError:
             raise
         except (DeltaError, OSError) as exc:
@@ -273,7 +289,17 @@ class DeltaStorageBackend:
     def _read_partition(
         self, snapshot_id: SnapshotId, kind: str, columns: list[str], expression: object
     ) -> pa.Table:
-        return _partition(self._read_table(snapshot_id), kind, columns, expression)
+        with self.pin_snapshot(snapshot_id):
+            return _partition(self._read_table(snapshot_id), kind, columns, expression)
+
+    def pin_snapshot(self, snapshot_id: SnapshotId) -> AbstractContextManager[None]:
+        if self._managed is None:
+            self._require_table(snapshot_id)
+        return self._retention.pin(snapshot_id.value) if self._managed else nullcontext()
+
+    @cached_property
+    def _retention(self) -> DeltaRetentionCoordinator:
+        return DeltaRetentionCoordinator(self._layout, self._filesystem, self._replica_id)
 
     def _read_edge_ranges(self, snapshot_id: SnapshotId) -> tuple[DeltaEdgeRange, ...]:
         return self._describe_read_version(self._read_table(snapshot_id)).edge_ranges
@@ -289,6 +315,10 @@ class DeltaStorageBackend:
         return self._require_table(snapshot_id)
 
     def _describe_read_version(self, table: DeltaTable) -> _ReadVersion:
+        with self.pin_snapshot(SnapshotId(table.version() + 1)):
+            return self._describe_pinned_read_version(table)
+
+    def _describe_pinned_read_version(self, table: DeltaTable) -> _ReadVersion:
         """Retain only the latest observed version, with a handle used exclusively for reads."""
         snapshot_id = SnapshotId(table.version() + 1)
         with self._read_version_lock:
@@ -303,12 +333,15 @@ class DeltaStorageBackend:
                 self._read_version = entry
             return entry
 
+    @cached_property
+    def _log_storage(self) -> DeltaStorageHandler:
+        return DeltaStorageHandler(self._uri, self._options)
+
     def _commit_info(self, version: int) -> dict[str, Any]:
         path = f"_delta_log/{version:020d}.json"
         try:
-            storage = DeltaStorageHandler(self._uri, self._options)
             # Supplying the size lets the handler skip an additional object-store HEAD.
-            info = storage.get_file_info([path])[0]
+            info = self._log_storage.get_file_info([path])[0]
             if info.type != pafs.FileType.File:
                 raise StorageError(f"Missing Delta log file for version {version}.")
             storage = DeltaStorageHandler(self._uri, self._options, known_sizes={path: info.size})
@@ -339,16 +372,56 @@ class DeltaStorageBackend:
         return head.manifest(SnapshotId(version + 1), catalog.version)
 
     def capture_snapshot(self) -> SnapshotManifest:
-        return self.bootstrap_snapshot()
+        with self.borrow_current_snapshot() as snapshot:
+            return snapshot
+
+    @contextmanager
+    def borrow_current_snapshot(self) -> Iterator[SnapshotManifest]:
+        """Hold the selected snapshot from its metadata read through the caller's work."""
+        cached = self._read_version
+        if cached is not None and self._cached_snapshot_is_current(cached.manifest.snapshot_id):
+            with self.pin_snapshot(cached.manifest.snapshot_id):
+                yield cached.manifest
+            return
+        with self._borrow_bootstrapped_snapshot() as snapshot:
+            yield snapshot
+
+    def _cached_snapshot_is_current(self, snapshot_id: SnapshotId) -> bool:
+        # GraphArrow retains the contiguous commit log, including expired snapshots.
+        path = f"_delta_log/{snapshot_id.value:020d}.json"
+        try:
+            if isinstance(self._layout.delta_dir, Path):
+                (self._layout.delta_dir / path).stat()
+                return False
+            return bool(self._log_storage.get_file_info([path])[0].type == pafs.FileType.NotFound)
+        except FileNotFoundError:
+            return True
+        except (DeltaError, OSError, pa.ArrowException):
+            # Let the standard Delta open resolve other storage errors.
+            return False
 
     def bootstrap_snapshot(self) -> SnapshotManifest:
+        with self._borrow_bootstrapped_snapshot() as snapshot:
+            return snapshot
+
+    @contextmanager
+    def _borrow_bootstrapped_snapshot(self) -> Iterator[SnapshotManifest]:
+        source = self._open_or_create()
+        if isinstance(source, SnapshotManifest):
+            with self.pin_snapshot(source.snapshot_id):
+                yield source
+            return
+        with self.pin_snapshot(SnapshotId(source.version() + 1)):
+            yield self._describe_pinned_read_version(source).manifest
+
+    def _open_or_create(self) -> DeltaTable | SnapshotManifest:
         table = self._try_open()
         if table is not None:
-            return self._describe_read_version(table).manifest
+            return table
         with self._writer.hold():
             table = self._try_open()
             if table is not None:
-                return self._describe_read_version(table).manifest
+                return table
             self._check_native_layout()
             catalog = VersionedCatalog.empty(version=CatalogVersion(1))
             head = _new_head(
@@ -360,16 +433,22 @@ class DeltaStorageBackend:
                 self._configured_range_size(_DEFAULT_EDGE_RANGE_SIZE),
                 metadata_version=0,
             )
-            data = _metadata_table(head, catalog)
+            data = _metadata_table(head, catalog, managed=self._manage_new_table)
+            configuration = {
+                "delta.isolationLevel": "Serializable",
+                "delta.enableExpiredLogCleanup": "false",
+            }
+            if self._checkpoint_interval is not None:
+                configuration["delta.checkpointInterval"] = str(self._checkpoint_interval)
+            if self._manage_new_table:
+                self._retention.initialize()
             try:
                 write_deltalake(
                     self._uri,
                     data,
                     partition_by=["kind"],
-                    configuration={
-                        "delta.isolationLevel": "Serializable",
-                        "delta.enableExpiredLogCleanup": "false",
-                    },
+                    configuration=configuration,
+                    description=MANAGED_DESCRIPTION if self._manage_new_table else None,
                     storage_options=self._options,
                     commit_properties=CommitProperties(max_commit_retries=0),
                 )
@@ -377,7 +456,8 @@ class DeltaStorageBackend:
                 table = self._try_open()
                 if table is None:
                     raise StorageError("Could not initialize the Delta graph.") from exc
-                return self._describe_read_version(table).manifest
+                return table
+            self._managed = self._manage_new_table
             return head.manifest(SnapshotId(1), catalog.version)
 
     def _check_native_layout(self) -> None:
@@ -422,9 +502,16 @@ class DeltaStorageBackend:
         self, pointer: CurrentSnapshotPointer | None = None
     ) -> Iterator[tuple[str, SnapshotManifest]]:
         head = pointer or self.load_current_pointer()
-        for value in range(head.snapshot_id.value, 0, -1):
-            manifest = self.load_manifest(SnapshotId(value))
-            yield _pointer(manifest).manifest_path, manifest
+        if self._managed is None:
+            self._require_table(head.snapshot_id)
+        minimum = self._retention.minimum_snapshot_id() if self._managed else 1
+        if head.snapshot_id.value < minimum:
+            # Report the same error as an explicit load of an expired snapshot.
+            self.load_manifest(head.snapshot_id)
+        with self.pin_snapshot(SnapshotId(minimum)):
+            for value in range(head.snapshot_id.value, minimum - 1, -1):
+                manifest = self.load_manifest(SnapshotId(value))
+                yield _pointer(manifest).manifest_path, manifest
 
     def publish(
         self, manifest: SnapshotManifest, *, base: SnapshotManifest | None = None
@@ -434,41 +521,43 @@ class DeltaStorageBackend:
     def idempotency_base(
         self, pointer: CurrentSnapshotPointer, key_hash: str
     ) -> tuple[SnapshotManifest, IdempotencyReceipt | None]:
-        table = self._read_table(pointer.snapshot_id)
-        manifest = self._describe_read_version(table).manifest
-        if pointer != _pointer(manifest):
-            raise StorageError("The Delta snapshot pointer does not match the log.")
-        rows = _partition(
-            table,
-            _receipt_partition(key_hash),
-            _RECEIPT_COLUMNS,
-            ds.field("key_hash") == key_hash,
-        ).to_pylist()
-        if len(rows) > 1:
-            raise StorageError("Duplicate idempotency receipts in the Delta snapshot.")
-        receipt = IdempotencyReceipt(**rows[0]) if rows else None
-        return manifest, receipt
+        with self.pin_snapshot(pointer.snapshot_id):
+            table = self._read_table(pointer.snapshot_id)
+            manifest = self._describe_read_version(table).manifest
+            if pointer != _pointer(manifest):
+                raise StorageError("The Delta snapshot pointer does not match the log.")
+            rows = _partition(
+                table,
+                _receipt_partition(key_hash),
+                _RECEIPT_COLUMNS,
+                ds.field("key_hash") == key_hash,
+            ).to_pylist()
+            if len(rows) > 1:
+                raise StorageError("Duplicate idempotency receipts in the Delta snapshot.")
+            receipt = IdempotencyReceipt(**rows[0]) if rows else None
+            return manifest, receipt
 
     @writer_locked
     def write(self, catalog: VersionedCatalog, *, base: SnapshotManifest | None = None) -> str:
         current = base or self.bootstrap_snapshot()
-        table = self._require_table(current.snapshot_id)
-        head, old_catalog = _metadata(table)
-        if catalog.version.value <= old_catalog.version.value:
-            if catalog == old_catalog:
-                return f"delta/{current.snapshot_id.value}/catalog"
-            raise WriteConflictError("Catalog changed. Reload it before writing a new version.")
-        candidate = _new_head(
-            head.node_count,
-            head.edge_count,
-            head.labels,
-            head.relationships,
-            None,
-            head.edge_range_size,
-            metadata_version=table.version() + 1,
-        )
-        snapshot = self._commit(table, candidate, catalog, {})
-        return f"delta/{snapshot.snapshot_id.value}/catalog"
+        with self.pin_snapshot(current.snapshot_id):
+            table = self._require_table(current.snapshot_id)
+            head, old_catalog = _metadata(table)
+            if catalog.version.value <= old_catalog.version.value:
+                if catalog == old_catalog:
+                    return f"delta/{current.snapshot_id.value}/catalog"
+                raise WriteConflictError("Catalog changed. Reload it before writing a new version.")
+            candidate = _new_head(
+                head.node_count,
+                head.edge_count,
+                head.labels,
+                head.relationships,
+                None,
+                head.edge_range_size,
+                metadata_version=table.version() + 1,
+            )
+            snapshot = self._commit(table, candidate, catalog, {})
+            return f"delta/{snapshot.snapshot_id.value}/catalog"
 
     def load_for_snapshot(self, manifest: SnapshotManifest) -> VersionedCatalog:
         catalog = self._describe_read_version(self._read_table(manifest.snapshot_id)).catalog
@@ -501,46 +590,47 @@ class DeltaStorageBackend:
     ) -> GraphState:
         from grapharrow.use_cases.graph import GraphState
 
-        base = self._require_table(previous_state.snapshot.snapshot_id)
-        previous_head = self._describe_read_version(
-            self._read_table(previous_state.snapshot.snapshot_id)
-        ).head
-        partitions: dict[str, pa.Table] = {}
-        node_records = tuple(nodes)
-        edge_records = tuple(edges)
-        node_table = previous_state.node_table
-        if node_records != previous_state.nodes:
-            node_table = _nodes_table(nodes)
-            partitions["nodes"] = node_table
-        if edge_records != previous_state.edges:
-            edge_table = edge_table if edge_table is not None else _edges_table(edges)
-            partitions.update(
-                _changed_edge_partitions(
-                    edge_table, previous_state.edge_table, previous_head.edge_range_size
+        with self.pin_snapshot(previous_state.snapshot.snapshot_id):
+            base = self._require_table(previous_state.snapshot.snapshot_id)
+            previous_head = self._describe_read_version(
+                self._read_table(previous_state.snapshot.snapshot_id)
+            ).head
+            partitions: dict[str, pa.Table] = {}
+            node_records = tuple(nodes)
+            edge_records = tuple(edges)
+            node_table = previous_state.node_table
+            if node_records != previous_state.nodes:
+                node_table = _nodes_table(nodes)
+                partitions["nodes"] = node_table
+            if edge_records != previous_state.edges:
+                edge_table = edge_table if edge_table is not None else _edges_table(edges)
+                partitions.update(
+                    _changed_edge_partitions(
+                        edge_table, previous_state.edge_table, previous_head.edge_range_size
+                    )
                 )
-            )
-        else:
-            edge_table = previous_state.edge_table
-        if idempotency_receipt is not None:
-            kind = _receipt_partition(idempotency_receipt.key_hash)
-            receipts = _partition(base, kind, _RECEIPT_COLUMNS)
-            receipt = pa.Table.from_pylist(
-                [asdict(idempotency_receipt)],
-                schema=pa.schema([_SCHEMA.field(name) for name in _RECEIPT_COLUMNS]),
-            )
-            partitions[kind] = pa.concat_tables([receipts.cast(receipt.schema), receipt])
+            else:
+                edge_table = previous_state.edge_table
+            if idempotency_receipt is not None:
+                kind = _receipt_partition(idempotency_receipt.key_hash)
+                receipts = _partition(base, kind, _RECEIPT_COLUMNS)
+                receipt = pa.Table.from_pylist(
+                    [asdict(idempotency_receipt)],
+                    schema=pa.schema([_SCHEMA.field(name) for name in _RECEIPT_COLUMNS]),
+                )
+                partitions[kind] = pa.concat_tables([receipts.cast(receipt.schema), receipt])
 
-        head = _new_head(
-            len(nodes),
-            len(edges),
-            dict(Counter(label for node in nodes for label in set(node.labels))),
-            dict(Counter(edge.rel_type for edge in edges)),
-            idempotency_receipt,
-            previous_head.edge_range_size,
-            metadata_version=base.version() + 1,
-        )
-        manifest = self._commit(base, head, catalog, partitions)
-        return GraphState(catalog, manifest, node_table, edge_table, node_records, edge_records)
+            head = _new_head(
+                len(nodes),
+                len(edges),
+                dict(Counter(label for node in nodes for label in set(node.labels))),
+                dict(Counter(edge.rel_type for edge in edges)),
+                idempotency_receipt,
+                previous_head.edge_range_size,
+                metadata_version=base.version() + 1,
+            )
+            manifest = self._commit(base, head, catalog, partitions)
+            return GraphState(catalog, manifest, node_table, edge_table, node_records, edge_records)
 
     def _commit(
         self,
@@ -554,7 +644,7 @@ class DeltaStorageBackend:
         snapshot_id = SnapshotId(head.metadata_version + 1)
         data = pa.concat_tables(
             [
-                _metadata_table(head, catalog),
+                _metadata_table(head, catalog, managed=bool(self._managed)),
                 *(_rows(part, kind) for kind, part in partitions.items()),
             ]
         )
@@ -600,9 +690,8 @@ class DeltaStorageBackend:
         self, *, edge_id: int, rel_type: str | None, properties: dict[str, object]
     ) -> Generator[tuple[EdgeRecord | None] | None, None, None]:
         """Replace one canonical range after the caller builds its result successfully."""
-        with self._writer.hold():
-            snapshot = self.capture_snapshot()
-            current = self._describe_read_version(self._read_table(snapshot.snapshot_id))
+        with self._writer.hold(), self.borrow_current_snapshot() as snapshot:
+            current = self._describe_pinned_read_version(self._read_table(snapshot.snapshot_id))
             width = current.head.edge_range_size
             if not width or current.catalog.constraints:
                 yield None
@@ -691,9 +780,10 @@ class DeltaStorageBackend:
         )
         try:
             table = self._require_table(None)
-            head, catalog = _metadata(table)
-            manifest = self._manifest(table, head, catalog)
-            self._verify_rows(manifest)
+            with self.pin_snapshot(SnapshotId(table.version() + 1)):
+                head, catalog = _metadata(table)
+                manifest = self._manifest(table, head, catalog)
+                self._verify_rows(manifest)
         except StorageError as exc:
             return VerificationReport(
                 ok=False,
@@ -720,27 +810,28 @@ class DeltaStorageBackend:
     @writer_locked
     def compact(self) -> SnapshotManifest:
         base = self._require_table(None)
-        head, catalog = _metadata(base)
-        manifest = head.manifest(SnapshotId(base.version() + 1), catalog.version)
-        width = self._configured_range_size(head.edge_range_size)
-        candidate = _new_head(
-            head.node_count,
-            head.edge_count,
-            head.labels,
-            head.relationships,
-            None,
-            width,
-            metadata_version=base.version() + 1,
-        )
-        partitions = _edge_partitions(self._graph.load_edge_table(manifest.edges), width)
-        partitions["nodes"] = self._graph.load_node_table(manifest.nodes)
-        return self._commit(
-            base,
-            candidate,
-            catalog,
-            partitions,
-            replace_all_edges=True,
-        )
+        with self.pin_snapshot(SnapshotId(base.version() + 1)):
+            head, catalog = _metadata(base)
+            manifest = head.manifest(SnapshotId(base.version() + 1), catalog.version)
+            width = self._configured_range_size(head.edge_range_size)
+            candidate = _new_head(
+                head.node_count,
+                head.edge_count,
+                head.labels,
+                head.relationships,
+                None,
+                width,
+                metadata_version=base.version() + 1,
+            )
+            partitions = _edge_partitions(self._graph.load_edge_table(manifest.edges), width)
+            partitions["nodes"] = self._graph.load_node_table(manifest.nodes)
+            return self._commit(
+                base,
+                candidate,
+                catalog,
+                partitions,
+                replace_all_edges=True,
+            )
 
     def _configured_range_size(self, default: int) -> int:
         if self._edge_range_size is not None:
@@ -750,8 +841,78 @@ class DeltaStorageBackend:
     def vacuum(self) -> tuple[str, ...]:
         raise StorageError("Delta vacuum is unavailable while historical snapshots are retained.")
 
-    def plan_retention(self, *, keep_last: int, min_age_hours: int = 0) -> RetentionPlan:
-        raise StorageError("Snapshot retention planning is currently available for Native storage.")
+    def storage_inventory(self) -> DeltaStorageInventory:
+        table = self._require_table(None)
+        inventory = inspect_delta_storage(
+            table, self._filesystem, self._layout.delta_dir, self._options
+        )
+        return (
+            replace(inventory, retention=self._retention.status()) if self._managed else inventory
+        )
+
+    def apply_retention(
+        self, *, minimum_snapshot_id: int, online: bool = False
+    ) -> DeltaRetentionResult:
+        table = self._require_table(None)
+        if not self._managed:
+            raise StorageError(
+                "Applying retention requires a Delta database with managed retention."
+            )
+        if not 1 <= minimum_snapshot_id <= table.version() + 1:
+            raise ValueError("minimum_snapshot_id must identify a published snapshot.")
+        plan = plan_delta_retention(
+            table,
+            self._filesystem,
+            self._layout.delta_dir,
+            self._options,
+            keep_last=1,
+            min_age_hours=0,
+            protect_from_snapshot_id=minimum_snapshot_id,
+            minimum_snapshot_id=self._retention.minimum_snapshot_id(),
+        )
+        token = self._retention.begin_cleanup(minimum_snapshot_id, online=online)
+        removed = []
+        for file in plan.candidate_files:
+            try:
+                self._filesystem.delete_file(self._layout.delta_retention_file(file.path))
+            except FileNotFoundError:
+                continue
+            removed.append(file.path)
+        self._retention.finish_cleanup(token)
+        return DeltaRetentionResult(minimum_snapshot_id, tuple(removed))
+
+    def recover_retention_pins(
+        self, incarnation_id: str, *, verifier: Path | None = None
+    ) -> DeltaPinRecoveryResult:
+        table = self._require_table(None)
+        if not self._managed:
+            raise StorageError("Recovering pins requires a Delta database with managed retention.")
+        return self._retention.recover_pins(
+            incarnation_id, database_id=str(table.metadata().id), verifier=verifier
+        )
+
+    def plan_retention(
+        self,
+        *,
+        keep_last: int,
+        min_age_hours: int = 0,
+        protect_from_snapshot_id: int | None = None,
+    ) -> RetentionPlan:
+        if keep_last < 1:
+            raise ValueError("keep_last must be at least 1.")
+        if min_age_hours < 0:
+            raise ValueError("min_age_hours must be nonnegative.")
+        table = self._require_table(None)
+        return plan_delta_retention(
+            table,
+            self._filesystem,
+            self._layout.delta_dir,
+            self._options,
+            keep_last=keep_last,
+            min_age_hours=min_age_hours,
+            protect_from_snapshot_id=protect_from_snapshot_id,
+            minimum_snapshot_id=self._retention.minimum_snapshot_id() if self._managed else 1,
+        )
 
 
 def _new_head(
@@ -792,9 +953,9 @@ def _rows(table: pa.Table, kind: str) -> pa.Table:
     )
 
 
-def _metadata_table(head: _Head, catalog: VersionedCatalog) -> pa.Table:
+def _metadata_table(head: _Head, catalog: VersionedCatalog, *, managed: bool = False) -> pa.Table:
     payload = {
-        "format": _FORMAT,
+        "format": _MANAGED_FORMAT if managed else _FORMAT,
         "graph": asdict(head),
         "catalog": serialize_catalog(catalog),
     }
@@ -839,7 +1000,10 @@ def _metadata(table: DeltaTable) -> tuple[_Head, VersionedCatalog]:
     try:
         payload = orjson.loads(rows["properties_json"][0].as_py())
         data = payload["graph"]
-        if payload["format"] != _FORMAT or "metadata_version" not in data:
+        expected_format = (
+            _MANAGED_FORMAT if table.metadata().description == MANAGED_DESCRIPTION else _FORMAT
+        )
+        if payload["format"] != expected_format or "metadata_version" not in data:
             raise StorageError("Unsupported GraphArrow Delta layout. Use a new database path.")
         width = data["edge_range_size"]
         if type(width) is not int or not 0 <= width < 2**63:

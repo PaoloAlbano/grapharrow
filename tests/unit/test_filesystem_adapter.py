@@ -67,6 +67,8 @@ def test_filesystem_adapter_from_settings_builds_configured_cloud_backends(
         gcs_project_id="grapharrow-test",
         azure_account_name="grapharrowstorage",
         azure_account_key="azure-secret",
+        azure_blob_storage_authority="127.0.0.1:10000/grapharrowstorage",
+        azure_dfs_storage_authority="127.0.0.1:10000/grapharrowstorage",
     )
 
     adapter = FileSystemAdapter.from_settings(settings)
@@ -92,6 +94,8 @@ def test_filesystem_adapter_from_settings_builds_configured_cloud_backends(
     assert azure_path == "container/example-db"
     assert created["az"]["account_name"] == "grapharrowstorage"
     assert created["az"]["account_key"] == "azure-secret"
+    assert created["az"]["blob_storage_authority"] == "127.0.0.1:10000"
+    assert created["az"]["dfs_storage_authority"] == "127.0.0.1:10000"
 
 
 def test_filesystem_adapter_from_settings_requires_azure_account_name() -> None:

@@ -23,7 +23,12 @@ from grapharrow.domain import (
     VersionedCatalog,
 )
 from grapharrow.interfaces.cypher_guard import query_requires_write
-from grapharrow.storage.models import RetentionPlan
+from grapharrow.storage.models import (
+    DeltaPinRecoveryResult,
+    DeltaRetentionResult,
+    DeltaStorageInventory,
+    RetentionPlan,
+)
 from grapharrow.use_cases import (
     InitializationResult,
     QueryResult,
@@ -332,10 +337,36 @@ class Database:
 
         return self._app.use_cases.admin.vacuum()
 
-    def plan_retention(self, *, keep_last: int, min_age_hours: int = 0) -> RetentionPlan:
+    def storage_inventory(self) -> DeltaStorageInventory:
+        """Report the physical footprint of a Delta database."""
+        return self._app.use_cases.admin.storage_inventory()
+
+    def apply_retention(
+        self, *, minimum_snapshot_id: int, online: bool = False
+    ) -> DeltaRetentionResult:
+        """Advance the minimum readable Delta snapshot and delete older Parquet files."""
+        return self._app.use_cases.admin.apply_retention(
+            minimum_snapshot_id=minimum_snapshot_id, online=online
+        )
+
+    def recover_retention_pins(
+        self, incarnation_id: str, *, verifier: Path | None = None
+    ) -> DeltaPinRecoveryResult:
+        """Verify an incarnation fence and remove the associated snapshot pins."""
+        return self._app.use_cases.admin.recover_retention_pins(incarnation_id, verifier=verifier)
+
+    def plan_retention(
+        self,
+        *,
+        keep_last: int,
+        min_age_hours: int = 0,
+        protect_from_snapshot_id: int | None = None,
+    ) -> RetentionPlan:
         """Preview the space a proposed snapshot retention policy could reclaim."""
         return self._app.use_cases.admin.plan_retention(
-            keep_last=keep_last, min_age_hours=min_age_hours
+            keep_last=keep_last,
+            min_age_hours=min_age_hours,
+            protect_from_snapshot_id=protect_from_snapshot_id,
         )
 
     def session(self) -> Session:

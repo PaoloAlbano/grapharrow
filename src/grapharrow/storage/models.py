@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 import pyarrow as pa  # type: ignore[import-untyped]
 
@@ -69,6 +70,71 @@ class RecoveryReport:
     orphan_staged_paths: tuple[str, ...] = field(default_factory=tuple)
     removed_paths: tuple[str, ...] = field(default_factory=tuple)
     warnings: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True, slots=True)
+class StorageFileSummary:
+    """Observed object count, logical size and modification-time range."""
+
+    file_count: int
+    size_bytes: int
+    oldest_modified_at: str | None
+    newest_modified_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DeltaRetentionPin:
+    """Snapshot protection held by one replica incarnation."""
+
+    replica_id: str
+    incarnation_id: str
+    snapshot_id: int
+    acquired_at: str
+    age_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class DeltaRetentionStatus:
+    """Current replica coordination state for managed retention."""
+
+    minimum_snapshot_id: int
+    active_pins: int
+    oldest_pinned_snapshot_id: int | None
+    cleanup_mode: Literal["maintenance", "online"] | None
+    pins: tuple[DeltaRetentionPin, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DeltaStorageInventory:
+    """Classify observed Delta files against one published graph snapshot."""
+
+    head_snapshot_id: int
+    delta_version: int
+    latest_checkpoint_version: int | None
+    commits_since_checkpoint: int
+    active_parquet: StorageFileSummary
+    historical_parquet: StorageFileSummary
+    untracked_parquet: StorageFileSummary
+    commit_logs: StorageFileSummary
+    checkpoints: StorageFileSummary
+    missing_active_parquet_count: int
+    retention: DeltaRetentionStatus | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DeltaRetentionResult:
+    """Completed cleanup and the durable floor shared by all replicas."""
+
+    minimum_snapshot_id: int
+    removed_parquet_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DeltaPinRecoveryResult:
+    """Pins reclaimed after fencing one replica incarnation."""
+
+    incarnation_id: str
+    released_pins: int
 
 
 @dataclass(frozen=True, slots=True)

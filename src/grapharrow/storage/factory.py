@@ -28,7 +28,7 @@ def create_storage_backend(
                 raise
             raise StorageError("Install grapharrow[delta] to use the Delta backend.") from exc
         return DeltaStorageBackend(
-            layout=layout, settings=settings, snapshot_tables=snapshot_tables
+            layout=layout, settings=settings, filesystem=filesystem, snapshot_tables=snapshot_tables
         )
 
     if settings.storage_backend != "native":

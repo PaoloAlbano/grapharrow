@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
+import signal
+from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -18,6 +22,8 @@ from grapharrow.app import build_application
 from grapharrow.config import GraphArrowSettings
 from grapharrow.core.errors import StorageError, WriteConflictError
 from grapharrow.domain.snapshot import IdempotencyReceipt
+from grapharrow.interfaces.cli import main
+from grapharrow.interfaces.embedded import Database
 from grapharrow.interfaces.rest import create_rest_app
 from grapharrow.use_cases.ana import GraphArrowAgentBackend
 from tests.integration.delta_log_gate import pause_delta_log_put
@@ -66,6 +72,708 @@ def _post(client: TestClient, name: str, key: str) -> Any:
         json={"query": CREATE, "params": {"name": name}},
         headers={"Idempotency-Key": key},
     )
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+def test_delta_checkpoint_interval_is_persisted_for_all_replicas(
+    delta_database: tuple[str | Path, GraphArrowSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from deltalake import DeltaTable
+
+    path, settings = delta_database
+    monkeypatch.setenv("GRAPHARROW_STORAGE_BACKEND", "delta")
+    monkeypatch.setenv("GRAPHARROW_DELTA_CHECKPOINT_INTERVAL", "3")
+    writer = build_application(path)
+    writer.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    replica = build_application(
+        path, settings=settings.model_copy(update={"delta_checkpoint_interval": 5})
+    )
+    replica.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025})
+    table = DeltaTable(str(replica.layout.delta_dir))
+    assert table.metadata().configuration["delta.checkpointInterval"] == "3"
+    inventory = replica.use_cases.admin.storage_inventory()
+    assert inventory.delta_version == inventory.latest_checkpoint_version == 2
+    assert inventory.commits_since_checkpoint == 0
+
+
+@pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
+def test_delta_snapshot_probe_reuses_the_head_and_detects_remote_commits(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from grapharrow.storage.delta import DeltaStorageBackend
+
+    path, settings = delta_database
+    writer = build_application(path, settings=settings)
+    reader = build_application(path, settings=settings)
+    backend = reader.storage_backend
+    assert isinstance(backend, DeltaStorageBackend)
+    writer.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    pinned = backend.capture_snapshot()
+    open_table = backend._try_open
+    opens = 0
+
+    def count_opens():
+        nonlocal opens
+        opens += 1
+        return open_table()
+
+    monkeypatch.setattr(backend, "_try_open", count_opens)
+    assert backend.capture_snapshot() is pinned
+    assert opens == 0
+
+    writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025})
+    writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2026})
+    current = backend.capture_snapshot()
+    assert current.snapshot_id.value == pinned.snapshot_id.value + 2
+    assert opens == 1
+    assert backend.capture_snapshot() is current
+    assert opens == 1
+
+    graph = reader.use_cases.graph
+    assert graph.load_state(snapshot=pinned).edges[0].properties == {"since": 2020}
+    assert graph.load_state(snapshot=current).edges[0].properties == {"since": 2026}
+
+
+@pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
+def test_delta_storage_inventory_reports_physical_files_and_log_tail(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+) -> None:
+    from grapharrow.storage.delta import DeltaStorageBackend
+
+    path, settings = delta_database
+    writer = build_application(path, settings=settings)
+    reader = Database(path, settings=settings)
+    backend = writer.storage_backend
+    assert isinstance(backend, DeltaStorageBackend)
+    writer.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    before = reader.storage_inventory()
+    assert before.head_snapshot_id == 2
+    assert before.delta_version == 1
+    assert before.active_parquet.file_count == 3
+    assert before.checkpoints.file_count == 0
+    assert before.latest_checkpoint_version is None
+    assert before.commit_logs.file_count == before.commits_since_checkpoint == 2
+
+    table = backend._require_table(None)
+    table.create_checkpoint()
+    writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025})
+    staged = b"unpublished staged data"
+    location = f"{writer.layout.delta_dir}/kind=nodes/staged.parquet"
+    filesystem, staged_path = writer.adapters.filesystem.resolve(location)
+    with filesystem.open_output_stream(staged_path) as stream:
+        stream.write(staged)
+    inventory = reader.storage_inventory()
+    assert inventory.head_snapshot_id == 3
+    assert inventory.delta_version == 2
+    assert inventory.latest_checkpoint_version == 1
+    assert inventory.commits_since_checkpoint == 1
+    assert inventory.commit_logs.file_count == 3
+    assert inventory.commit_logs.size_bytes > before.commit_logs.size_bytes
+    assert inventory.checkpoints.file_count == 1
+    assert inventory.checkpoints.size_bytes > 0
+    assert inventory.active_parquet.file_count == before.active_parquet.file_count
+    assert inventory.missing_active_parquet_count == 0
+    assert inventory.historical_parquet.file_count == before.historical_parquet.file_count + 1
+    assert inventory.historical_parquet.size_bytes > before.historical_parquet.size_bytes
+    assert inventory.untracked_parquet.file_count == 1
+    assert inventory.untracked_parquet.size_bytes == len(staged)
+    oldest = inventory.historical_parquet.oldest_modified_at
+    newest = inventory.historical_parquet.newest_modified_at
+    assert oldest and newest and datetime.fromisoformat(oldest) <= datetime.fromisoformat(newest)
+    assert reader.storage_inventory() == inventory
+    with filesystem.open_input_file(staged_path) as stream:
+        assert stream.read() == staged
+    assert backend.capture_snapshot().snapshot_id.value == 3
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+def test_delta_inventory_uses_one_snapshot_when_a_replica_publishes_during_listing(
+    delta_database: tuple[str | Path, GraphArrowSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from grapharrow.storage import delta
+
+    path, settings = delta_database
+    writer = build_application(path, settings=settings)
+    reader = build_application(path, settings=settings)
+    writer.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    before = reader.use_cases.admin.storage_inventory()
+    inspect_storage = delta.inspect_delta_storage
+
+    def publish_then_inspect(*args: Any) -> Any:
+        writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025})
+        writer.storage_backend.maintenance.compact()
+        return inspect_storage(*args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(delta, "inspect_delta_storage", publish_then_inspect)
+        during = reader.use_cases.admin.storage_inventory()
+    assert during.head_snapshot_id == before.head_snapshot_id
+    assert during.active_parquet == before.active_parquet
+    assert during.commit_logs == before.commit_logs
+    assert during.historical_parquet == before.historical_parquet
+    assert during.untracked_parquet.file_count > 0
+    after = reader.use_cases.admin.storage_inventory()
+    assert after.head_snapshot_id == before.head_snapshot_id + 2
+    assert after.untracked_parquet.file_count == 0
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+def test_delta_storage_inventory_cli_and_authenticated_rest(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, settings = delta_database
+    database = Database(path, settings=settings)
+    database.initialize()
+    expected = asdict(database.storage_inventory())
+    monkeypatch.setenv("GRAPHARROW_STORAGE_BACKEND", "delta")
+    assert main(["storage-inventory", str(path)]) == 0
+    assert json.loads(capsys.readouterr().out) == expected
+    with TestClient(
+        create_rest_app(path, settings=settings.model_copy(update={"server_auth_token": "secret"}))
+    ) as client:
+        route = "/v1/admin/storage/inventory"
+        assert client.get(route).status_code == 401
+        response = client.get(route, headers={"Authorization": "Bearer secret"})
+    assert response.status_code == 200
+    assert response.json()["data"] == expected
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+def test_delta_storage_inventory_does_not_initialize_a_missing_database(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+) -> None:
+    path, settings = delta_database
+    assert isinstance(path, Path)
+    with pytest.raises(StorageError, match="Delta graph does not exist"):
+        Database(path, settings=settings).storage_inventory()
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+def test_delta_storage_inventory_rejects_missing_commit_json_even_after_a_checkpoint(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+) -> None:
+    from grapharrow.storage.delta import DeltaStorageBackend
+
+    path, settings = delta_database
+    app = build_application(path, settings=settings)
+    backend = app.storage_backend
+    assert isinstance(backend, DeltaStorageBackend)
+    app.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    backend._require_table(None).create_checkpoint()
+    backend._log_storage.delete_file("_delta_log/00000000000000000000.json")
+    with pytest.raises(StorageError, match="requires the complete commit log"):
+        app.use_cases.admin.storage_inventory()
+
+
+@pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
+def test_delta_retention_preview_respects_a_pinned_reader_and_rest_replay(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+) -> None:
+    import pyarrow as pa
+
+    from grapharrow.domain import SnapshotId
+    from grapharrow.storage.delta import DeltaStorageBackend
+
+    path, settings = delta_database
+    writer = build_application(path, settings=settings)
+    reader = build_application(path, settings=settings)
+    backend = writer.storage_backend
+    assert isinstance(backend, DeltaStorageBackend)
+    database = Database(path, settings=settings)
+    with TestClient(create_rest_app(path, settings=settings)) as client:
+        original = _post(client, "Graph", "once")
+        assert original.status_code == 200
+        with GraphArrowAgentBackend(reader) as workflow:
+            pinned = workflow._state.snapshot
+            for year in (2025, 2026, 2027):
+                writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": year})
+            head = backend.capture_snapshot()
+            assert head.snapshot_id.value == 5
+            backend._require_table(None).create_checkpoint()
+
+            filesystem, staged = writer.adapters.filesystem.resolve(
+                f"{writer.layout.delta_dir}/kind=nodes/staged.parquet"
+            )
+            with filesystem.open_output_stream(staged) as stream:
+                stream.write(b"unpublished")
+            before = database.storage_inventory()
+            assert before.untracked_parquet.file_count == 1
+
+            def files_at(snapshot_id: int) -> set[str]:
+                table = backend._require_table(SnapshotId(snapshot_id))
+                return {
+                    f"delta/{file}"
+                    for file in pa.table(table.get_add_actions()).column("path").to_pylist()
+                }
+
+            plan = database.plan_retention(keep_last=2)
+            assert plan.retained_snapshot_ids == (5, 4)
+            assert plan.older_snapshot_ids == (3, 2, 1)
+            retained = files_at(5) | files_at(4)
+            older = files_at(3) | files_at(2) | files_at(1)
+            assert {file.path for file in plan.candidate_files} == older - retained
+            assert set(plan.shared_parquet_paths) == older & retained
+            assert not plan.missing_candidate_paths
+            for candidate in plan.candidate_files:
+                assert (
+                    writer.adapters.filesystem.file_size(f"{writer.layout.root}/{candidate.path}")
+                    == candidate.size_bytes
+                )
+            assert plan.estimated_reclaimable_bytes == sum(
+                file.size_bytes for file in plan.candidate_files
+            )
+
+            protected = database.plan_retention(
+                keep_last=2, protect_from_snapshot_id=pinned.snapshot_id.value
+            )
+            assert protected.retained_snapshot_ids == (5, 4, 3, 2)
+            assert {file.path for file in protected.candidate_files} == files_at(1) - (
+                retained | files_at(3) | files_at(2)
+            )
+            assert database.storage_inventory() == before
+            assert reader.use_cases.graph.load_state(snapshot=pinned).edges[0].properties == {
+                "since": 2020
+            }
+            assert _post(client, "Graph", "once").content == original.content
+            assert _post(client, "Other", "once").status_code == 409
+            assert backend.capture_snapshot() == head
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+def test_delta_retention_uses_commit_age_and_reports_a_missing_older_file(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+) -> None:
+    path, settings = delta_database
+    assert isinstance(path, Path)
+    app = build_application(path, settings=settings)
+    app.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    app.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025})
+    app.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2026})
+    now = datetime.now(UTC)
+    for version, age in enumerate((48, 2, 24, 1)):
+        log = path / "delta" / "_delta_log" / f"{version:020d}.json"
+        actions = [orjson.loads(line) for line in log.read_bytes().splitlines()]
+        commit = next(action["commitInfo"] for action in actions if "commitInfo" in action)
+        commit["timestamp"] = int((now - timedelta(hours=age)).timestamp() * 1000)
+        log.write_bytes(b"\n".join(orjson.dumps(action) for action in actions) + b"\n")
+
+    database = Database(path, settings=settings)
+    plan = database.plan_retention(keep_last=1, min_age_hours=4)
+    assert plan.retained_snapshot_ids == (4, 3, 2)
+    assert plan.older_snapshot_ids == (1,)
+    (candidate,) = plan.candidate_files
+    (path / candidate.path).unlink()
+    updated = database.plan_retention(keep_last=1, min_age_hours=4)
+    assert updated.missing_candidate_paths == (candidate.path,)
+    assert updated.estimated_reclaimable_bytes == 0
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+def test_delta_retention_plan_cli_and_authenticated_rest(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, settings = delta_database
+    app = build_application(path, settings=settings)
+    app.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    monkeypatch.setenv("GRAPHARROW_STORAGE_BACKEND", "delta")
+    assert (
+        main(["retention-plan", str(path), "--keep-last", "1", "--protect-from-snapshot-id", "1"])
+        == 0
+    )
+    cli_plan = json.loads(capsys.readouterr().out)
+    with TestClient(
+        create_rest_app(path, settings=settings.model_copy(update={"server_auth_token": "secret"}))
+    ) as client:
+        route = "/v1/admin/retention/plan"
+        params = {"keep_last": 1, "protect_from_snapshot_id": 1}
+        assert client.get(route, params=params).status_code == 401
+        auth = {"Authorization": "Bearer secret"}
+        response = client.get(route, params=params, headers=auth)
+        assert response.status_code == 200
+        assert (
+            client.get(
+                route, params={**params, "protect_from_snapshot_id": 3}, headers=auth
+            ).status_code
+            == 400
+        )
+    rest_plan = response.json()["data"]
+    assert rest_plan.pop("evaluated_at") and cli_plan.pop("evaluated_at")
+    assert rest_plan == cli_plan
+    assert rest_plan["retained_snapshot_ids"] == [2, 1]
+    assert rest_plan["candidate_files"] == []
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+@pytest.mark.parametrize("warm", [False, True], ids=["fresh-head", "cached-head"])
+@pytest.mark.parametrize("operation", ["ana", "point-set"])
+def test_managed_delta_holds_one_admission_from_snapshot_selection_to_completion(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    warm: bool,
+    operation: str,
+) -> None:
+    from grapharrow.storage.delta import DeltaStorageBackend
+
+    path, settings = delta_database
+    writer = build_application(
+        path, settings=settings.model_copy(update={"delta_managed_retention": True})
+    )
+    writer.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    app = build_application(path, settings=settings)
+    backend = app.storage_backend
+    assert isinstance(backend, DeltaStorageBackend)
+    admission = backend._retention
+    if warm:
+        assert backend.capture_snapshot().snapshot_id.value == 2
+
+    admit = admission._admit
+    admissions: list[int] = []
+
+    def record_admission(snapshot_id: int, token: str) -> None:
+        admit(snapshot_id, token)
+        admissions.append(snapshot_id)
+
+    def assert_active() -> None:
+        assert admissions == [2]
+        assert admission.status().oldest_pinned_snapshot_id == 2
+        assert admission.status().active_pins == 1
+
+    monkeypatch.setattr(admission, "_admit", record_admission)
+    if operation == "ana":
+        with GraphArrowAgentBackend(app) as workflow:
+            assert_active()
+            assert workflow.call("schema_overview", {})["labels"]
+            assert_active()
+    else:
+        publish = backend._commit_point
+
+        def observe_publication(*args: Any) -> None:
+            assert_active()
+            publish(*args)
+
+        monkeypatch.setattr(backend, "_commit_point", observe_publication)
+        assert app.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025}).rows == (
+            {"since": 2025},
+        )
+    assert admissions == [2]
+    assert admission.status().active_pins == 0
+
+
+@pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
+def test_managed_delta_retention_coordinates_live_replicas(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+) -> None:
+    from grapharrow.use_cases.graph import GraphTransactionUseCase
+
+    path, settings = delta_database
+    writer_settings = settings.model_copy(update={"delta_managed_retention": True})
+    writer = build_application(path, settings=writer_settings)
+    reader = build_application(path, settings=settings)
+    database = Database(path, settings=settings)
+    with TestClient(create_rest_app(path, settings=writer_settings)) as client:
+        original = _post(client, "Graph", "once")
+        assert original.status_code == 200
+        with GraphTransactionUseCase(reader.use_cases.graph) as transaction:
+            with GraphArrowAgentBackend(reader) as old:
+                old_id = old._state.snapshot.snapshot_id
+                status = database.storage_inventory().retention
+                assert status is not None and status.active_pins == 1
+                writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025})
+                head = writer.storage_backend.capture_snapshot().snapshot_id
+                with pytest.raises(StorageError, match="Active Delta snapshot pins"):
+                    database.apply_retention(minimum_snapshot_id=head.value, online=True)
+                assert old.call("schema_overview", {})["labels"]
+            assert transaction.load_state().edges[0].properties == {"since": 2020}
+            with pytest.raises(StorageError, match="Active Delta snapshot pins"):
+                database.apply_retention(minimum_snapshot_id=head.value, online=True)
+        with GraphArrowAgentBackend(reader) as current:
+            with pytest.raises(StorageError, match="Active Delta snapshot pins"):
+                database.apply_retention(minimum_snapshot_id=head.value)
+            plan = database.plan_retention(keep_last=1)
+            assert plan.candidate_files
+            filesystem = database._app.adapters.filesystem
+            delete = filesystem.delete_file
+            observed_online = False
+
+            def delete_with_concurrent_work(location: str | Path) -> None:
+                nonlocal observed_online
+                if not observed_online:
+                    observed_online = True
+                    status = database.storage_inventory().retention
+                    assert status is not None and status.cleanup_mode == "online"
+                    assert current.call("schema_overview", {})["labels"]
+                    assert writer.use_cases.cypher.execute(
+                        SET_EDGE, {"id": 1, "since": 2026}
+                    ).rows == ({"since": 2026},)
+                delete(location)
+
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(filesystem, "delete_file", delete_with_concurrent_work)
+                result = database.apply_retention(minimum_snapshot_id=head.value, online=True)
+            assert observed_online
+            assert result.minimum_snapshot_id == head.value
+            assert set(result.removed_parquet_paths) == {item.path for item in plan.candidate_files}
+        with pytest.raises(StorageError, match=f"snapshot {old_id.value} has expired"):
+            database.load_snapshot(old_id)
+        with pytest.raises(StorageError, match="already expired"):
+            database.plan_retention(keep_last=1, protect_from_snapshot_id=old_id.value)
+        assert database.storage_inventory().historical_parquet.file_count == 1
+        assert _post(client, "Graph", "once").content == original.content
+        assert _post(client, "Different", "once").status_code == 409
+        assert database.verify().ok
+        assert len(list(reader.repositories.snapshot.history())) == 2
+
+
+def _retention_process_stops_after_one_delete(path: Path, minimum_snapshot_id: int) -> None:
+    app = build_application(path, settings=GraphArrowSettings(storage_backend="delta"))
+    delete = app.adapters.filesystem.delete_file
+
+    def delete_and_stop(location: str | Path) -> None:
+        delete(location)
+        os._exit(77)
+
+    app.adapters.filesystem.delete_file = delete_and_stop  # type: ignore[method-assign]
+    app.use_cases.admin.apply_retention(minimum_snapshot_id=minimum_snapshot_id)
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+def test_managed_delta_retention_recovers_after_the_cleaner_exits(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, settings = delta_database
+    assert isinstance(path, Path)
+    writer_settings = settings.model_copy(update={"delta_managed_retention": True})
+    writer = build_application(path, settings=writer_settings)
+    with TestClient(create_rest_app(path, settings=writer_settings)) as client:
+        original = _post(client, "Graph", "once")
+        assert original.status_code == 200
+        old = writer.storage_backend.capture_snapshot().snapshot_id
+        for year in (2025, 2026):
+            writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": year})
+        head = writer.storage_backend.capture_snapshot().snapshot_id
+        database = Database(path, settings=settings)
+        plan = database.plan_retention(keep_last=1)
+        assert len(plan.candidate_files) >= 2
+        child = multiprocessing.get_context("spawn").Process(
+            target=_retention_process_stops_after_one_delete, args=(path, head.value)
+        )
+        child.start()
+        try:
+            child.join(timeout=30)
+            assert child.exitcode == 77
+        finally:
+            if child.is_alive():
+                child.kill()
+                child.join(timeout=5)
+
+        assert sum(not (path / item.path).exists() for item in plan.candidate_files) == 1
+        status = database.storage_inventory().retention
+        assert status is not None and status.cleanup_mode == "maintenance"
+        assert status.minimum_snapshot_id == head.value
+        with pytest.raises(StorageError, match="paused for retention maintenance"):
+            database.load_snapshot()
+        with pytest.raises(StorageError, match=f"snapshot {old.value} has expired"):
+            database.load_snapshot(old)
+        with pytest.raises(StorageError, match="same cutoff and mode"):
+            database.apply_retention(minimum_snapshot_id=head.value, online=True)
+
+        monkeypatch.setenv("GRAPHARROW_STORAGE_BACKEND", "delta")
+        assert main(["retention-apply", str(path), "--minimum-snapshot-id", str(head.value)]) == 0
+        assert all(not (path / item.path).exists() for item in plan.candidate_files)
+        assert database.load_snapshot().snapshot_id == head
+        assert database.storage_inventory().commit_logs.file_count == head.value
+        assert database.apply_retention(minimum_snapshot_id=head.value).removed_parquet_paths == ()
+        assert _post(client, "Graph", "once").content == original.content
+        assert database.verify().ok
+
+
+def _retention_reader_waits_for_cutover(
+    path: str | Path, channel: Connection, settings: GraphArrowSettings | None = None
+) -> None:
+    app = build_application(path, settings=settings or GraphArrowSettings(storage_backend="delta"))
+    with GraphArrowAgentBackend(app) as workflow:
+        snapshot = workflow._state.snapshot.snapshot_id
+        channel.send(snapshot.value)
+        assert channel.poll(30) and channel.recv() == "finish"
+        assert workflow.call("schema_overview", {})["labels"]
+    channel.send("closed")
+    assert channel.poll(30) and channel.recv() == "after-cutover"
+    try:
+        app.repositories.snapshot.load_manifest(snapshot)
+    except StorageError as error:
+        channel.send(str(error))
+    else:
+        raise AssertionError("The suspended replica was able to reopen an expired snapshot")
+    channel.close()
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+def test_managed_delta_retention_keeps_the_pin_of_a_waiting_process(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+) -> None:
+    path, settings = delta_database
+    assert isinstance(path, Path)
+    writer = build_application(
+        path, settings=settings.model_copy(update={"delta_managed_retention": True})
+    )
+    writer.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe()
+    replica = context.Process(target=_retention_reader_waits_for_cutover, args=(path, child))
+    replica.start()
+    child.close()
+    try:
+        assert parent.poll(30)
+        old = parent.recv()
+        writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025})
+        cutoff = writer.storage_backend.capture_snapshot().snapshot_id.value
+        maintainer = writer.use_cases.admin
+        status = maintainer.storage_inventory().retention
+        assert status is not None and status.oldest_pinned_snapshot_id == old
+        with pytest.raises(StorageError, match="Active Delta snapshot pins"):
+            maintainer.apply_retention(minimum_snapshot_id=cutoff, online=True)
+        if os.name == "posix":
+            assert replica.pid is not None
+            os.kill(replica.pid, signal.SIGSTOP)
+            try:
+                with pytest.raises(StorageError, match="still holds its process lock"):
+                    maintainer.recover_retention_pins(status.pins[0].incarnation_id)
+            finally:
+                os.kill(replica.pid, signal.SIGCONT)
+        parent.send("finish")
+        assert parent.poll(30) and parent.recv() == "closed"
+        maintainer.apply_retention(minimum_snapshot_id=cutoff, online=True)
+        parent.send("after-cutover")
+        assert parent.poll(30) and f"snapshot {old} has expired" in parent.recv()
+        replica.join(timeout=5)
+        assert replica.exitcode == 0
+    finally:
+        parent.close()
+        if replica.is_alive():
+            replica.kill()
+            replica.join(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Requires a POSIX process and verifier executable.")
+@pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
+def test_managed_delta_recovers_only_a_fenced_incarnation(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from grapharrow.domain import SnapshotId
+    from grapharrow.storage.delta import DeltaStorageBackend
+
+    path, settings = delta_database
+    writer = build_application(
+        path, settings=settings.model_copy(update={"delta_managed_retention": True})
+    )
+    writer.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    database = Database(path, settings=settings)
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe()
+    replica = context.Process(
+        target=_retention_reader_waits_for_cutover,
+        args=(path, child, settings.model_copy(update={"delta_replica_id": "spot-worker"})),
+    )
+    replica.start()
+    child.close()
+    try:
+        assert parent.poll(30)
+        old = parent.recv()
+        status = database.storage_inventory().retention
+        assert status is not None
+        (pin,) = status.pins
+        assert pin.replica_id == "spot-worker"
+        assert pin.snapshot_id == old and pin.age_seconds >= 0
+        assert datetime.fromisoformat(pin.acquired_at).tzinfo is not None
+        incarnation = pin.incarnation_id
+        verifier = None
+        if isinstance(path, Path):
+            with pytest.raises(StorageError, match="still holds its process lock"):
+                database.recover_retention_pins(incarnation)
+        else:
+            with pytest.raises(StorageError, match="requires an external fence verifier"):
+                database.recover_retention_pins(incarnation)
+            backend = writer.storage_backend
+            assert isinstance(backend, DeltaStorageBackend)
+            table = backend._require_table(None)
+            assert replica.pid is not None
+            verifier = tmp_path / "local-supervisor"
+            verifier.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "request = json.load(sys.stdin)\n"
+                f"assert request['database_id'] == {str(table.metadata().id)!r}\n"
+                f"assert request['database_location'] == {str(path)!r}\n"
+                f"assert request['incarnation_id'] == {incarnation!r}\n"
+                "assert request['replica_id'] == 'spot-worker'\n"
+                "try:\n"
+                f"    os.kill({replica.pid}, 0)\n"
+                "except ProcessLookupError:\n"
+                "    print(json.dumps({**request, 'fenced': True, 'drained': True}))\n"
+                "else:\n"
+                "    sys.exit(1)\n"
+            )
+            verifier.chmod(0o700)
+            with pytest.raises(StorageError, match="did not confirm"):
+                database.recover_retention_pins(incarnation, verifier=verifier)
+
+        writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025})
+        head = writer.storage_backend.capture_snapshot().snapshot_id
+        with pytest.raises(StorageError, match="Active Delta snapshot pins"):
+            database.apply_retention(minimum_snapshot_id=head.value, online=True)
+        replica.kill()
+        replica.join(timeout=5)
+        assert replica.exitcode == -signal.SIGKILL
+        if verifier is not None:
+            script = verifier.read_text()
+            verifier.write_text(
+                script.replace("'fenced': True", "'challenge': 'old-challenge', 'fenced': True")
+            )
+            with pytest.raises(StorageError, match="did not confirm"):
+                database.recover_retention_pins(incarnation, verifier=verifier)
+            verifier.write_text(script.replace("'drained': True", "'drained': False"))
+            with pytest.raises(StorageError, match="did not confirm"):
+                database.recover_retention_pins(incarnation, verifier=verifier)
+            verifier.write_text(script)
+
+        new_replica = build_application(path, settings=settings)
+        with GraphArrowAgentBackend(new_replica) as current:
+            result = database.recover_retention_pins(incarnation, verifier=verifier)
+            assert result.incarnation_id == incarnation and result.released_pins == 1
+            assert (
+                database.recover_retention_pins(incarnation, verifier=verifier).released_pins == 0
+            )
+            status = database.storage_inventory().retention
+            assert status is not None and len(status.pins) == 1
+            assert status.pins[0].incarnation_id != incarnation
+            database.apply_retention(minimum_snapshot_id=head.value, online=True)
+            assert current.call("schema_overview", {})["labels"]
+
+        if isinstance(path, Path):
+            monkeypatch.setenv("GRAPHARROW_STORAGE_BACKEND", "delta")
+            assert main(["retention-recover-pins", str(path), "--incarnation-id", incarnation]) == 0
+
+        stale_backend = build_application(path, settings=settings).storage_backend
+        assert isinstance(stale_backend, DeltaStorageBackend)
+        monkeypatch.setattr(stale_backend._retention, "_incarnation_id", incarnation)
+        with pytest.raises(StorageError, match="incarnation has been fenced"):
+            stale_backend.load_manifest(head)
+        with pytest.raises(StorageError, match="has expired"):
+            database.load_snapshot(SnapshotId(old))
+    finally:
+        parent.close()
+        if replica.is_alive():
+            replica.kill()
+            replica.join(timeout=5)
 
 
 @pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
@@ -196,6 +904,18 @@ def test_killed_delta_writer_leaves_one_atomic_rest_effect(
                 f"receipt-{key_hash[:2]}",
             } <= gate.staged_partitions
             assert_visible_state(after_publish)
+            maintainer = build_application(path, settings=settings).use_cases.admin
+            inventory = maintainer.storage_inventory()
+            if after_publish:
+                assert inventory.untracked_parquet.file_count == 0
+            else:
+                assert inventory.untracked_parquet.file_count >= 4
+            preview = maintainer.plan_retention(
+                keep_last=1, protect_from_snapshot_id=initial.snapshot_id.value
+            )
+            assert preview.head_snapshot_id == inventory.head_snapshot_id
+            assert preview.retained_snapshot_ids[-1] == initial.snapshot_id.value
+            assert preview.candidate_files == ()
             assert writer.is_alive()
             writer.kill()
             writer.join(timeout=10)

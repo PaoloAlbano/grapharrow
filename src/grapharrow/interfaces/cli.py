@@ -135,6 +135,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     vacuum_parser.add_argument("path", help="Database directory to vacuum.")
 
+    inventory_parser = subparsers.add_parser(
+        "storage-inventory",
+        help="Report the physical footprint of a Delta database.",
+    )
+    inventory_parser.add_argument("path", help="Database directory or URI to inspect.")
+
     retention_parser = subparsers.add_parser(
         "retention-plan",
         help="Estimate reclaimable Parquet space for a proposed snapshot policy.",
@@ -145,6 +151,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retention_parser.add_argument(
         "--min-age-hours", type=int, default=0, help="Keep snapshots within this age window."
+    )
+    retention_parser.add_argument(
+        "--protect-from-snapshot-id",
+        type=int,
+        help="Keep this snapshot and every newer snapshot in the preview.",
+    )
+
+    retention_apply_parser = subparsers.add_parser(
+        "retention-apply",
+        help="Advance the Delta snapshot floor and delete expired historical Parquet files.",
+    )
+    retention_apply_parser.add_argument("path", help="Database directory or URI to maintain.")
+    retention_apply_parser.add_argument(
+        "--minimum-snapshot-id", type=int, required=True, help="First snapshot to keep."
+    )
+    retention_apply_parser.add_argument(
+        "--online", action="store_true", help="Allow reads and writes at or above the new floor."
+    )
+
+    recover_pins_parser = subparsers.add_parser(
+        "retention-recover-pins", help="Verify a replica fence and recover its Delta pins."
+    )
+    recover_pins_parser.add_argument("path", help="Database directory or URI to maintain.")
+    recover_pins_parser.add_argument(
+        "--incarnation-id", required=True, help="Exact replica incarnation from storage-inventory."
+    )
+    recover_pins_parser.add_argument(
+        "--verifier", type=Path, help="Absolute path to a trusted external fence verifier."
     )
 
     bulk_nodes_parser = subparsers.add_parser(
@@ -454,11 +488,41 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps({"removed_paths": list(removed_paths)}, indent=2, sort_keys=True))
         return 0
 
+    if args.command == "storage-inventory":
+        try:
+            inventory = Database(args.path).storage_inventory()
+        except StorageError as exc:
+            parser.error(str(exc))
+        print(json.dumps(asdict(inventory), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "retention-recover-pins":
+        try:
+            recovered = Database(args.path).recover_retention_pins(
+                args.incarnation_id, verifier=args.verifier
+            )
+        except (ValueError, StorageError) as exc:
+            parser.error(str(exc))
+        print(json.dumps(asdict(recovered), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "retention-apply":
+        try:
+            cleanup = Database(args.path).apply_retention(
+                minimum_snapshot_id=args.minimum_snapshot_id, online=args.online
+            )
+        except (ValueError, StorageError) as exc:
+            parser.error(str(exc))
+        print(json.dumps(asdict(cleanup), indent=2, sort_keys=True))
+        return 0
+
     if args.command == "retention-plan":
         database = Database(args.path)
         try:
             plan = database.plan_retention(
-                keep_last=args.keep_last, min_age_hours=args.min_age_hours
+                keep_last=args.keep_last,
+                min_age_hours=args.min_age_hours,
+                protect_from_snapshot_id=args.protect_from_snapshot_id,
             )
         except (ValueError, StorageError) as exc:
             parser.error(str(exc))

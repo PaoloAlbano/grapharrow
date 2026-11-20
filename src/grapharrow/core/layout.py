@@ -49,6 +49,14 @@ class DatabaseLayout:
         return self._join("delta")
 
     @property
+    def delta_admission_path(self) -> Location:
+        return self._join("delta_snapshot_admission.json")
+
+    def delta_retention_file(self, relative_path: str) -> Location:
+        """Resolve a database-relative Delta Parquet path from the retention plan."""
+        return self._join(relative_path)
+
+    @property
     def delta_initial_commit_path(self) -> Location:
         return self._join("delta", "_delta_log", "00000000000000000000.json")
 

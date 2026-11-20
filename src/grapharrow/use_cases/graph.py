@@ -152,8 +152,11 @@ class GraphStateUseCase:
             slots.release()
 
     def capture_snapshot(self) -> SnapshotManifest:
-        """Pin a published snapshot without loading canonical graph tables."""
+        """Capture a published manifest without loading canonical graph tables."""
         return self._storage_backend.capture_snapshot()
+
+    def pin_snapshot(self, snapshot: SnapshotManifest) -> AbstractContextManager[None]:
+        return self._storage_backend.pin_snapshot(snapshot.snapshot_id)
 
     def idempotency_base(self, key_hash: str) -> tuple[SnapshotManifest, IdempotencyReceipt | None]:
         """Find a receipt and the write base in the same published history."""
@@ -176,19 +179,20 @@ class GraphStateUseCase:
 
         if snapshot is None:
             snapshot = self.capture_snapshot()
-        catalog = self._catalog_store.load_for_snapshot(snapshot)
-        node_table = self._graph_store.load_node_table(snapshot.nodes)
-        edge_table = self._graph_store.load_edge_table(snapshot.edges)
-        nodes = tuple(self._graph_store.node_records_from_table(node_table))
-        edges = tuple(self._graph_store.edge_records_from_table(edge_table))
-        return GraphState(
-            catalog=catalog,
-            snapshot=snapshot,
-            node_table=node_table,
-            edge_table=edge_table,
-            nodes=nodes,
-            edges=edges,
-        )
+        with self.pin_snapshot(snapshot):
+            catalog = self._catalog_store.load_for_snapshot(snapshot)
+            node_table = self._graph_store.load_node_table(snapshot.nodes)
+            edge_table = self._graph_store.load_edge_table(snapshot.edges)
+            nodes = tuple(self._graph_store.node_records_from_table(node_table))
+            edges = tuple(self._graph_store.edge_records_from_table(edge_table))
+            return GraphState(
+                catalog=catalog,
+                snapshot=snapshot,
+                node_table=node_table,
+                edge_table=edge_table,
+                nodes=nodes,
+                edges=edges,
+            )
 
     def load_tabular_state(
         self, *, include_edges: bool = True, snapshot: SnapshotManifest | None = None
@@ -197,46 +201,52 @@ class GraphStateUseCase:
 
         if snapshot is None:
             snapshot = self.capture_snapshot()
-        catalog = self._catalog_store.load_for_snapshot(snapshot)
-        node_table = self._graph_store.load_node_table(snapshot.nodes)
-        edge_table = (
-            self._graph_store.load_edge_table(snapshot.edges)
-            if include_edges
-            else EDGE_SCHEMA.empty_table()
-        )
-        return GraphTabularState(
-            catalog=catalog,
-            snapshot=snapshot,
-            node_table=node_table,
-            edge_table=edge_table,
-        )
+        with self.pin_snapshot(snapshot):
+            catalog = self._catalog_store.load_for_snapshot(snapshot)
+            node_table = self._graph_store.load_node_table(snapshot.nodes)
+            edge_table = (
+                self._graph_store.load_edge_table(snapshot.edges)
+                if include_edges
+                else EDGE_SCHEMA.empty_table()
+            )
+            return GraphTabularState(
+                catalog=catalog,
+                snapshot=snapshot,
+                node_table=node_table,
+                edge_table=edge_table,
+            )
 
     @contextmanager
     def borrow_tabular_state(
         self, *, include_edges: bool = True, snapshot: SnapshotManifest | None = None
     ) -> Generator[GraphTabularState, None, None]:
         """Share canonical buffers until the snapshot reader releases them."""
-        if snapshot is None:
-            snapshot = self.capture_snapshot()
-        catalog = self._catalog_store.load_for_snapshot(snapshot)
-        nodes, edges = snapshot.nodes, snapshot.edges
-        node_key = (
-            self._graph_store.node_cache_files(nodes) if self.snapshot_tables.max_bytes else nodes
-        )
-        edge_table = (
-            self.snapshot_tables.borrow(
-                ("edges", edges), lambda: self._graph_store.load_edge_table(edges)
+        with ExitStack() as pins:
+            if snapshot is None:
+                snapshot = pins.enter_context(self._storage_backend.borrow_current_snapshot())
+            else:
+                pins.enter_context(self.pin_snapshot(snapshot))
+            catalog = self._catalog_store.load_for_snapshot(snapshot)
+            nodes, edges = snapshot.nodes, snapshot.edges
+            node_key = (
+                self._graph_store.node_cache_files(nodes)
+                if self.snapshot_tables.max_bytes
+                else nodes
             )
-            if include_edges
-            else nullcontext(EDGE_SCHEMA.empty_table())
-        )
-        with (
-            self.snapshot_tables.borrow(
-                ("nodes", node_key), lambda: self._graph_store.load_node_table(nodes)
-            ) as node_table,
-            edge_table as borrowed_edges,
-        ):
-            yield GraphTabularState(catalog, snapshot, node_table, borrowed_edges)
+            edge_table = (
+                self.snapshot_tables.borrow(
+                    ("edges", edges), lambda: self._graph_store.load_edge_table(edges)
+                )
+                if include_edges
+                else nullcontext(EDGE_SCHEMA.empty_table())
+            )
+            with (
+                self.snapshot_tables.borrow(
+                    ("nodes", node_key), lambda: self._graph_store.load_node_table(nodes)
+                ) as node_table,
+                edge_table as borrowed_edges,
+            ):
+                yield GraphTabularState(catalog, snapshot, node_table, borrowed_edges)
 
     def load_node_property_table(
         self,
@@ -1268,18 +1278,27 @@ class GraphTransactionUseCase:
     ) -> None:
         """Start an isolated in-memory transaction from the current published snapshot."""
         self._graph_service = graph_service
-        with graph_service.writer_lock():
-            self._base_state = (
-                graph_service.load_state()
-                if base_snapshot is None
-                else graph_service.load_state(snapshot=base_snapshot)
-            )
+        with graph_service.writer_lock(), ExitStack() as leases:
+            snapshot = base_snapshot or graph_service.capture_snapshot()
+            leases.enter_context(graph_service.pin_snapshot(snapshot))
+            self._base_state = graph_service.load_state(snapshot=snapshot)
+            self._snapshot_lease = leases.pop_all()
         self.transaction_time_ns = time.time_ns()
         self._state = self._base_state
         self._reuse_edge_table_on_commit = False
         self._closed = False
         self._adjacency_table: pa.Table | None = None
         self._adjacency_index: GraphAdjacency | None = None
+
+    def __enter__(self) -> GraphTransactionUseCase:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if not self._closed:
+            self.rollback()
 
     @contextmanager
     def statement(self) -> Generator[None, None, None]:
@@ -1733,16 +1752,17 @@ class GraphTransactionUseCase:
         self._closed = True
         self._adjacency_table = None
         self._adjacency_index = None
-        if idempotency_receipt is None and self._state == self._base_state:
-            return self._base_state
-        return self._graph_service._publish_graph(
-            previous_state=self._base_state,
-            catalog=self._state.catalog,
-            nodes=list(self._state.nodes),
-            edges=list(self._state.edges),
-            edge_table=self._state.edge_table if self._reuse_edge_table_on_commit else None,
-            idempotency_receipt=idempotency_receipt,
-        )
+        with self._snapshot_lease:
+            if idempotency_receipt is None and self._state == self._base_state:
+                return self._base_state
+            return self._graph_service._publish_graph(
+                previous_state=self._base_state,
+                catalog=self._state.catalog,
+                nodes=list(self._state.nodes),
+                edges=list(self._state.edges),
+                edge_table=self._state.edge_table if self._reuse_edge_table_on_commit else None,
+                idempotency_receipt=idempotency_receipt,
+            )
 
     def rollback(self) -> GraphState:
         """Discard all local changes and close the transaction."""
@@ -1752,6 +1772,7 @@ class GraphTransactionUseCase:
         self._adjacency_table = None
         self._adjacency_index = None
         self._state = self._base_state
+        self._snapshot_lease.close()
         return self._base_state
 
     def _replace_state(

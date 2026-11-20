@@ -22,6 +22,14 @@ class GraphArrowSettings(BaseSettings):
     environment: str = Field(default="development")
     database_path: str | Path | None = Field(default=None)
     storage_backend: Literal["native", "delta"] = Field(default="native")
+    delta_managed_retention: bool = Field(default=False)
+    delta_replica_id: str | None = Field(default=None, min_length=1, max_length=255)
+    delta_checkpoint_interval: int | None = Field(
+        default=None,
+        ge=1,
+        le=2**31 - 1,
+        description="Commits between automatic checkpoints for new Delta databases.",
+    )
     verify_checksums_on_verify: bool = Field(default=False)
     server_host: str = Field(default="127.0.0.1")
     server_port: int = Field(default=8000)

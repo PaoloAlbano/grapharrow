@@ -165,13 +165,28 @@ also retains the snapshots between them so the retained range is contiguous.
 `min_age_hours=0` uses the count alone. Use the report's head and evaluation
 time to identify the view that was measured.
 
+For a known pinned snapshot, pass `--protect-from-snapshot-id ID` on the CLI,
+or `protect_from_snapshot_id=ID` in Python or as a REST query parameter. The
+preview includes that snapshot and every newer snapshot. Supply the lowest
+snapshot ID if several readers are in use. The caller supplies this boundary
+and remains responsible for tracking readers on other replicas.
+
 `shared_parquet_paths` lists files referenced by both parts of the history.
 `candidate_files` contains older-only Parquet files with their actual stored
 sizes. Missing candidates are reported separately and contribute zero to
-`estimated_reclaimable_bytes`. Catalogs, manifests and idempotency records
-are outside this estimate. The preview performs no writes. Its candidates
-are a space estimate for the proposed policy. Native vacuum preserves the
-files of all published snapshots, including those outside that policy.
+`estimated_reclaimable_bytes`. On Native, the estimate covers graph Parquet
+files. On Delta, it covers Parquet files referenced by the commit log,
+including older graph metadata and receipt files outside the retained range.
+Delta uses commit timestamps from the log and checks the complete history
+through the captured version. Logs, checkpoints and untracked files are
+outside the estimate.
+
+The preview performs no writes. Its candidates are a space estimate for
+the proposed policy. Native vacuum preserves the files of all published
+snapshots, including those outside that policy. On a newly created Delta
+database with managed retention, the
+[coordinated cleanup command](storage-backends.md#applying-managed-delta-retention)
+publishes the minimum readable snapshot before removing older Parquet.
 
 Upgrade all writers sharing a database together. When opening a database
 from the earlier layout, GraphArrow reads the catalog version referenced by

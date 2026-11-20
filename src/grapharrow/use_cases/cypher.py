@@ -8,7 +8,7 @@ import math
 import os
 import re
 from collections.abc import Callable, Generator, Iterable, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from typing import Any, Literal, TypeAlias, cast
 
@@ -643,7 +643,7 @@ class CypherQueryUseCase:
         graph = self._graph_service
         if not isinstance(graph, GraphStateUseCase):
             raise QueryError.unsupported("Idempotency requires an autocommit data write.")
-        with graph.cypher_query_slot(), graph.writer_lock():
+        with graph.cypher_query_slot(), graph.writer_lock(), ExitStack() as leases:
             base, receipt = graph.idempotency_base(key_hash)
             if receipt is not None:
                 return _replay_response(receipt, request_hash)
@@ -654,7 +654,9 @@ class CypherQueryUseCase:
                     raise QueryError.unsupported("Idempotency-Key requires a Cypher data write.")
                 # The lookup and transaction use the same snapshot. A concurrent publication
                 # after the lookup must go through commit conflict handling below.
-                transaction = GraphTransactionUseCase(graph, base_snapshot=base)
+                transaction = leases.enter_context(
+                    GraphTransactionUseCase(graph, base_snapshot=base)
+                )
                 executor = self._transaction_executor(transaction)
                 result = executor._compile_and_execute_write(tree, query.strip(), params)
             response = encode_response(_public_query_result(result))
@@ -814,8 +816,7 @@ class CypherQueryUseCase:
             if isinstance(graph, GraphTransactionUseCase):
                 with graph.statement():
                     return run(self)
-            with graph.writer_lock():
-                transaction = GraphTransactionUseCase(graph)
+            with graph.writer_lock(), GraphTransactionUseCase(graph) as transaction:
                 executor = self._transaction_executor(transaction)
                 with transaction.statement():
                     result = run(executor)

@@ -113,6 +113,7 @@ class AzurePointer:
 
         settings = self._settings
         authority = settings.azure_blob_storage_authority or ".blob.core.windows.net"
+        authority = authority.rstrip("/").removesuffix(f"/{self._account}")
         scheme = settings.azure_blob_storage_scheme or "https"
         endpoint = (
             f"{self._account}{authority}"
