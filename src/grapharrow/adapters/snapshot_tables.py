@@ -5,9 +5,10 @@ from __future__ import annotations
 import sys
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
+from concurrent.futures import Future
 from contextlib import contextmanager
 from dataclasses import dataclass
-from threading import RLock
+from threading import Condition, local
 from typing import Literal, TypeAlias
 
 import pyarrow as pa  # type: ignore[import-untyped]
@@ -27,6 +28,7 @@ _TableKey: TypeAlias = tuple[
     tuple[DatasetFile, ...],
 ]
 _Buffer: TypeAlias = tuple[int, int]
+_MAX_CONCURRENT_LOADS = 2
 
 
 @dataclass(slots=True)
@@ -37,6 +39,12 @@ class _Entry:
     readers: int
 
 
+@dataclass(slots=True)
+class _Load:
+    result: Future[_Entry]
+    readers: int = 1
+
+
 class SnapshotTableCache:
     """Share published table buffers and protect them from eviction while borrowed."""
 
@@ -45,8 +53,10 @@ class SnapshotTableCache:
         self.used_bytes = 0
         self._entries: OrderedDict[_TableKey, _Entry] = OrderedDict()
         self._buffer_refs: dict[_Buffer, int] = {}
-        # A logical snapshot table can be assembled from separately cached immutable ranges.
-        self._lock = RLock()
+        self._ready = Condition()
+        self._loading: dict[_TableKey, _Load] = {}
+        self._active_loads = 0
+        self._loader = local()
 
     @contextmanager
     def borrow(self, key: _TableKey, load: Callable[[], pa.Table]) -> Iterator[pa.Table]:
@@ -55,33 +65,77 @@ class SnapshotTableCache:
             yield load()
             return
 
-        with self._lock:
+        depth: int = getattr(self._loader, "depth", 0)
+        with self._ready:
+            self._ready.wait_for(
+                lambda: (
+                    depth > 0
+                    or key in self._entries
+                    or key in self._loading
+                    or self._active_loads < _MAX_CONCURRENT_LOADS
+                )
+            )
             entry = self._entries.get(key)
+            loading = self._loading.get(key)
+            owner = False
             if entry is not None:
                 self._entries.move_to_end(key)
                 entry.readers += 1
-                table = entry.table
+            elif loading is not None:
+                loading.readers += 1
             else:
-                table = load()
-                buffers = {
-                    (buffer.address, buffer.size)
-                    for column in table.columns
-                    for chunk in column.chunks
-                    for buffer in chunk.buffers()
-                    if buffer is not None and buffer.size
-                }
-                overhead = 1024 + sum(
-                    sys.getsizeof(item) + sys.getsizeof(item.path) + 128 for item in key[1]
-                )
-                # Array.buffers() can omit data such as dictionary values. Charge
-                # such tables in full when Arrow reports a different buffer total.
-                total = table.get_total_buffer_size()
-                if sum(size for _, size in buffers) != total:
-                    buffers.clear()
-                    overhead += total
-                overhead += 160 * len(buffers)
+                loading = self._loading[key] = _Load(Future())
+                owner = True
+                if depth == 0:
+                    self._active_loads += 1
+                self._ready.notify_all()
+        if entry is None:
+            assert loading is not None
+            if owner:
+                entry = self._load_entry(key, load, loading, depth)
+            else:
+                try:
+                    entry = loading.result.result()
+                except BaseException:
+                    with self._ready:
+                        if not loading.result.done():
+                            loading.readers -= 1
+                        elif loading.result.exception() is None:
+                            loading.result.result().readers -= 1
+                    raise
+        try:
+            yield entry.table
+        finally:
+            with self._ready:
+                entry.readers -= 1
+
+    def _load_entry(
+        self, key: _TableKey, load: Callable[[], pa.Table], loading: _Load, depth: int
+    ) -> _Entry:
+        # Assembled tables can borrow immutable ranges. Their nested loads
+        # share the outer slot, so each assembly can finish under contention.
+        self._loader.depth = depth + 1
+        try:
+            table = load()
+            buffers = {
+                (buffer.address, buffer.size)
+                for column in table.columns
+                for chunk in column.chunks
+                for buffer in chunk.buffers()
+                if buffer is not None and buffer.size
+            }
+            overhead = 1024 + sum(
+                sys.getsizeof(item) + sys.getsizeof(item.path) + 128 for item in key[1]
+            )
+            # Array.buffers() can omit data such as dictionary values.
+            total = table.get_total_buffer_size()
+            if sum(size for _, size in buffers) != total:
+                buffers.clear()
+                overhead += total
+            overhead += 160 * len(buffers)
+            with self._ready:
+                entry = _Entry(table, overhead, buffers, readers=loading.readers)
                 if self._reserve(overhead, buffers):
-                    entry = _Entry(table, overhead, buffers, readers=1)
                     self._entries[key] = entry
                     self.used_bytes += overhead
                     for buffer in buffers:
@@ -89,12 +143,20 @@ class SnapshotTableCache:
                         if not references:
                             self.used_bytes += buffer[1]
                         self._buffer_refs[buffer] = references + 1
-        try:
-            yield table
+                del self._loading[key]
+                loading.result.set_result(entry)
+                return entry
+        except BaseException as exc:
+            with self._ready:
+                del self._loading[key]
+                loading.result.set_exception(exc)
+            raise
         finally:
-            if entry is not None:
-                with self._lock:
-                    entry.readers -= 1
+            self._loader.depth = depth
+            with self._ready:
+                if depth == 0:
+                    self._active_loads -= 1
+                self._ready.notify_all()
 
     def _reserve(self, overhead: int, buffers: set[_Buffer]) -> bool:
         new_bytes = sum(

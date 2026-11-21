@@ -37,6 +37,12 @@ class GraphArrowSettings(BaseSettings):
     server_auth_token: str | None = Field(default=None)
     ana_enabled: bool = Field(default=True)
     ana_schema_entry: str = Field(default="overview")
+    ana_session_route: str | None = Field(
+        default=None,
+        max_length=63,
+        pattern=r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$",
+        description="Optional DNS label identifying the HTTP replica that owns a workflow.",
+    )
     ana_max_sessions: int = Field(default=128, gt=0)
     ana_session_idle_timeout_s: float = Field(default=1800, gt=0)
     ana_max_handles_per_session: int | None = Field(default=None, gt=0)

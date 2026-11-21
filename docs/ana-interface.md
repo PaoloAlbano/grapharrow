@@ -57,6 +57,7 @@ Use `--no-ana` or `GRAPHARROW_ANA_ENABLED=false` to disable the interface.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `GRAPHARROW_ANA_SCHEMA_ENTRY` | `overview` | Schema discovery guidance mode |
+| `GRAPHARROW_ANA_SESSION_ROUTE` | unset | Optional replica label for [routing workflows](server-configuration.md#multiple-replicas-on-kubernetes) |
 | `GRAPHARROW_ANA_MAX_SESSIONS` | `128` | Concurrent workflow capacity |
 | `GRAPHARROW_ANA_SESSION_IDLE_TIMEOUT_S` | `1800` | Request-driven idle expiry |
 | `GRAPHARROW_ANA_MAX_HANDLES_PER_SESSION` | unset | Optional handle count ceiling; unset or `0` disables it |
@@ -96,6 +97,10 @@ echo that header and use `Cache-Control: no-store`. Tool execution errors also
 echo the header after ownership validation; authentication, unavailable-tool
 and unknown/foreign-session errors do not confirm a session. A deletion response
 identifies the workflow just closed; its identifier cannot be reused.
+
+Treat the full session ID as an opaque string. A replica configured with
+`GRAPHARROW_ANA_SESSION_ROUTE` prefixes newly issued IDs with its route and
+a dot. Send the returned ID unchanged on every call and on deletion.
 
 Tool calls use the existing ANA envelope:
 

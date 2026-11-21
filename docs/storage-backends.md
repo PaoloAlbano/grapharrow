@@ -209,9 +209,9 @@ rejected. The command releases only the identified incarnation's pins.
 
 ## Current Delta scope
 
-- Node changes can rewrite the full node partition. Edge changes can rewrite
-  the affected ID ranges. General mutations still check the shared graph
-  version, so they can conflict even when they change disjoint data.
+- Node and edge changes publish the affected ID ranges. General mutations
+  still check the shared graph version, so they can conflict even when
+  they change disjoint data. See [Selective node range publication](engine-performance.md#selective-node-range-publication).
 - `verify` checks the captured metadata and reads active Parquet data.
   `compact` rewrites the active graph partitions as a new snapshot.
   Managed Delta retention controls when older snapshots expire. `vacuum`

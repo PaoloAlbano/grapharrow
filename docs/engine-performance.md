@@ -234,6 +234,15 @@ for each table. Queries borrow tables until their results have been built,
 and ANA workflows borrow tables until they close. A new publication reuses
 entries for files that it still references.
 
+Concurrent misses for the same table share one load. An application can
+start two independent cold table loads at a time, and an in-progress load
+leaves cache hits available. Nested range reads share their enclosing
+load's slot. Delta collects concurrent checks of the next commit on object
+storage in a one-millisecond window. Each check runs after its group closes,
+so a reader arriving during the storage request starts or joins a fresh check.
+ANA uses the Delta snapshot lease while it loads its tables and projections.
+Native guards that same load with its writer lock to coordinate with vacuum.
+
 Set `GRAPHARROW_SNAPSHOT_TABLE_CACHE_MAX_BYTES` to adjust the per-application
 budget, which defaults to 67108864 bytes (64 MiB). A value of 0 disables
 sharing. Unused entries are eligible for eviction. A table above the
@@ -281,6 +290,19 @@ does not infer safety from the final record diff and does not automatically
 rebase a prepared write. It avoids complete graph materialization only for the
 certified query shape. Large scans, other write shapes and ANA workflow opening
 retain their existing memory requirements.
+
+## Selective node range publication
+
+Both backends store nodes in fixed ranges of 8,192 IDs. A point property
+`SET` retains unchanged canonical ranges, label indexes and relationship
+files. Native also retains unaffected property-projection ranges when
+the label schema stays the same. A property schema change updates all
+affected projection ranges so readers see a consistent column layout.
+Native recognizes existing unsplit node files, and Delta reads existing
+unsplit snapshots. A node-changing commit or compaction can convert
+the active snapshot to ranges. Historical readers retain their files.
+Use a build that supports node ranges on every Delta replica before
+converting a shared database.
 
 
 ## Sequential integrity checks

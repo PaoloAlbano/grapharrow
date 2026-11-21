@@ -29,6 +29,7 @@ class Backend(Protocol):
 class SessionConfig:
     max_sessions: int = 128
     idle_timeout_s: float = 1800
+    route: str | None = None
 
 
 @dataclass
@@ -90,6 +91,8 @@ class BackendSessions:
             with self._condition:
                 if not self._closed:
                     token = secrets.token_urlsafe(32)
+                    if self._config.route is not None:
+                        token = f"{self._config.route}.{token}"
                     self._sessions[token] = workflow
                     return token
             workflow.close()

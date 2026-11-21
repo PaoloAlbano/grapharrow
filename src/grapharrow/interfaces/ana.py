@@ -43,6 +43,7 @@ def install_ana_routes(app: FastAPI, application: GraphArrowApplication) -> None
     config = SessionConfig(
         max_sessions=application.settings.ana_max_sessions,
         idle_timeout_s=application.settings.ana_session_idle_timeout_s,
+        route=application.settings.ana_session_route,
     )
     budget = AnaResourceBudget(application.settings.ana_max_total_bytes)
     sessions = BackendSessions(

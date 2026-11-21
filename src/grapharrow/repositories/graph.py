@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from pathlib import Path, PurePosixPath
 from typing import cast
 from uuid import uuid4
@@ -55,6 +55,7 @@ _EDGE_RANGE_PATH = re.compile(
     r"data/edges/range-([1-9][0-9]*)/([0-9]+)/snapshot-[0-9]+(?:-[0-9a-f]{32})?\.parquet"
 )
 _DEFAULT_EDGE_RANGE_SIZE = 32_768
+NODE_RANGE_SIZE = 8192
 
 
 def node_records_from_table(table: pa.Table) -> list[NodeRecord]:
@@ -408,8 +409,6 @@ class GraphRepository:
 
         self._layout.ensure_base_directories()
         filename = f"snapshot-{snapshot_id.value:06d}-{uuid4().hex}.parquet"
-        final_nodes_path = self._join(self._layout.nodes_dir, filename)
-
         same_nodes = (
             previous_snapshot is not None
             and previous_nodes is not None
@@ -423,9 +422,16 @@ class GraphRepository:
             and list(previous_edges) == edges
             and edge_groups == relationship_types
         )
-        if not same_nodes:
-            self._filesystem.create_dir(self._parent(final_nodes_path))
-            self._parquet.write_table(_nodes_table(nodes), final_nodes_path)
+        node_files = (
+            previous_snapshot.nodes
+            if same_nodes and previous_snapshot is not None
+            else self._persist_node_files(
+                filename,
+                nodes,
+                previous_nodes or (),
+                previous_snapshot.nodes if previous_snapshot is not None else (),
+            )
+        )
         previous_edge_files = previous_snapshot.edges if previous_snapshot is not None else ()
         edge_files = previous_edge_files
         if not same_edges:
@@ -438,7 +444,6 @@ class GraphRepository:
                 previous_edge_table=previous_edge_table,
                 allow_conversion=previous_edges is None,
             )
-        node_groups = _unchanged_node_groups(previous_nodes, nodes)
         label_groups = _unchanged_label_groups(previous_nodes, nodes)
         topology_groups = _unchanged_topology_groups(previous_edges, edges)
 
@@ -451,8 +456,8 @@ class GraphRepository:
         node_property_files = self._persist_node_property_tables(
             filename=filename,
             nodes=nodes,
+            previous_nodes=previous_nodes or (),
             reuse_files=previous_snapshot.node_properties if previous_snapshot is not None else (),
-            unchanged=node_groups,
         )
         adjacency_files, adjacency_by_dest_files = self._persist_adjacency(
             filename=filename,
@@ -470,19 +475,7 @@ class GraphRepository:
         )
 
         persisted = PersistedGraph(
-            nodes=previous_snapshot.nodes
-            if same_nodes and previous_snapshot is not None
-            else (
-                _dataset_file_for(
-                    path=final_nodes_path,
-                    layout=self._layout,
-                    filesystem=self._filesystem,
-                    kind="nodes",
-                    row_count=len(nodes),
-                    min_key=min((record.node_id for record in nodes), default=None),
-                    max_key=max((record.node_id for record in nodes), default=None),
-                ),
-            ),
+            nodes=node_files,
             edges=edge_files,
             node_labels=node_label_files,
             node_properties=node_property_files,
@@ -491,6 +484,43 @@ class GraphRepository:
             edge_properties=edge_property_files,
         )
         return persisted
+
+    def _persist_node_files(
+        self,
+        filename: str,
+        nodes: list[NodeRecord],
+        previous_nodes: tuple[NodeRecord, ...],
+        previous_files: tuple[DatasetFile, ...],
+    ) -> tuple[DatasetFile, ...]:
+        files = _node_range_files(previous_files)
+        prior = _group_node_ranges(previous_nodes) if files else {}
+        ranges = _group_node_ranges(nodes) or {0: []}
+        return tuple(
+            files[bucket]
+            if bucket in files and prior.get(bucket) == records
+            else self._write_node_range(
+                _nodes_table(records), self._layout.nodes_dir, bucket, filename, "nodes"
+            )
+            for bucket, records in sorted(ranges.items())
+        )
+
+    def _write_node_range(
+        self, table: pa.Table, directory: str | Path, bucket: int, filename: str, kind: DatasetKind
+    ) -> DatasetFile:
+        parts = (f"range-{NODE_RANGE_SIZE}", f"{bucket:020d}", filename) if bucket else (filename,)
+        path = self._join(directory, *parts)
+        self._filesystem.create_dir(self._parent(path))
+        self._parquet.write_table(table, path)
+        bounds = pc.min_max(table["node_id"]).as_py()
+        return _dataset_file_for(
+            path=path,
+            layout=self._layout,
+            filesystem=self._filesystem,
+            kind=kind,
+            row_count=table.num_rows,
+            min_key=bounds["min"],
+            max_key=bounds["max"],
+        )
 
     def _persist_edge_files(
         self,
@@ -704,40 +734,40 @@ class GraphRepository:
         *,
         filename: str,
         nodes: list[NodeRecord],
+        previous_nodes: tuple[NodeRecord, ...],
         reuse_files: tuple[DatasetFile, ...] = (),
-        unchanged: set[str] | None = None,
     ) -> tuple[DatasetFile, ...]:
-        """Write one property-columnar dataset per label to avoid JSON decoding on hot reads."""
+        """Retain unchanged ranges with the same per-label property schema."""
         dataset_files: list[DatasetFile] = []
-        by_label: dict[str, list[NodeRecord]] = {}
-        for node in nodes:
-            for label in node.labels:
-                by_label.setdefault(label, []).append(node)
-
-        for label, typed_nodes in sorted(by_label.items()):
-            reused = tuple(item for item in reuse_files if Path(item.path).parent.name == label)
-            if unchanged is not None and label in unchanged and reused:
+        previous_labels = _group_nodes_by_label(previous_nodes)
+        existing = self.group_node_property_files(reuse_files)
+        for label, typed_nodes in sorted(_group_nodes_by_label(nodes).items()):
+            reused = existing.get(label, ())
+            prior_nodes = previous_labels.get(label, [])
+            if reused and prior_nodes == typed_nodes:
                 dataset_files.extend(reused)
                 continue
-            final_path = self._join(
-                self._layout.node_properties_dir,
-                label,
-                filename,
-            )
-            self._filesystem.create_dir(self._parent(final_path))
-            table = _node_property_table(sorted(typed_nodes, key=lambda item: item.node_id))
-            self._parquet.write_table(table, final_path)
-            node_ids = [node.node_id for node in typed_nodes]
-            dataset_files.append(
-                _dataset_file_for(
-                    path=final_path,
-                    layout=self._layout,
-                    filesystem=self._filesystem,
-                    kind="node_properties",
-                    row_count=table.num_rows,
-                    min_key=min(node_ids, default=None),
-                    max_key=max(node_ids, default=None),
-                )
+            directory = self._join(self._layout.node_properties_dir, label)
+            table = _node_property_table(sorted(typed_nodes, key=lambda node: node.node_id))
+            files = _node_range_files(reused)
+            reusable: set[int] = set()
+            if files:
+                prior = _group_node_ranges(prior_nodes)
+                reusable = {
+                    bucket
+                    for bucket, records in _group_node_ranges(typed_nodes).items()
+                    if bucket in files and prior.get(bucket) == records
+                }
+                if reusable and not table.schema.equals(
+                    self._parquet.read_dataset_schema([self._absolute_location(reused[0].path)]),
+                    check_metadata=True,
+                ):
+                    reusable.clear()
+            dataset_files.extend(
+                files[bucket]
+                if bucket in reusable
+                else self._write_node_range(rows, directory, bucket, filename, "node_properties")
+                for bucket, rows in _id_ranges(table, "node_id", NODE_RANGE_SIZE)
             )
         return tuple(dataset_files)
 
@@ -867,11 +897,17 @@ def _edge_range_layout(files: tuple[DatasetFile, ...]) -> tuple[int, dict[int, D
 
 def _edge_ranges(table: pa.Table, width: int) -> Generator[tuple[int, pa.Table], None, None]:
     """Slice canonical rows by stable, one-based edge ID ranges."""
+    yield from _id_ranges(table, "edge_id", width)
+
+
+def _id_ranges(
+    table: pa.Table, id_column: str, width: int
+) -> Generator[tuple[int, pa.Table], None, None]:
     if not table.num_rows:
-        # An empty file retains the layout after the last edge is removed.
+        # An empty file can retain the layout after the last row is removed.
         yield 0, table
         return
-    groups = pc.divide(pc.subtract(table["edge_id"], 1), width)
+    groups = pc.divide(pc.subtract(table[id_column], 1), width)
     if pc.any(pc.less(groups.slice(1), groups.slice(0, len(groups) - 1))).as_py():
         order = pc.sort_indices(groups)
         table = table.take(order)
@@ -885,18 +921,40 @@ def _edge_ranges(table: pa.Table, width: int) -> Generator[tuple[int, pa.Table],
         start = stop
 
 
-def _unchanged_node_groups(
-    previous: tuple[NodeRecord, ...] | None, current: list[NodeRecord]
-) -> set[str]:
-    before: dict[str, list[NodeRecord]] = {}
-    after: dict[str, list[NodeRecord]] = {}
-    for node in previous or ():
+def _group_nodes_by_label(nodes: Iterable[NodeRecord]) -> dict[str, list[NodeRecord]]:
+    groups: dict[str, list[NodeRecord]] = {}
+    for node in nodes:
         for label in node.labels:
-            before.setdefault(label, []).append(node)
-    for node in current:
-        for label in node.labels:
-            after.setdefault(label, []).append(node)
-    return {label for label, records in after.items() if before.get(label) == records}
+            groups.setdefault(label, []).append(node)
+    return groups
+
+
+def _group_node_ranges(nodes: Iterable[NodeRecord]) -> dict[int, list[NodeRecord]]:
+    groups: dict[int, list[NodeRecord]] = {}
+    for node in nodes:
+        groups.setdefault((node.node_id - 1) // NODE_RANGE_SIZE, []).append(node)
+    return groups
+
+
+def _node_range_files(files: tuple[DatasetFile, ...]) -> dict[int, DatasetFile]:
+    ranges: dict[int, DatasetFile] = {}
+    for file in files:
+        parts = Path(file.path).parts
+        if len(parts) >= 5 and parts[-3] == f"range-{NODE_RANGE_SIZE}" and parts[-2].isdigit():
+            bucket = int(parts[-2])
+        elif len(parts) == (3 if file.kind == "nodes" else 4) and (
+            not file.row_count
+            or (
+                file.min_key is not None
+                and file.max_key is not None
+                and 1 <= file.min_key <= file.max_key <= NODE_RANGE_SIZE
+            )
+        ):
+            bucket = 0
+        else:
+            return {}
+        ranges[bucket] = file
+    return ranges if len(ranges) == len(files) else {}
 
 
 def _unchanged_label_groups(

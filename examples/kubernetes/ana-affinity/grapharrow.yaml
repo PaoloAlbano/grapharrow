@@ -1,0 +1,114 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: grapharrow-pods
+spec:
+  clusterIP: None
+  selector:
+    app: grapharrow
+  ports:
+    - name: http
+      port: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grapharrow-0
+spec:
+  selector:
+    statefulset.kubernetes.io/pod-name: grapharrow-0
+  ports:
+    - name: http
+      port: 8000
+    - name: bolt
+      port: 7687
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grapharrow-1
+spec:
+  selector:
+    statefulset.kubernetes.io/pod-name: grapharrow-1
+  ports:
+    - name: http
+      port: 8000
+    - name: bolt
+      port: 7687
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: grapharrow
+spec:
+  replicas: 2
+  serviceName: grapharrow-pods
+  selector:
+    matchLabels:
+      app: grapharrow
+  template:
+    metadata:
+      labels:
+        app: grapharrow
+    spec:
+      containers:
+        - name: http
+          image: grapharrow:local
+          args: ["grapharrow-server", "--host", "0.0.0.0", "--port", "8000"]
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: grapharrow-storage
+          env:
+            - name: GRAPHARROW_STORAGE_BACKEND
+              value: delta
+            - name: GRAPHARROW_ANA_SESSION_ROUTE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: GRAPHARROW_SERVER_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: grapharrow-auth
+                  key: rest-token
+            - name: ANA_AUTH_FILE
+              value: /etc/grapharrow-auth/clients.json
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+          volumeMounts:
+            - name: ana-auth
+              mountPath: /etc/grapharrow-auth
+              readOnly: true
+        - name: bolt
+          image: grapharrow:local
+          args: ["grapharrow-bolt", "--host", "0.0.0.0", "--port", "7687"]
+          ports:
+            - name: bolt
+              containerPort: 7687
+          envFrom:
+            - secretRef:
+                name: grapharrow-storage
+          env:
+            - name: GRAPHARROW_STORAGE_BACKEND
+              value: delta
+            - name: GRAPHARROW_BOLT_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: grapharrow-auth
+                  key: bolt-token
+          readinessProbe:
+            tcpSocket:
+              port: bolt
+            periodSeconds: 2
+      volumes:
+        - name: ana-auth
+          secret:
+            secretName: grapharrow-auth
+            items:
+              - key: clients.json
+                path: clients.json

@@ -1,7 +1,8 @@
 # Server Startup and Authentication
 
-GraphArrow has two server commands. Run both against the same native local
-database directory when clients need HTTP and Bolt access to one graph.
+GraphArrow has two server commands. For local development, point both at the
+same Native database directory. For replicas on shared Delta storage, see
+[Multiple replicas on Kubernetes](#multiple-replicas-on-kubernetes).
 
 | Command | Interfaces | Default address | Authentication |
 | --- | --- | --- | --- |
@@ -206,6 +207,59 @@ untrusted networks. Keep authentication configured for every exposed interface.
 The [ANA resource limits](ana-interface.md#workflows-and-results) account for
 retained state, not a complete CPU or process-memory boundary.
 
+## Arrow IPC over REST
+
+`POST /v1/nodes/bulk` and `POST /v1/edges/bulk` accept Arrow IPC
+streams and files. Send `Content-Type: application/vnd.apache.arrow.stream`
+for an IPC stream or `application/vnd.apache.arrow.file` for an IPC file.
+Both formats use the regular bulk columns and write one graph transaction.
+For node ingestion, pass the optional `default_labels` query parameter once
+per label, or supply a `labels` column. For relationship ingestion, use
+`src_id`, `dst_id` and `rel_type`. Business-key ingestion uses `src_key`
+and `dst_key` along with the `source_label`, `source_key`, `target_label`
+and `target_key` query parameters.
+
+The bulk endpoints and `POST /v1/query` return IPC when the client sends
+the corresponding `Accept` header. Query requests still use a JSON body
+with `query` and `params`. JSON remains the default response. The Arrow
+schema preserves column names and order. Homogeneous scalar columns and
+lists of homogeneous scalars use Arrow types. Maps and heterogeneous
+values use a UTF-8 JSON column marked with the field metadata
+`grapharrow.encoding=json`. An `Idempotency-Key` replay can select
+either representation of the same stored result.
+
+```python
+import os
+
+import httpx
+import pyarrow as pa
+
+media_type = "application/vnd.apache.arrow.stream"
+nodes = pa.table({"name": ["Ada", "Grace"]})
+sink = pa.BufferOutputStream()
+with pa.ipc.new_stream(sink, nodes.schema) as writer:
+    writer.write_table(nodes)
+
+with httpx.Client(
+    base_url="http://127.0.0.1:8000",
+    headers={"Authorization": f"Bearer {os.environ['GRAPHARROW_SERVER_AUTH_TOKEN']}"},
+) as client:
+    created = client.post(
+        "/v1/nodes/bulk",
+        params={"default_labels": "Person"},
+        headers={"Content-Type": media_type},
+        content=sink.getvalue().to_pybytes(),
+    )
+    created.raise_for_status()
+    response = client.post(
+        "/v1/query",
+        json={"query": "MATCH (n:Person) RETURN n.name AS name ORDER BY name"},
+        headers={"Accept": media_type},
+    )
+    response.raise_for_status()
+    result = pa.ipc.open_stream(response.content).read_all()
+```
+
 ## Docker
 
 The runtime image uses Python 3.13 on Debian Trixie slim by default. Run the
@@ -248,3 +302,61 @@ entrypoint above. Container listeners bind to all container interfaces, while
 the `-p 127.0.0.1:...` mappings expose them only on the host loopback address.
 The named volume retains database files after containers stop; removing an ANA
 session or stopping a server does not delete that data.
+
+## Multiple replicas on Kubernetes
+
+The [two-replica example](../examples/kubernetes/ana-affinity/) runs GraphArrow
+against one Delta database on shared object storage. One gateway Service exposes
+REST and ANA on port 8000 and Bolt on port 7687. Each GraphArrow Pod runs one HTTP
+process and one Bolt process.
+
+Set `GRAPHARROW_ANA_SESSION_ROUTE` to a unique DNS label per HTTP process
+(lowercase letters, digits and internal hyphens, up to 63 characters). When it
+is set, both `session_id` and `X-ANA-Session` contain
+`<route>.<random-token>`. Standalone servers can leave the setting unset.
+
+The example uses each StatefulSet Pod name as the route and gives that Pod
+a [dedicated Service](https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#pod-name-label).
+Both HAProxy replicas use the same routing rules. They balance session
+creation, discovery and REST traffic across healthy HTTP replicas. They send
+`/tools/call` and `/sessions/current` to the replica named by the
+`X-ANA-Session` prefix. Bolt connections are balanced separately at the TCP
+layer. The route only selects a destination. GraphArrow validates the full
+session token and its authenticated owner.
+
+Before applying the example, point both replicas at an initialized Delta
+database on [shared storage](storage-backends.md#delta-lake-setup). Put
+`GRAPHARROW_DATABASE_PATH` and any provider settings the containers need in
+`.local-secrets/storage.env`, as unquoted `NAME=value` entries. Build
+`grapharrow:local` with the [Docker instructions](#docker). For kind, load it
+with `kind load docker-image grapharrow:local --name CLUSTER`. For a remote
+cluster, set both container images in the StatefulSet to a GraphArrow build
+accessible to that cluster. Use the credentials from
+[Prepare a local configuration](#prepare-a-local-configuration).
+
+```sh
+set -a
+. ./.local-secrets/server.env
+set +a
+
+kubectl create namespace grapharrow-demo
+kubectl -n grapharrow-demo create secret generic grapharrow-storage \
+  --from-env-file=.local-secrets/storage.env
+kubectl -n grapharrow-demo create secret generic grapharrow-auth \
+  --from-literal=rest-token="$GRAPHARROW_SERVER_AUTH_TOKEN" \
+  --from-literal=bolt-token="$GRAPHARROW_BOLT_AUTH_TOKEN" \
+  --from-file=clients.json=.local-secrets/ana-clients.json
+kubectl -n grapharrow-demo apply -k examples/kubernetes/ana-affinity
+kubectl -n grapharrow-demo rollout status statefulset/grapharrow
+kubectl -n grapharrow-demo rollout status deployment/grapharrow-gateway
+kubectl -n grapharrow-demo port-forward service/grapharrow-gateway 8000:8000 7687:7687
+```
+
+Use the [HTTP examples](#start-http-rest-and-ana) and
+[Bolt client instructions](#start-bolt) through the forwarded ports. For
+external traffic, terminate TLS at the deployment boundary.
+
+Handles live in the creating HTTP process. If that process restarts, clients
+open a new workflow and recreate its handles. A temporarily unavailable
+replica may return a gateway error for its workflows. Add a per-Pod Service
+and the corresponding HAProxy routes and pool entries when adding a replica.

@@ -6,11 +6,13 @@ import json
 import multiprocessing
 import os
 import signal
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from multiprocessing.connection import Connection
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 import orjson
@@ -18,9 +20,12 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.types import Message, Receive, Scope, Send
 
+from grapharrow.adapters import FileSystemAdapter
 from grapharrow.app import build_application
 from grapharrow.config import GraphArrowSettings
+from grapharrow.core import DatabaseLayout
 from grapharrow.core.errors import StorageError, WriteConflictError
+from grapharrow.domain import SnapshotId
 from grapharrow.domain.snapshot import IdempotencyReceipt
 from grapharrow.interfaces.cli import main
 from grapharrow.interfaces.embedded import Database
@@ -72,6 +77,87 @@ def _post(client: TestClient, name: str, key: str) -> Any:
         json={"query": CREATE, "params": {"name": name}},
         headers={"Idempotency-Key": key},
     )
+
+
+def test_delta_queues_late_readers_for_a_fresh_shared_head_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("deltalake")
+    from grapharrow.storage import delta
+
+    backend = delta.DeltaStorageBackend(
+        layout=DatabaseLayout("s3://grapharrow-test/db"),
+        settings=GraphArrowSettings(),
+        filesystem=FileSystemAdapter(),
+    )
+    snapshot = SnapshotId(2)
+    first_entered, release_first, second_queued, shared = (Event() for _ in range(4))
+    calls: list[SnapshotId] = []
+    futures: list[Future[bool]] = []
+
+    class ProbeFuture(Future[bool]):
+        def __init__(self) -> None:
+            super().__init__()
+            futures.append(self)
+            if len(futures) == 2:
+                second_queued.set()
+
+        def result(self, timeout: float | None = None) -> bool:
+            if not self.done():
+                shared.set()
+            return super().result(timeout)
+
+    def probe(snapshot_id: SnapshotId) -> bool:
+        calls.append(snapshot_id)
+        if len(calls) == 1:
+            first_entered.set()
+            assert release_first.wait(5)
+            return True
+        return False
+
+    def collect(seconds: float) -> None:
+        if second_queued.is_set():
+            assert shared.wait(5)
+
+    monkeypatch.setattr(delta, "Future", ProbeFuture)
+    monkeypatch.setattr(delta, "sleep", collect)
+    monkeypatch.setattr(backend, "_probe_next_commit", probe)
+    with ThreadPoolExecutor(3) as workers:
+        first = workers.submit(backend._cached_snapshot_is_current, snapshot)
+        try:
+            assert first_entered.wait(5)
+            second = workers.submit(backend._cached_snapshot_is_current, snapshot)
+            assert second_queued.wait(5)
+            third = workers.submit(backend._cached_snapshot_is_current, snapshot)
+            assert shared.wait(5)
+            assert second.result(5) is False and third.result(5) is False
+        finally:
+            release_first.set()
+        assert first.result(5) is True
+    assert calls == [snapshot, snapshot]
+
+
+def test_managed_delta_ana_opens_while_the_local_writer_lock_is_held(tmp_path: Path) -> None:
+    pytest.importorskip("deltalake")
+    app = build_application(
+        tmp_path / "graph",
+        settings=GraphArrowSettings(storage_backend="delta", delta_managed_retention=True),
+    )
+    app.use_cases.cypher.execute("CREATE (:Person)")
+
+    def open_session() -> int:
+        with GraphArrowAgentBackend(app) as session:
+            result = session.call("count_nodes", {"label": "Person"})
+            assert session.call("fetch", {"from": result["handle"]})["rows"] == [[1]]
+            inventory = app.storage_backend.maintenance.storage_inventory()
+            assert inventory.retention is not None
+            return inventory.retention.active_pins
+
+    with ThreadPoolExecutor(1) as workers:
+        with app.storage_backend.writer.hold():
+            assert workers.submit(open_session).result(timeout=5) == 1
+    inventory = app.storage_backend.maintenance.storage_inventory()
+    assert inventory.retention is not None and inventory.retention.active_pins == 0
 
 
 @pytest.mark.parametrize("delta_database", ["local"], indirect=True)

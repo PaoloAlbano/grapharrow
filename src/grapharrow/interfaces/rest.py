@@ -8,10 +8,22 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Any, cast
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from pydantic.json_schema import SkipJsonSchema
 
 from grapharrow import __version__
 from grapharrow.adapters import FileSystemAdapter
@@ -27,6 +39,12 @@ from grapharrow.core.errors import (
     StorageError,
     TransactionError,
     WriteConflictError,
+)
+from grapharrow.interfaces.rest_arrow import (
+    ARROW_CONTENT,
+    arrow_response_type,
+    arrow_rows_response,
+    read_arrow_body,
 )
 from grapharrow.use_cases.cypher_expression import public_value
 from grapharrow.use_cases.graph import QueryResult
@@ -157,17 +175,26 @@ def create_rest_app(
             }
         )
 
-    @protected_router.post("/query")
+    @protected_router.post(
+        "/query", response_model=dict[str, object], responses={200: {"content": ARROW_CONTENT}}
+    )
     def query(
         payload: QueryRequest,
+        response: Response,
         idempotency_key: Annotated[
             str | None, Header(min_length=1, max_length=128, pattern=r"^[!-~]+$")
         ] = None,
-    ) -> dict[str, object]:
+        accept: Annotated[str, Header()] = "",
+    ) -> dict[str, object] | Response:
         """Execute a Cypher statement over HTTP and wrap the tabular result in the REST envelope."""
         cypher = container.use_cases.cypher
+        response.headers["Vary"] = "Accept"
+        media_type = arrow_response_type(accept)
         if idempotency_key is None:
-            return _query_envelope(cypher.execute(payload.query, payload.params))
+            result = cypher.execute(payload.query, payload.params)
+            if media_type is not None:
+                return arrow_rows_response(result.rows, result.columns, media_type)
+            return _query_envelope(result)
 
         try:
             fingerprint = json.dumps(
@@ -175,14 +202,18 @@ def create_rest_app(
             )
         except ValueError as exc:
             raise QueryError("Idempotency-Key requires finite JSON parameters.") from exc
-        response = cypher.execute_idempotent_write(
+        receipt = cypher.execute_idempotent_write(
             payload.query,
             payload.params,
             key_hash=sha256(idempotency_key.encode("ascii")).hexdigest(),
             request_hash=sha256(fingerprint.encode("utf-8")).hexdigest(),
             encode_response=_encode_idempotent_response,
         )
-        return cast(dict[str, object], json.loads(response))
+        replay = json.loads(receipt)
+        if media_type is not None:
+            data = replay["data"]
+            return arrow_rows_response(data["rows"], data["columns"], media_type)
+        return cast(dict[str, object], replay)
 
     @protected_router.post("/nodes", status_code=status.HTTP_201_CREATED)
     def create_node(payload: NodeCreateRequest) -> dict[str, object]:
@@ -193,15 +224,37 @@ def create_rest_app(
         )
         return _ok(data=_node_payload(node))
 
-    @protected_router.post("/nodes/bulk", status_code=status.HTTP_201_CREATED)
-    def create_nodes_bulk(payload: BulkNodeCreateRequest) -> dict[str, object]:
+    @protected_router.post(
+        "/nodes/bulk",
+        status_code=status.HTTP_201_CREATED,
+        response_model=dict[str, object],
+        openapi_extra={"requestBody": {"content": ARROW_CONTENT}},
+        responses={201: {"content": ARROW_CONTENT}},
+    )
+    def create_nodes_bulk(
+        payload: Annotated[BulkNodeCreateRequest | SkipJsonSchema[bytes], Body()],
+        request: Request,
+        response: Response,
+        default_labels: Annotated[list[str] | None, Query()] = None,
+        accept: Annotated[str, Header()] = "",
+    ) -> dict[str, object] | Response:
         """Create many nodes in one request through the bulk-ingest adapter and graph use case."""
-        table = container.adapters.bulk_input.to_table(payload.rows)
+        if isinstance(payload, BulkNodeCreateRequest):
+            table = container.adapters.bulk_input.to_table(payload.rows)
+            default_labels = payload.default_labels
+        else:
+            table = read_arrow_body(payload, request.headers.get("Content-Type", ""))
         _, nodes = container.use_cases.graph.create_nodes_bulk(
             table=table,
-            default_labels=tuple(payload.default_labels),
+            default_labels=tuple(default_labels or ()),
         )
         rows = [_node_payload(node) for node in nodes]
+        response.headers["Vary"] = "Accept"
+        media_type = arrow_response_type(accept)
+        if media_type is not None:
+            arrow = arrow_rows_response(rows, ("id", "labels", "properties"), media_type)
+            arrow.status_code = status.HTTP_201_CREATED
+            return arrow
         return _ok(data={"nodes": rows}, meta={"row_count": len(rows)})
 
     @protected_router.post("/edges", status_code=status.HTTP_201_CREATED)
@@ -210,26 +263,50 @@ def create_rest_app(
         edge = _create_edge_from_request(container, payload)
         return _ok(data=_edge_payload(edge))
 
-    @protected_router.post("/edges/bulk", status_code=status.HTTP_201_CREATED)
-    def create_edges_bulk(payload: BulkEdgeCreateRequest) -> dict[str, object]:
+    @protected_router.post(
+        "/edges/bulk",
+        status_code=status.HTTP_201_CREATED,
+        response_model=dict[str, object],
+        openapi_extra={"requestBody": {"content": ARROW_CONTENT}},
+        responses={201: {"content": ARROW_CONTENT}},
+    )
+    def create_edges_bulk(
+        payload: Annotated[BulkEdgeCreateRequest | SkipJsonSchema[bytes], Body()],
+        request: Request,
+        response: Response,
+        source_label: str | None = None,
+        source_key: str | None = None,
+        target_label: str | None = None,
+        target_key: str | None = None,
+        accept: Annotated[str, Header()] = "",
+    ) -> dict[str, object] | Response:
         """Create many relationships in one request through the bulk edge-ingest path."""
-        table = container.adapters.bulk_input.to_table(payload.rows)
-        source_key = (
-            (payload.source_key.label, payload.source_key.key)
-            if payload.source_key is not None
-            else None
-        )
-        target_key = (
-            (payload.target_key.label, payload.target_key.key)
-            if payload.target_key is not None
-            else None
-        )
+        if isinstance(payload, BulkEdgeCreateRequest):
+            table = container.adapters.bulk_input.to_table(payload.rows)
+            source = (
+                (payload.source_key.label, payload.source_key.key) if payload.source_key else None
+            )
+            target = (
+                (payload.target_key.label, payload.target_key.key) if payload.target_key else None
+            )
+        else:
+            table = read_arrow_body(payload, request.headers.get("Content-Type", ""))
+            source = _arrow_endpoint_key(source_label, source_key)
+            target = _arrow_endpoint_key(target_label, target_key)
         _, edges = container.use_cases.graph.create_edges_bulk(
             table=table,
-            source_key=source_key,
-            target_key=target_key,
+            source_key=source,
+            target_key=target,
         )
         rows = [_edge_payload(edge) for edge in edges]
+        response.headers["Vary"] = "Accept"
+        media_type = arrow_response_type(accept)
+        if media_type is not None:
+            arrow = arrow_rows_response(
+                rows, ("id", "type", "source", "target", "properties"), media_type
+            )
+            arrow.status_code = status.HTTP_201_CREATED
+            return arrow
         return _ok(data={"edges": rows}, meta={"row_count": len(rows)})
 
     @protected_router.post("/triples", status_code=status.HTTP_201_CREATED)
@@ -461,6 +538,14 @@ def _query_envelope(result: QueryResult) -> dict[str, object]:
         data={"columns": list(result.columns), "rows": list(result.rows)},
         meta={"row_count": len(result.rows)},
     )
+
+
+def _arrow_endpoint_key(label: str | None, key: str | None) -> tuple[str, str] | None:
+    if label is None and key is None:
+        return None
+    if not label or not key:
+        raise HTTPException(422, "An Arrow relationship endpoint requires both a label and a key.")
+    return label, key
 
 
 def _encode_idempotent_response(result: QueryResult) -> str:

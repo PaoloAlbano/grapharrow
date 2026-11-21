@@ -13,6 +13,7 @@ import pyarrow as pa
 import pytest
 from fastapi.testclient import TestClient
 from neo4j import GraphDatabase  # noqa: E402
+from pydantic import ValidationError
 
 from grapharrow.ana.sessions import SessionNotFound
 from grapharrow.app import GraphArrowApplication, build_application  # noqa: E402
@@ -401,6 +402,7 @@ def _session(client: TestClient, key: str = "a") -> dict[str, str]:
 def test_http_session_header_round_trip_and_error_isolation(http_app: Any) -> None:
     with TestClient(http_app) as client:
         headers = _session(client)
+        assert "." not in headers["X-ANA-Session"]
         body = {"tool": "count_nodes", "args": {"label": "Device"}}
         response = client.post("/tools/call", headers=headers, json=body)
         assert response.status_code == 200
@@ -420,6 +422,47 @@ def test_http_session_header_round_trip_and_error_isolation(http_app: Any) -> No
         response = client.post("/tools/call", headers=headers, json=body)
         assert response.status_code == 404
         assert "X-ANA-Session" not in response.headers
+
+
+@pytest.mark.parametrize("route", ["", "GraphArrow", "pod.example", "pod-", "a" * 64])
+def test_http_session_route_must_be_a_dns_label(route: str) -> None:
+    with pytest.raises(ValidationError, match="ana_session_route"):
+        GraphArrowSettings(ana_session_route=route)
+
+
+def test_http_routed_tokens_still_require_the_owning_replica(
+    application: GraphArrowApplication, http_app: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = create_rest_app(
+        application.layout.root, settings=GraphArrowSettings(ana_session_route="grapharrow-0")
+    )
+    monkeypatch.setenv("GRAPHARROW_ANA_SESSION_ROUTE", "grapharrow-1")
+    second = create_rest_app(application.layout.root, settings=GraphArrowSettings())
+    count = {"tool": "count_nodes", "args": {"label": "Device"}}
+    fetch = {"tool": "fetch", "args": {"from": "h1"}}
+    with TestClient(first) as owner, TestClient(second) as other:
+        headers = _session(owner)
+        token = headers["X-ANA-Session"]
+        assert token.startswith("grapharrow-0.")
+        assert _session(other)["X-ANA-Session"].startswith("grapharrow-1.")
+        assert (
+            owner.post("/tools/call", json=count, headers=headers).json()["result"]["handle"]
+            == "h1"
+        )
+        assert owner.post("/tools/call", json=fetch, headers=headers).json()["result"]["rows"] == [
+            [25]
+        ]
+        assert other.post("/tools/call", json=fetch, headers=headers).status_code == 404
+        retargeted = {
+            **headers,
+            "X-ANA-Session": token.replace("grapharrow-0.", "grapharrow-1.", 1),
+        }
+        assert other.post("/tools/call", json=fetch, headers=retargeted).status_code == 404
+        foreign = {**headers, "Authorization": "Bearer " + "b" * 32}
+        assert owner.post("/tools/call", json=fetch, headers=foreign).status_code == 404
+        response = owner.delete("/sessions/current", headers=headers)
+        assert response.status_code == 204
+        assert response.headers["X-ANA-Session"] == token
 
 
 def test_short_handles_resolve_only_with_their_session_context(http_app: Any) -> None:

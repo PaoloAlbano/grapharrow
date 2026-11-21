@@ -618,23 +618,34 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
             return
 
         pending = state.pending
-        remaining = pending.rows[pending.index :]
-        if requested < 0:
-            limit = len(remaining)
-        else:
-            limit = min(requested, len(remaining))
-
-        batch = remaining[:limit]
-        for row in batch:
+        end = (
+            len(pending.rows)
+            if requested < 0
+            else min(pending.index + requested, len(pending.rows))
+        )
+        packet = bytearray()
+        for index in range(pending.index, end):
+            row = pending.rows[index]
             values = [
                 _packstream_temporals(
                     _packstream_result_value(column, row.get(column)), state.utc_datetimes
                 )
                 for column in pending.columns
             ]
-            _send_message(self.request, self.codec, PackstreamStructure(RECORD, [values]))
+            payload = self.codec.encode(PackstreamStructure(RECORD, [values]))
+            if packet and len(packet) + len(payload) + 4 > 65536:
+                self.request.sendall(packet)
+                packet.clear()
+            if len(payload) + 4 > 65536:
+                _send_payload(self.request, payload)
+            else:
+                packet.extend(struct.pack(">H", len(payload)))
+                packet.extend(payload)
+                packet.extend(b"\x00\x00")
+        if packet:
+            self.request.sendall(packet)
 
-        pending.index += len(batch)
+        pending.index = end
         has_more = pending.index < len(pending.rows)
         if has_more:
             _send_success(self.request, self.codec, {"has_more": True})
@@ -902,7 +913,13 @@ def _send_message(
     message: PackstreamStructure,
 ) -> None:
     """Encode and send one Bolt message using the protocol chunking rules."""
-    payload = codec.encode(message)
+    _send_payload(sock, codec.encode(message))
+
+
+def _send_payload(sock: socket.socket, payload: bytes) -> None:
+    if len(payload) <= 65535:
+        sock.sendall(struct.pack(">H", len(payload)) + payload + b"\x00\x00")
+        return
     view = memoryview(payload)
     # Bolt frames logical messages as chunked payloads terminated by an empty
     # chunk, so large records can stream without a separate length prefix.

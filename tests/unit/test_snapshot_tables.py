@@ -3,7 +3,7 @@
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 from typing import Any
 
 import pyarrow as pa
@@ -109,6 +109,42 @@ def test_snapshot_table_loader_can_retry_and_disable_caching() -> None:
         pass
     with pytest.raises(OSError, match="Read failed"), disabled.borrow(("nodes", files), fail):
         pytest.fail("The disabled cache should always call the table loader")
+
+
+def test_snapshot_table_cache_allows_distinct_loads_and_hits_during_io() -> None:
+    cache = SnapshotTableCache(1_000_000)
+    table = pa.table({"id": [1]})
+    first = ("nodes", (DatasetFile("first.parquet", 1, "nodes"),))
+    second = ("nodes", (DatasetFile("second.parquet", 1, "nodes"),))
+    cached = ("nodes", (DatasetFile("cached.parquet", 1, "nodes"),))
+    with cache.borrow(cached, lambda: table):
+        pass
+    entered = Event()
+    release = Event()
+
+    def load_first() -> pa.Table:
+        entered.set()
+        assert release.wait(5)
+        return table
+
+    def read_first() -> None:
+        with cache.borrow(first, load_first) as result:
+            assert result is table
+
+    def read_other_keys() -> None:
+        with cache.borrow(cached, lambda: pytest.fail("Expected a cache hit")) as result:
+            assert result is table
+        with cache.borrow(second, lambda: table) as result:
+            assert result is table
+
+    with ThreadPoolExecutor(2) as workers:
+        slow = workers.submit(read_first)
+        try:
+            assert entered.wait(5)
+            workers.submit(read_other_keys).result(timeout=5)
+        finally:
+            release.set()
+        slow.result(timeout=5)
 
 
 def test_snapshot_table_cache_counts_shared_range_buffers_once() -> None:

@@ -188,6 +188,9 @@ class GraphArrowMcpCypherInterface:
 
         manifest = self.grapharrow.repositories.snapshot.load_manifest()
         catalog = self.grapharrow.repositories.catalog.load_for_snapshot(manifest)
+        node_properties = self.grapharrow.repositories.graph.group_node_property_files(
+            manifest.node_properties
+        )
         return {
             "catalog_version": catalog.version.value,
             "snapshot_id": manifest.snapshot_id.value,
@@ -200,10 +203,11 @@ class GraphArrowMcpCypherInterface:
             ],
             "node_properties": [
                 {
-                    "label": _label_from_node_property_file(dataset_file),
+                    "label": label,
                     **_dataset_file_payload(dataset_file),
                 }
-                for dataset_file in manifest.node_properties
+                for label, files in node_properties.items()
+                for dataset_file in files
             ],
             "adjacency_by_source": [
                 {
@@ -437,15 +441,6 @@ def _label_from_node_label_file(dataset_file: DatasetFile) -> str:
     if len(parts) >= 3:
         return parts[-2]
     raise QueryError(f"Unexpected node label dataset path: {dataset_file.path}")
-
-
-def _label_from_node_property_file(dataset_file: DatasetFile) -> str:
-    """Extract the label name from a node-property derived dataset path."""
-
-    parts = dataset_file.path.split("/")
-    if len(parts) >= 3:
-        return parts[-2]
-    raise QueryError(f"Unexpected node property dataset path: {dataset_file.path}")
 
 
 def _rel_type_from_adjacency_file(dataset_file: DatasetFile) -> str:

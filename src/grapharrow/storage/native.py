@@ -77,6 +77,10 @@ class NativeStorageBackend:
     def borrow_current_snapshot(self) -> AbstractContextManager[SnapshotManifest]:
         return nullcontext(self.capture_snapshot())
 
+    def snapshot_open_guard(self) -> AbstractContextManager[None]:
+        """Prevent vacuum from removing files while a snapshot is materialized."""
+        return self._writer.hold()
+
     def pin_snapshot(self, snapshot_id: SnapshotId) -> AbstractContextManager[None]:
         return nullcontext()
 

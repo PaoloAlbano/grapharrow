@@ -25,6 +25,24 @@ def test_bolt_application_uses_configured_server_agent(tmp_path: Path) -> None:
 
 
 @pytest.mark.integration
+def test_bolt_batched_pull_keeps_record_boundaries_for_large_values(tmp_path: Path) -> None:
+    settings = GraphArrowSettings(bolt_host="127.0.0.1", bolt_port=0)
+    large = "x" * 70_000
+    with (
+        run_bolt_server(tmp_path / "db", settings=settings) as handle,
+        GraphDatabase.driver(f"bolt://127.0.0.1:{handle.port}", auth=None) as driver,
+        driver.session(fetch_size=3) as session,
+    ):
+        rows = session.run(
+            "UNWIND range(1, 15) AS i "
+            "RETURN i, CASE WHEN i = 8 THEN $large ELSE 'small' END AS value ORDER BY i",
+            large=large,
+        ).data()
+        assert [row["i"] for row in rows] == list(range(1, 16))
+        assert [row["value"] for row in rows] == ["small"] * 7 + [large] + ["small"] * 7
+
+
+@pytest.mark.integration
 def test_bolt_transaction_calls_registered_procedure_and_keeps_nan(tmp_path: Path) -> None:
     path = tmp_path / "graph"
     settings = GraphArrowSettings(database_path=path, bolt_host="127.0.0.1", bolt_port=0)

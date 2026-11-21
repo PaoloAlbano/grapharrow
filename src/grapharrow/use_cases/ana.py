@@ -57,8 +57,7 @@ class GraphArrowAgentBackend(AnaRuntime):
     def _open_snapshot(self, leases: ExitStack, resource_budget: AnaResourceBudget | None) -> None:
         application = self._application
         graph = application.use_cases.graph
-        # Pin canonical tables and projections together against concurrent vacuum.
-        with graph.writer_lock():
+        with application.storage_backend.snapshot_open_guard():
             self._snapshot_state: GraphTabularState | None = leases.enter_context(
                 graph.borrow_tabular_state()
             )
