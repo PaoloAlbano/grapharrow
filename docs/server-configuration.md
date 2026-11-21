@@ -228,6 +228,11 @@ values use a UTF-8 JSON column marked with the field metadata
 `grapharrow.encoding=json`. An `Idempotency-Key` replay can select
 either representation of the same stored result.
 
+Eligible Cypher scalar projections reuse the engine's Arrow columns.
+An IPC stream sends those results as bounded record batches after the
+query has prepared its result. The IPC file response includes a complete
+file footer and is buffered before sending.
+
 ```python
 import os
 

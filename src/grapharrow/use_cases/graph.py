@@ -174,6 +174,13 @@ class GraphStateUseCase:
             edge_id=edge_id, rel_type=rel_type, properties=properties
         )
 
+    def edit_node_properties_by_id(
+        self, *, node_id: int, labels: tuple[str, ...], properties: dict[str, object]
+    ) -> AbstractContextManager[tuple[NodeRecord | None] | None]:
+        return self._storage_backend.edit_node_properties_by_id(
+            node_id=node_id, labels=labels, properties=properties
+        )
+
     def load_state(self, *, snapshot: SnapshotManifest | None = None) -> GraphState:
         """Load the current catalog, snapshot, and graph records."""
 

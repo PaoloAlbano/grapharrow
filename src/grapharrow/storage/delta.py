@@ -53,10 +53,12 @@ from grapharrow.repositories.graph import (
     EDGE_SCHEMA,
     NODE_RANGE_SIZE,
     NODE_SCHEMA,
+    _can_patch_properties,
     _edge_ranges,
     _edges_table,
     _id_ranges,
     _nodes_table,
+    node_records_from_table,
 )
 from grapharrow.storage.contracts import CatalogStore, GraphStore, SnapshotStore, StorageMaintenance
 from grapharrow.storage.delta_graph import DeltaEdgeRange, DeltaGraphStore, dataset_ref
@@ -783,21 +785,59 @@ class DeltaStorageBackend:
             base = self._require_table(snapshot.snapshot_id)
             self._commit_point(base, current.head.commit_id, kind, after)
 
+    @contextmanager
+    def edit_node_properties_by_id(
+        self, *, node_id: int, labels: tuple[str, ...], properties: dict[str, object]
+    ) -> Generator[tuple[NodeRecord | None] | None, None, None]:
+        """Read a node by ID from its pinned range and publish through Delta OCC."""
+        with self._writer.hold(), self.borrow_current_snapshot() as snapshot:
+            current = self._describe_pinned_read_version(self._read_table(snapshot.snapshot_id))
+            if not current.head.node_ranges or current.catalog.constraints:
+                yield None
+                return
+            kind = _node_partition((node_id - 1) // NODE_RANGE_SIZE)
+            table = _partition(
+                current.table, kind, NODE_SCHEMA.names, ds.field("node_id") == node_id, exact=True
+            )
+            if not table.num_rows:
+                yield (None,)
+                return
+            if table.num_rows != 1:
+                yield None
+                return
+            before = node_records_from_table(table)[0]
+            if not set(labels).issubset(before.labels):
+                yield (None,)
+                return
+            if not _can_patch_properties(before, properties):
+                yield None
+                return
+            after = replace(before, properties={**before.properties, **properties})
+            yield (after,)
+            if before != after:
+                base = self._require_table(snapshot.snapshot_id)
+                self._commit_point(base, current.head.commit_id, kind, after)
+
     def _commit_point(
-        self, base: DeltaTable, metadata_id: str, kind: str, edge: EdgeRecord
+        self, base: DeltaTable, metadata_id: str, kind: str, entity: EdgeRecord | NodeRecord
     ) -> None:
         commit_id = uuid4().hex
         base_version = base.version()
+        field, identifier = (
+            ("node_id", entity.node_id)
+            if isinstance(entity, NodeRecord)
+            else ("edge_id", entity.edge_id)
+        )
         # The guard matches no row on the pinned base and matches any replacement
-        # metadata row during conflict checking. The update only writes the edge file.
+        # metadata row during conflict checking. The update only writes the touched file.
         predicate = (
-            f"(kind = '{kind}' AND edge_id = {edge.edge_id}) OR "
+            f"(kind = '{kind}' AND {field} = {identifier}) OR "
             f"(kind = 'metadata' AND (key_hash IS NULL OR key_hash <> '{metadata_id}'))"
         )
         try:
             metrics = base.update(
                 predicate=predicate,
-                new_values={"properties_json": property_codec.dumps(edge.properties)},
+                new_values={"properties_json": property_codec.dumps(entity.properties)},
                 commit_properties=CommitProperties(
                     custom_metadata={_POINT_COMMIT_ID: commit_id},
                     max_commit_retries=_POINT_COMMIT_RETRIES,
@@ -819,7 +859,7 @@ class DeltaStorageBackend:
                 raise WriteConflictError(_CONFLICT) from exc
             raise CommitOutcomeUnknownError("Could not confirm the Delta commit outcome.") from exc
         if metrics.get("num_updated_rows") != 1:
-            raise CommitOutcomeUnknownError("Delta did not report exactly one updated edge.")
+            raise CommitOutcomeUnknownError("Delta did not report exactly one updated entity.")
 
     def initialize(self) -> InitializationResult:
         snapshot = self.bootstrap_snapshot()
@@ -1042,7 +1082,12 @@ def _metadata_table(head: _Head, catalog: VersionedCatalog, *, managed: bool = F
 
 
 def _partition(
-    table: DeltaTable, kind: str, columns: list[str], expression: object = None
+    table: DeltaTable,
+    kind: str,
+    columns: list[str],
+    expression: object = None,
+    *,
+    exact: bool = False,
 ) -> pa.Table:
     try:
         partition_filters = {
@@ -1050,7 +1095,8 @@ def _partition(
             "nodes": _NODE_PARTITION_PREDICATE,
         }
         dataset = table.to_pyarrow_dataset(
-            file_pruning_predicate=partition_filters.get(kind) or [("kind", "=", kind)]
+            file_pruning_predicate=(partition_filters.get(kind) if not exact else None)
+            or [("kind", "=", kind)]
         )
         if kind == "metadata" or kind.startswith("receipt-"):
             # Avoid background Parquet work on Delta's Python-backed filesystem
@@ -1130,11 +1176,15 @@ def _edge_partitions(table: pa.Table, width: int) -> dict[str, pa.Table]:
 def _node_partitions(table: pa.Table) -> dict[str, pa.Table]:
     if not table.num_rows:
         return {}
-    # Keep the original partition name for the first range.
     return {
-        "nodes" if bucket == 0 else f"nodes-{bucket:020d}": rows
+        _node_partition(bucket): rows
         for bucket, rows in _id_ranges(table, "node_id", NODE_RANGE_SIZE)
     }
+
+
+def _node_partition(bucket: int) -> str:
+    # Keep the original partition name for the first range.
+    return "nodes" if bucket == 0 else f"nodes-{bucket:020d}"
 
 
 def _changed_edge_partitions(
@@ -1157,15 +1207,6 @@ def _changed_partitions(
     }
     changed.update({kind: schema.empty_table() for kind in old.keys() - current.keys()})
     return changed
-
-
-def _can_patch_properties(edge: EdgeRecord, properties: dict[str, object]) -> bool:
-    return all(
-        type(value) in (str, bool, int, float)
-        and type(edge.properties.get(name)) is type(value)
-        and (type(value) is not int or -(2**63) <= value < 2**63)
-        for name, value in properties.items()
-    )
 
 
 def _storage_options(root: str | Path, settings: GraphArrowSettings) -> dict[str, str]:

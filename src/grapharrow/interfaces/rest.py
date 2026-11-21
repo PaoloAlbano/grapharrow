@@ -44,6 +44,7 @@ from grapharrow.interfaces.rest_arrow import (
     ARROW_CONTENT,
     arrow_response_type,
     arrow_rows_response,
+    arrow_table_response,
     read_arrow_body,
 )
 from grapharrow.use_cases.cypher_expression import public_value
@@ -191,10 +192,12 @@ def create_rest_app(
         response.headers["Vary"] = "Accept"
         media_type = arrow_response_type(accept)
         if idempotency_key is None:
-            result = cypher.execute(payload.query, payload.params)
             if media_type is not None:
-                return arrow_rows_response(result.rows, result.columns, media_type)
-            return _query_envelope(result)
+                result = cypher.execute_arrow(payload.query, payload.params)
+                if isinstance(result, QueryResult):
+                    return arrow_rows_response(result.rows, result.columns, media_type)
+                return arrow_table_response(result, media_type)
+            return _query_envelope(cypher.execute(payload.query, payload.params))
 
         try:
             fingerprint = json.dumps(

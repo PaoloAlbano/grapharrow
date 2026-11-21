@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Generator, Iterable
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 from typing import cast
 from uuid import uuid4
@@ -20,7 +21,7 @@ from grapharrow.domain.records import EdgeRecord as EdgeRecord
 from grapharrow.domain.records import NodeRecord as NodeRecord
 from grapharrow.domain.scan import ScanPredicate
 from grapharrow.domain.snapshot import DatasetKind
-from grapharrow.storage.models import EdgePropertyPatch
+from grapharrow.storage.models import EdgePropertyPatch, NodePropertyPatch
 from grapharrow.storage.models import PersistedGraph as PersistedGraph
 
 NODE_SCHEMA = pa.schema(
@@ -156,12 +157,8 @@ class GraphRepository:
         before = self.edge_records_from_table(table.slice(position, 1))[0]
         if rel_type is not None and before.rel_type != rel_type:
             return True, None
-        for key, value in properties.items():
-            old = before.properties.get(key)
-            if type(value) not in (str, bool, int, float) or type(old) is not type(value):
-                return False, None
-            if type(value) is int and not -(2**63) <= value < 2**63:
-                return False, None
+        if not _can_patch_properties(before, properties):
+            return False, None
         candidates = [
             file
             for file in snapshot.edge_properties
@@ -217,6 +214,87 @@ class GraphRepository:
         property_parts = (*Path(patch.property_file.path).parts[2:-1], filename)
         projected = self._write_edge_property_table(patch.property_table, property_parts)
         return canonical, projected
+
+    def prepare_node_property_patch(
+        self,
+        snapshot: SnapshotManifest,
+        *,
+        node_id: int,
+        labels: tuple[str, ...],
+        properties: dict[str, object],
+    ) -> tuple[bool, NodePropertyPatch | None]:
+        """Read the canonical node range and only the projections the edit can change."""
+        files = _node_range_files(snapshot.nodes)
+        if not files and snapshot.nodes:
+            return False, None
+        bucket = (node_id - 1) // NODE_RANGE_SIZE
+        canonical = files.get(bucket)
+        if canonical is None:
+            return True, None
+        table = self.load_node_table((canonical,))
+        positions = pc.indices_nonzero(pc.equal(table["node_id"], node_id))
+        if not len(positions):
+            return True, None
+        if len(positions) != 1:
+            return False, None
+        position = positions[0].as_py()
+        before = node_records_from_table(table.slice(position, 1))[0]
+        if not set(labels).issubset(before.labels):
+            return True, None
+        if not _can_patch_properties(before, properties):
+            return False, None
+        after = replace(before, properties={**before.properties, **properties})
+        if before == after:
+            return True, NodePropertyPatch(before, after, canonical, table, ())
+
+        by_label = self.group_node_property_files(snapshot.node_properties)
+        patches: list[tuple[DatasetFile, pa.Table]] = []
+        for label in dict.fromkeys(before.labels):
+            projection = _node_range_files(by_label.get(label, ())).get(bucket)
+            if projection is None:
+                return False, None
+            projected = self._parquet.read_table(self._absolute_location(projection.path))
+            positions = pc.indices_nonzero(pc.equal(projected["node_id"], node_id))
+            if len(positions) != 1:
+                return False, None
+            index = positions[0].as_py()
+            row = projected.slice(index, 1)
+            for name, value in properties.items():
+                column = projected.schema.get_field_index(name)
+                if column < 0 or name == "node_id":
+                    return False, None
+                field = projected.schema.field(column)
+                if (field.metadata or {}).get(b"grapharrow.encoding") != b"native":
+                    return False, None
+                try:
+                    array = pa.array([value], type=field.type)
+                except (pa.ArrowException, OverflowError):
+                    return False, None
+                row = row.set_column(column, field, array)
+            patches.append((projection, _replace_row(projected, index, row)))
+
+        replaced = _replace_row(table, position, _nodes_table([after]))
+        return True, NodePropertyPatch(before, after, canonical, replaced, tuple(patches))
+
+    def persist_node_property_patch(
+        self, patch: NodePropertyPatch, snapshot_id: SnapshotId
+    ) -> dict[DatasetFile, DatasetFile]:
+        """Publish immutable replacements for a canonical range and its label projections."""
+        filename = f"snapshot-{snapshot_id.value:06d}-{uuid4().hex}.parquet"
+        bucket = (patch.after.node_id - 1) // NODE_RANGE_SIZE
+        replacements = {
+            patch.canonical_file: self._write_node_range(
+                patch.canonical_table, self._layout.nodes_dir, bucket, filename, "nodes"
+            )
+        }
+        for file, projection in patch.projections:
+            label = _label_from_node_property_file(file)
+            assert label is not None
+            directory = self._join(self._layout.node_properties_dir, label)
+            replacements[file] = self._write_node_range(
+                projection, directory, bucket, filename, "node_properties"
+            )
+        return replacements
 
     @staticmethod
     def node_cache_files(files: tuple[DatasetFile, ...]) -> tuple[DatasetFile, ...]:
@@ -857,6 +935,15 @@ class GraphRepository:
 def _replace_row(table: pa.Table, position: int, replacement: pa.Table) -> pa.Table:
     """Reuse Arrow buffers outside one edited row."""
     return pa.concat_tables([table.slice(0, position), replacement, table.slice(position + 1)])
+
+
+def _can_patch_properties(entity: EdgeRecord | NodeRecord, properties: dict[str, object]) -> bool:
+    return all(
+        type(value) in (str, bool, int, float)
+        and type(entity.properties.get(name)) is type(value)
+        and (type(value) is not int or -(2**63) <= value < 2**63)
+        for name, value in properties.items()
+    )
 
 
 def _edge_property_file_matches_layout(file: DatasetFile, width: int) -> bool:

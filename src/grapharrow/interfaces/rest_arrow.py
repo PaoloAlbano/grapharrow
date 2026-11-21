@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from io import RawIOBase
 from typing import Any
 
 import pyarrow as pa  # type: ignore[import-untyped]
 from fastapi import HTTPException, Response
+from fastapi.responses import StreamingResponse
 from pydantic import TypeAdapter
 
 ARROW_STREAM = "application/vnd.apache.arrow.stream"
@@ -15,6 +17,7 @@ _JSON = "application/json"
 _ARROW_TYPES = (ARROW_STREAM, ARROW_FILE)
 _SCALAR_TYPES = {str, int, bool, float}
 _JSON_VALUE = TypeAdapter(Any)
+_BATCH_ROWS = 8192
 ARROW_CONTENT = {
     media_type: {"schema": {"type": "string", "format": "binary"}} for media_type in _ARROW_TYPES
 }
@@ -98,8 +101,54 @@ def arrow_rows_response(
         if fields_and_arrays
         else pa.table({"empty": pa.nulls(len(rows))}).select([])
     )
+    return _buffered_arrow_response(table, media_type)
+
+
+def arrow_table_response(table: pa.Table, media_type: str) -> Response:
+    """Send a columnar query result without rebuilding its rows or buffering an IPC stream."""
+    if media_type == ARROW_STREAM:
+        return StreamingResponse(
+            _ipc_batches(table), media_type=media_type, headers={"Vary": "Accept"}
+        )
+    return _buffered_arrow_response(table, media_type)
+
+
+def _buffered_arrow_response(table: pa.Table, media_type: str) -> Response:
     sink = pa.BufferOutputStream()
     writer = pa.ipc.new_stream if media_type == ARROW_STREAM else pa.ipc.new_file
     with writer(sink, table.schema) as output:
         output.write_table(table)
     return Response(memoryview(sink.getvalue()), media_type=media_type, headers={"Vary": "Accept"})
+
+
+class _BatchBuffer(RawIOBase):
+    """Drain encoded batches while retaining the absolute IPC stream position."""
+
+    def __init__(self) -> None:
+        self._payload = bytearray()
+        self._position = 0
+
+    def writable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._position
+
+    def write(self, data: Any) -> int:
+        self._payload.extend(data)
+        self._position += len(data)
+        return len(data)
+
+    def drain(self) -> bytes:
+        payload = bytes(self._payload)
+        self._payload.clear()
+        return payload
+
+
+def _ipc_batches(table: pa.Table) -> Iterator[bytes]:
+    sink = _BatchBuffer()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        for batch in table.to_reader(max_chunksize=_BATCH_ROWS):
+            writer.write_batch(batch)
+            yield sink.drain()
+    yield sink.drain()

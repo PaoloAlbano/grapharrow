@@ -243,3 +243,7 @@ class StorageBackend(Protocol):
     def edit_edge_properties_by_id(
         self, *, edge_id: int, rel_type: str | None, properties: dict[str, object]
     ) -> AbstractContextManager[tuple[EdgeRecord | None] | None]: ...
+
+    def edit_node_properties_by_id(
+        self, *, node_id: int, labels: tuple[str, ...], properties: dict[str, object]
+    ) -> AbstractContextManager[tuple[NodeRecord | None] | None]: ...

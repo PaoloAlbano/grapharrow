@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from grapharrow.interfaces.rest import create_rest_app
 from grapharrow.interfaces.rest_arrow import ARROW_FILE, ARROW_STREAM
+from grapharrow.use_cases import cypher as engine
 
 
 def _ipc(table: pa.Table, media_type: str) -> bytes:
@@ -123,3 +124,46 @@ def test_arrow_and_json_retry_share_one_idempotency_receipt(tmp_path: Path) -> N
     assert replay.status_code == 200
     assert replay.json()["data"]["rows"] == rows == [{"name": "Ada"}]
     assert graph.capture_snapshot() == published
+
+
+def test_arrow_stream_reuses_the_engine_columns_in_multiple_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = create_rest_app(tmp_path / "graph")
+    graph = app.state.grapharrow.use_cases.graph
+    graph.create_nodes_bulk(
+        table=pa.table({"rank": list(range(9000)), "name": ["ada"] * 9000}),
+        default_labels=("Person",),
+    )
+    client = TestClient(app)
+    query = {"query": "MATCH (n:Person) RETURN n.rank AS rank, n.name AS name ORDER BY rank"}
+    json_rows = client.post("/v1/query", json=query).json()["data"]["rows"]
+
+    def forbid_row_conversion(*args: object, **kwargs: object) -> None:
+        pytest.fail("Simple Arrow projection was converted to Python rows.")
+
+    monkeypatch.setattr(engine, "_build_query_result_from_table", forbid_row_conversion)
+    response = client.post("/v1/query", json=query, headers={"Accept": ARROW_STREAM})
+    assert response.status_code == 200
+    assert "content-length" not in response.headers
+    with pa.ipc.open_stream(response.content) as reader:
+        assert reader.schema.names == ["rank", "name"]
+        batches = list(reader)
+    assert len(batches) > 1
+    assert pa.Table.from_batches(batches).to_pylist() == json_rows
+
+    response = client.post("/v1/query", json=query, headers={"Accept": ARROW_FILE})
+    assert pa.ipc.open_file(response.content).read_all().to_pylist() == json_rows
+
+
+def test_arrow_projection_keeps_the_public_encoding_for_nested_values(tmp_path: Path) -> None:
+    app = create_rest_app(tmp_path / "graph")
+    client = TestClient(app)
+    payload = {"query": "CREATE (:Person {profile:{name:'Ada', active:true}})"}
+    assert client.post("/v1/query", json=payload).status_code == 200
+    query = {"query": "MATCH (n:Person) RETURN n.profile AS profile"}
+    result = client.post("/v1/query", json=query, headers={"Accept": ARROW_STREAM})
+    assert result.status_code == 200
+    table = pa.ipc.open_stream(result.content).read_all()
+    assert table.schema.field("profile").metadata == {b"grapharrow.encoding": b"json"}
+    assert json.loads(table["profile"][0].as_py()) == {"active": True, "name": "Ada"}

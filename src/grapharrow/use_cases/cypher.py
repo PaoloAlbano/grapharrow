@@ -626,7 +626,17 @@ class CypherQueryUseCase:
         with self._graph_service.cypher_query_slot():
             with _query_phase("compile"):
                 result = self._execute(query, params)
+            return _public_query_result(cast(QueryResult, result))
+
+    def execute_arrow(
+        self, query: str, params: dict[str, object] | None = None
+    ) -> pa.Table | QueryResult:
+        """Use the columnar result when the final projection preserves public values."""
+        with self._graph_service.cypher_query_slot(), _query_phase("compile"):
+            result = self._execute(query, params, arrow=True)
+        if isinstance(result, QueryResult):
             return _public_query_result(result)
+        return result
 
     def execute_idempotent_write(
         self,
@@ -671,7 +681,9 @@ class CypherQueryUseCase:
                 return _replay_response(receipt, request_hash)
             return response
 
-    def _execute(self, query: str, params: dict[str, object] | None) -> QueryResult:
+    def _execute(
+        self, query: str, params: dict[str, object] | None, *, arrow: bool = False
+    ) -> pa.Table | QueryResult:
         normalized = query.strip()
         if not normalized:
             raise QueryError.syntax("Query string cannot be empty.", "UnexpectedSyntax")
@@ -741,6 +753,10 @@ class CypherQueryUseCase:
             with _query_phase("runtime"):
                 return ReadRuntime(self).execute(read_query)
         with _query_phase("runtime"):
+            if arrow and isinstance(compiled, CompiledMatchQuery):
+                return self._execute_match(compiled, arrow=True)
+            if arrow and isinstance(compiled, CompiledUnwindQuery):
+                return self._execute_unwind(compiled, arrow=True)
             return self._execute_compiled(compiled)
 
     def _compile_and_execute_write(
@@ -845,7 +861,7 @@ class CypherQueryUseCase:
         if isinstance(compiled, CompiledOptionalMatchQuery):
             return self._execute_optional_match(compiled)
         if isinstance(compiled, CompiledUnwindQuery):
-            return self._execute_unwind(compiled)
+            return cast(QueryResult, self._execute_unwind(compiled))
         if isinstance(compiled, CompiledMatchOptionalQuery):
             return self._execute_match_optional(compiled)
         if isinstance(compiled, CompiledMatchCreateQuery):
@@ -860,7 +876,7 @@ class CypherQueryUseCase:
             return self._execute_match_remove(compiled)
         if isinstance(compiled, CompiledMatchWithQuery):
             return self._execute_match_with(compiled)
-        return self._execute_match(compiled)
+        return cast(QueryResult, self._execute_match(compiled))
 
     def _execute_ddl_statement(self, query: str) -> QueryResult | None:
         """Handle index DDL before the ANTLR parser sees client-specific syntax."""
@@ -1231,7 +1247,9 @@ class CypherQueryUseCase:
             limit=query.limit,
         )
 
-    def _execute_match(self, query: CompiledMatchQuery) -> QueryResult:
+    def _execute_match(
+        self, query: CompiledMatchQuery, *, arrow: bool = False
+    ) -> pa.Table | QueryResult:
         """Execute this query shape and return the result needed by the caller."""
         endpoint_range_result = self._try_execute_distinct_endpoint_range_match(query)
         if endpoint_range_result is not None:
@@ -1261,6 +1279,7 @@ class CypherQueryUseCase:
                     order_by=None if planned.planned_order_window else query.order_by,
                     skip=None if planned.planned_order_window else query.skip,
                     limit=None if planned.planned_order_window else query.limit,
+                    arrow=arrow,
                 )
         matched_rows = self._match_rows(
             query.patterns,
@@ -1275,6 +1294,7 @@ class CypherQueryUseCase:
             order_by=query.order_by,
             skip=query.skip,
             limit=query.limit,
+            arrow=arrow,
         )
 
     def _try_execute_distinct_endpoint_range_match(
@@ -1720,7 +1740,9 @@ class CypherQueryUseCase:
             limit=query.limit,
         )
 
-    def _execute_unwind(self, query: CompiledUnwindQuery) -> QueryResult:
+    def _execute_unwind(
+        self, query: CompiledUnwindQuery, *, arrow: bool = False
+    ) -> pa.Table | QueryResult:
         """Execute this query shape and return the result needed by the caller."""
         rows = _apply_unwind_to_input_table(
             pa.table({}),
@@ -1733,6 +1755,7 @@ class CypherQueryUseCase:
             order_by=query.order_by,
             skip=query.skip,
             limit=query.limit,
+            arrow=arrow,
         )
 
     def _execute_match_optional(self, query: CompiledMatchOptionalQuery) -> QueryResult:
@@ -2514,7 +2537,8 @@ class CypherQueryUseCase:
         order_by: tuple[OrderByItem, ...] | None,
         skip: int | None,
         limit: int | None,
-    ) -> QueryResult:
+        arrow: bool = False,
+    ) -> QueryResult | pa.Table:
         # Aggregate projections first collapse the matched rows into an Arrow table, then apply
         # ordering/windowing to that aggregate result instead of to the pre-aggregate matches.
         """Support the current Cypher compilation or execution step."""
@@ -2548,9 +2572,17 @@ class CypherQueryUseCase:
                 skip=skip,
                 limit=limit,
             )
+            if arrow:
+                projection = _public_scalar_projection(return_items, projected_rows)
+                if projection is not None:
+                    return projection
             return _build_query_result_from_table(return_items, projected_rows)
 
         result_rows = self._apply_result_window(rows, order_by=order_by, skip=skip, limit=limit)
+        if arrow and not distinct:
+            projection = _public_scalar_projection(return_items, result_rows)
+            if projection is not None:
+                return projection
         result = _build_query_result_from_table(return_items, result_rows)
         return _apply_distinct_to_query_result(result) if distinct else result
 
@@ -7596,6 +7628,36 @@ def _build_query_result_from_table(
         columns=tuple(item.expression for item in return_items),
         rows=tuple(rows),
     )
+
+
+def _public_scalar_projection(
+    return_items: tuple[ReturnItem, ...], table: pa.Table
+) -> pa.Table | None:
+    """Reuse scalar buffers that already contain the public Cypher values."""
+    columns: dict[str, pa.Array | pa.ChunkedArray] = {}
+    for item in return_items:
+        if item.expression in columns or item.field in (None, "labels"):
+            return None
+        column = (
+            _evaluate_scalar_expression_array(table, item.scalar_expression)
+            if item.scalar_expression is not None
+            else _resolve_table_field_array(table, variable=item.variable, field=item.field)
+        )
+        if column is None:
+            return None
+        kind = column.type
+        if pa.types.is_string(kind) or pa.types.is_large_string(kind):
+            if pc.any(pc.starts_with(column, pattern=_JOIN_JSON_PREFIX)).as_py():
+                return None
+        elif not (
+            pa.types.is_integer(kind)
+            or pa.types.is_floating(kind)
+            or pa.types.is_boolean(kind)
+            or pa.types.is_null(kind)
+        ):
+            return None
+        columns[item.expression] = column
+    return pa.table(columns) if columns else None
 
 
 def _project_return_items_table(

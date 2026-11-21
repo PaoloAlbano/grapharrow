@@ -132,6 +132,45 @@ class NativeStorageBackend:
             )
             self._snapshot.publish(manifest, base=snapshot)
 
+    @contextmanager
+    def edit_node_properties_by_id(
+        self, *, node_id: int, labels: tuple[str, ...], properties: dict[str, object]
+    ) -> Generator[tuple[NodeRecord | None] | None, None, None]:
+        """Publish the touched node range and projections once the result is ready."""
+        with self.writer.hold():
+            snapshot = self.capture_snapshot()
+            if self._catalog.load_for_snapshot(snapshot).constraints:
+                yield None
+                return
+            eligible, patch = self._graph.prepare_node_property_patch(
+                snapshot, node_id=node_id, labels=labels, properties=properties
+            )
+            if not eligible:
+                yield None
+                return
+            yield (patch.after if patch is not None else None,)
+            if patch is None or patch.before == patch.after:
+                return
+            if self._snapshot.load_current_pointer().snapshot_id != snapshot.snapshot_id:
+                raise WriteConflictError(
+                    "Database changed since this write began. Retry in a new transaction."
+                )
+            next_id = SnapshotId(snapshot.snapshot_id.value + 1)
+            replacements = self._graph.persist_node_property_patch(patch, next_id)
+            manifest = replace(
+                snapshot,
+                snapshot_id=next_id,
+                parent_snapshot_id=snapshot.snapshot_id,
+                commit_txid=next_id.value,
+                created_at=_utc_now(),
+                idempotency_receipt=None,
+                nodes=tuple(replacements.get(file, file) for file in snapshot.nodes),
+                node_properties=tuple(
+                    replacements.get(file, file) for file in snapshot.node_properties
+                ),
+            )
+            self._snapshot.publish(manifest, base=snapshot)
+
     @writer_locked
     def publish_graph(
         self,

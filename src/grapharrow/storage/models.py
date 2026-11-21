@@ -14,7 +14,7 @@ from grapharrow.domain import (
     SnapshotManifest,
     VersionedCatalog,
 )
-from grapharrow.domain.records import EdgeRecord
+from grapharrow.domain.records import EdgeRecord, NodeRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +40,17 @@ class EdgePropertyPatch:
     canonical_table: pa.Table
     property_file: DatasetFile
     property_table: pa.Table
+
+
+@dataclass(frozen=True, slots=True)
+class NodePropertyPatch:
+    """A schema-preserving edit of one node range and its label projections."""
+
+    before: NodeRecord
+    after: NodeRecord
+    canonical_file: DatasetFile
+    canonical_table: pa.Table
+    projections: tuple[tuple[DatasetFile, pa.Table], ...]
 
 
 @dataclass(frozen=True, slots=True)

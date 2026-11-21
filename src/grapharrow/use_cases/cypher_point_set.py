@@ -1,11 +1,13 @@
-"""Selective execution for constant relationship property SET by entity ID."""
+"""Selective execution for constant property SET by entity ID."""
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING
 
 import pyarrow as pa  # type: ignore[import-untyped]
 
+from grapharrow.domain.records import EdgeRecord, NodeRecord
 from grapharrow.use_cases import cypher as core
 from grapharrow.use_cases.graph import GraphStateUseCase, QueryResult
 
@@ -14,32 +16,17 @@ if TYPE_CHECKING:
 
 
 def try_point_set(executor: CypherQueryUseCase, query: CompiledMatchSetQuery) -> QueryResult | None:
-    """Decline any shape whose read dependencies extend beyond one directed edge."""
+    """Decline shapes whose read dependencies extend beyond a single entity."""
     graph = executor._graph_service
-    if not isinstance(graph, GraphStateUseCase) or len(query.match_patterns) != 1:
+    if not isinstance(graph, GraphStateUseCase) or len(query.match_patterns) != 1 or query.order_by:
         return None
     pattern = query.match_patterns[0]
-    if not isinstance(pattern, core.PathPattern) or len(pattern.steps) != 1:
+    node = pattern if isinstance(pattern, core.NodePattern) and not pattern.properties else None
+    edge = _single_edge(pattern)
+    if node is None and edge is None:
         return None
-    step = pattern.steps[0]
-    variable = step.variable
-    if (
-        variable is None
-        or pattern.capture_relationships
-        or pattern.start.labels
-        or pattern.start.properties
-        or step.node.labels
-        or step.node.properties
-        or pattern.start.variable == step.node.variable
-        or step.direction not in {"outgoing", "incoming"}
-        or step.variable_length
-        or step.min_hops != 1
-        or step.max_hops != 1
-        or step.properties
-        or len(step.rel_type_alternatives) > 1
-        or query.order_by
-    ):
-        return None
+    variable = node.variable if node is not None else edge.variable if edge is not None else None
+    assert variable is not None
     predicate = query.where_predicate
     if not (
         isinstance(predicate, core.Comparison)
@@ -65,23 +52,32 @@ def try_point_set(executor: CypherQueryUseCase, query: CompiledMatchSetQuery) ->
             projection.variable != variable
             or projection.field is None
             or projection.field in {"type", "source", "target"}
+            or (node is not None and projection.field == "labels")
             or projection.field.startswith("__")
             or projection.scalar_expression is not None
             or projection.aggregate is not None
             or projection.metadata_only
         ):
             return None
-    with graph.edit_edge_properties_by_id(
-        edge_id=predicate.value, rel_type=step.rel_type, properties=properties
-    ) as candidate:
+    edit: AbstractContextManager[tuple[EdgeRecord | NodeRecord | None] | None]
+    if node is not None:
+        edit = graph.edit_node_properties_by_id(
+            node_id=predicate.value, labels=node.labels, properties=properties
+        )
+    else:
+        assert edge is not None
+        edit = graph.edit_edge_properties_by_id(
+            edge_id=predicate.value, rel_type=edge.rel_type, properties=properties
+        )
+    with edit as candidate:
         if candidate is None:
             return None
-        edge = candidate[0]
+        entity = candidate[0]
         if not query.return_items:
             return QueryResult((), ())
         columns = {
             f"{variable}.{item.field}": core._property_binding_array(
-                [edge.properties.get(item.field or "")] if edge is not None else []
+                [entity.properties.get(item.field or "")] if entity is not None else []
             )
             for item in query.return_items
         }
@@ -93,3 +89,26 @@ def try_point_set(executor: CypherQueryUseCase, query: CompiledMatchSetQuery) ->
             skip=query.skip,
             limit=query.limit,
         )
+
+
+def _single_edge(pattern: core.CompiledPattern) -> core.RelationshipStep | None:
+    if not isinstance(pattern, core.PathPattern) or len(pattern.steps) != 1:
+        return None
+    step = pattern.steps[0]
+    if (
+        step.variable is None
+        or pattern.capture_relationships
+        or pattern.start.labels
+        or pattern.start.properties
+        or step.node.labels
+        or step.node.properties
+        or pattern.start.variable == step.node.variable
+        or step.direction not in {"outgoing", "incoming"}
+        or step.variable_length
+        or step.min_hops != 1
+        or step.max_hops != 1
+        or step.properties
+        or len(step.rel_type_alternatives) > 1
+    ):
+        return None
+    return step

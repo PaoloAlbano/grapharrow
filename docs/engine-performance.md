@@ -298,6 +298,11 @@ Both backends store nodes in fixed ranges of 8,192 IDs. A point property
 files. Native also retains unaffected property-projection ranges when
 the label schema stays the same. A property schema change updates all
 affected projection ranges so readers see a consistent column layout.
+An autocommit `MATCH (n) WHERE id(n) = $id SET n.property = $value`
+can load only the node's range for constant scalar assignments to
+existing properties of the same type. Constraints, explicit transactions
+and wider read dependencies use the regular write path. Delta uses the
+same commit guard as a point relationship update.
 Native recognizes existing unsplit node files, and Delta reads existing
 unsplit snapshots. A node-changing commit or compaction can convert
 the active snapshot to ranges. Historical readers retain their files.
