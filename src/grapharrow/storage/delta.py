@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Generator, Iterator
 from concurrent.futures import Future
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -233,6 +233,7 @@ class DeltaStorageBackend:
         self._retain_read_version = snapshot_tables.max_bytes > 0
         self._read_version: _ReadVersion | None = None
         self._read_version_lock = Lock()
+        self._read_refresh_lock = Lock()
         self._head_probe_lock = Lock()
         self._queued_head_probes: dict[SnapshotId, Future[bool]] = {}
         self._graph = DeltaGraphStore(
@@ -398,11 +399,30 @@ class DeltaStorageBackend:
     @contextmanager
     def borrow_current_snapshot(self) -> Iterator[SnapshotManifest]:
         """Hold the selected snapshot from its metadata read through the caller's work."""
-        cached = self._read_version
-        if cached is not None and self._cached_snapshot_is_current(cached.manifest.snapshot_id):
-            with self.pin_snapshot(cached.manifest.snapshot_id):
-                yield cached.manifest
-            return
+        if self._retain_read_version:
+            with ExitStack() as pin:
+                snapshot: SnapshotManifest | None = None
+                while snapshot is None:
+                    cached = self._read_version
+                    if cached is not None and self._cached_snapshot_is_current(
+                        cached.manifest.snapshot_id
+                    ):
+                        pin.enter_context(self.pin_snapshot(cached.manifest.snapshot_id))
+                        snapshot = cached.manifest
+                        continue
+                    with self._read_refresh_lock:
+                        if self._read_version is not cached:
+                            # Probe the new version again. The refresh may have
+                            # selected it before this caller arrived.
+                            continue
+                        table = self._try_open()
+                        if table is None:
+                            break
+                        snapshot = pin.enter_context(self._borrow_open_snapshot(table))
+                if snapshot is not None:
+                    yield snapshot
+                    return
+        # Initialization can acquire the writer lock. Do it outside the refresh lock.
         with self._borrow_bootstrapped_snapshot() as snapshot:
             yield snapshot
 
@@ -452,7 +472,13 @@ class DeltaStorageBackend:
 
     @contextmanager
     def _borrow_bootstrapped_snapshot(self) -> Iterator[SnapshotManifest]:
-        source = self._open_or_create()
+        with self._borrow_open_snapshot(self._open_or_create()) as snapshot:
+            yield snapshot
+
+    @contextmanager
+    def _borrow_open_snapshot(
+        self, source: DeltaTable | SnapshotManifest
+    ) -> Iterator[SnapshotManifest]:
         if isinstance(source, SnapshotManifest):
             with self.pin_snapshot(source.snapshot_id):
                 yield source

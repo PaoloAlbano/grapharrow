@@ -221,6 +221,74 @@ def test_delta_snapshot_probe_reuses_the_head_and_detects_remote_commits(
     assert graph.load_state(snapshot=current).edges[0].properties == {"since": 2026}
 
 
+@pytest.mark.parametrize("commit_during_refresh", [False, True])
+def test_delta_shares_head_refresh_and_rechecks_after_waiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, commit_during_refresh: bool
+) -> None:
+    pytest.importorskip("deltalake")
+    from grapharrow.storage.delta import DeltaStorageBackend
+
+    settings = GraphArrowSettings(storage_backend="delta", delta_managed_retention=True)
+    writer = build_application(tmp_path / "graph", settings=settings)
+    writer.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    reader = build_application(tmp_path / "graph", settings=settings)
+    backend = reader.storage_backend
+    assert isinstance(backend, DeltaStorageBackend)
+    stale = backend.capture_snapshot().snapshot_id
+    writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025})
+
+    opened, resume_refresh, waiter_probed, borrowing, release_pin = (Event() for _ in range(5))
+    open_table = backend._try_open
+    probe = backend._probe_next_commit
+    opened_versions: list[int] = []
+
+    def gated_open():
+        table = open_table()
+        assert table is not None
+        opened_versions.append(table.version() + 1)
+        if len(opened_versions) == 1:
+            opened.set()
+            assert resume_refresh.wait(5)
+        return table
+
+    def record_stale_probe(snapshot_id: SnapshotId) -> bool:
+        is_current = probe(snapshot_id)
+        if snapshot_id == stale and opened.is_set():
+            waiter_probed.set()
+        return is_current
+
+    def hold_snapshot() -> SnapshotId:
+        with backend.borrow_current_snapshot() as snapshot:
+            borrowing.set()
+            assert release_pin.wait(5)
+            return snapshot.snapshot_id
+
+    monkeypatch.setattr(backend, "_try_open", gated_open)
+    monkeypatch.setattr(backend, "_probe_next_commit", record_stale_probe)
+    with ThreadPoolExecutor(2) as workers:
+        leader = workers.submit(hold_snapshot)
+        try:
+            assert opened.wait(5)
+            if commit_during_refresh:
+                writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2026})
+            waiter = workers.submit(backend.capture_snapshot)
+            assert waiter_probed.wait(5)
+            resume_refresh.set()
+            latest = waiter.result(5).snapshot_id
+            assert borrowing.wait(5)
+            assert latest.value == stale.value + 1 + int(commit_during_refresh)
+            assert opened_versions == list(range(stale.value + 1, latest.value + 1))
+            retention = writer.storage_backend.maintenance.storage_inventory().retention
+            assert retention is not None and retention.active_pins == 1
+            assert retention.oldest_pinned_snapshot_id == stale.value + 1
+        finally:
+            resume_refresh.set()
+            release_pin.set()
+        assert leader.result(5).value == stale.value + 1
+    retention = writer.storage_backend.maintenance.storage_inventory().retention
+    assert retention is not None and retention.active_pins == 0
+
+
 @pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
 def test_delta_storage_inventory_reports_physical_files_and_log_tail(
     delta_database: tuple[str | Path, GraphArrowSettings],
