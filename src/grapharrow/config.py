@@ -22,6 +22,10 @@ class GraphArrowSettings(BaseSettings):
     environment: str = Field(default="development")
     database_path: str | Path | None = Field(default=None)
     storage_backend: Literal["native", "delta"] = Field(default="native")
+    delta_incremental_refresh_enabled: bool = Field(
+        default=False,
+        description="Use incremental replay when refreshing cached Delta snapshots.",
+    )
     delta_managed_retention: bool = Field(default=False)
     delta_replica_id: str | None = Field(default=None, min_length=1, max_length=255)
     delta_checkpoint_interval: int | None = Field(

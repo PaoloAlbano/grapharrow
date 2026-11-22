@@ -132,6 +132,18 @@ value. Without an explicit value it uses the Delta library default. Shorter
 intervals reduce the amount of log replay on table open and create more
 checkpoint files.
 
+### Incremental snapshot refresh
+
+Set `GRAPHARROW_DELTA_INCREMENTAL_REFRESH_ENABLED=true` to try incremental
+replay on a Delta replica with the snapshot table cache enabled. The replica
+keeps a private Delta cursor and captures an independent view of each selected
+version. It builds Arrow fragments for the requested partitions when it reads
+them. An unsupported layout or a replay error falls back to opening the
+complete Delta table.
+
+The setting applies per process, leaves the on-disk layout intact, and is
+disabled by default. Freshness checks and retention pins still apply.
+
 ### Applying managed Delta retention
 
 Enable managed retention when creating a new Delta database. All replicas

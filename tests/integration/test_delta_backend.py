@@ -222,13 +222,21 @@ def test_delta_snapshot_probe_reuses_the_head_and_detects_remote_commits(
 
 
 @pytest.mark.parametrize("commit_during_refresh", [False, True])
+@pytest.mark.parametrize("incremental", [False, True])
 def test_delta_shares_head_refresh_and_rechecks_after_waiting(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, commit_during_refresh: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    commit_during_refresh: bool,
+    incremental: bool,
 ) -> None:
     pytest.importorskip("deltalake")
     from grapharrow.storage.delta import DeltaStorageBackend
 
-    settings = GraphArrowSettings(storage_backend="delta", delta_managed_retention=True)
+    settings = GraphArrowSettings(
+        storage_backend="delta",
+        delta_managed_retention=True,
+        delta_incremental_refresh_enabled=incremental,
+    )
     writer = build_application(tmp_path / "graph", settings=settings)
     writer.use_cases.cypher.execute(CREATE, {"name": "Graph"})
     reader = build_application(tmp_path / "graph", settings=settings)
@@ -238,12 +246,12 @@ def test_delta_shares_head_refresh_and_rechecks_after_waiting(
     writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025})
 
     opened, resume_refresh, waiter_probed, borrowing, release_pin = (Event() for _ in range(5))
-    open_table = backend._try_open
+    refresh = backend._refresh_read_source
     probe = backend._probe_next_commit
     opened_versions: list[int] = []
 
-    def gated_open():
-        table = open_table()
+    def gated_open(cached):
+        table = refresh(cached)
         assert table is not None
         opened_versions.append(table.version() + 1)
         if len(opened_versions) == 1:
@@ -263,7 +271,7 @@ def test_delta_shares_head_refresh_and_rechecks_after_waiting(
             assert release_pin.wait(5)
             return snapshot.snapshot_id
 
-    monkeypatch.setattr(backend, "_try_open", gated_open)
+    monkeypatch.setattr(backend, "_refresh_read_source", gated_open)
     monkeypatch.setattr(backend, "_probe_next_commit", record_stale_probe)
     with ThreadPoolExecutor(2) as workers:
         leader = workers.submit(hold_snapshot)
@@ -357,6 +365,76 @@ def test_delta_refresh_reuses_only_unchanged_graph_metadata(
         "NewLabel",
     ]
     assert opened_versions == [after.snapshot_id.value]
+
+
+@pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
+def test_delta_incremental_refresh_keeps_an_independent_read_view(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+) -> None:
+    from grapharrow.storage.delta import DeltaStorageBackend, _partition
+    from grapharrow.storage.delta_read_view import DeltaReadView
+
+    path, settings = delta_database
+    settings = settings.model_copy(
+        update={
+            "delta_incremental_refresh_enabled": True,
+            "delta_managed_retention": True,
+            "edge_parquet_range_size": 2,
+        }
+    )
+    writer = build_application(path, settings=settings)
+    writer.use_cases.cypher.execute(CREATE_EDGE_RANGES)
+    reader = build_application(path, settings=settings).storage_backend
+    assert isinstance(reader, DeltaStorageBackend)
+    with reader.borrow_current_snapshot() as original:
+        before = reader._read_table(original.snapshot_id)
+        cursor = reader._read_refresh_cursor
+        assert isinstance(before, DeltaReadView) and cursor is not None
+        writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025})
+        current = reader.capture_snapshot()
+        after = reader._read_table(current.snapshot_id)
+        assert isinstance(after, DeltaReadView)
+        assert reader._read_refresh_cursor is cursor
+        assert before.version() + 1 == after.version() == cursor.version()
+
+        def years(view: DeltaReadView) -> list[int]:
+            rows = _partition(view, "edges", ["properties_json"]).to_pylist()
+            return sorted(json.loads(row["properties_json"])["since"] for row in rows)
+
+        assert years(before) == [2020, 2020, 2020, 2020]
+        assert years(after) == [2020, 2020, 2020, 2025]
+        with pytest.raises(StorageError, match="Active Delta snapshot pins"):
+            writer.storage_backend.maintenance.apply_retention(
+                minimum_snapshot_id=current.snapshot_id.value, online=True
+            )
+    status = writer.storage_backend.maintenance.storage_inventory().retention
+    assert status is not None and status.active_pins == 0
+
+
+def test_delta_incremental_refresh_falls_back_for_unsupported_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    deltalake = pytest.importorskip("deltalake")
+    from grapharrow.storage.delta import DeltaStorageBackend
+    from grapharrow.storage.delta_read_view import DeltaReadView
+
+    settings = GraphArrowSettings(storage_backend="delta", delta_incremental_refresh_enabled=True)
+    writer = build_application(tmp_path / "graph", settings=settings)
+    writer.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    reader = build_application(tmp_path / "graph", settings=settings).storage_backend
+    assert isinstance(reader, DeltaStorageBackend)
+    before = reader.capture_snapshot()
+    assert isinstance(reader._read_table(before.snapshot_id), DeltaReadView)
+    writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025})
+    with monkeypatch.context() as patch:
+        patch.setattr(DeltaReadView, "capture", lambda *args: None)
+        after = reader.capture_snapshot()
+        assert isinstance(reader._read_table(after.snapshot_id), deltalake.DeltaTable)
+        assert reader._read_refresh_cursor is None
+    writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2026})
+    latest = reader.capture_snapshot()
+    assert latest.snapshot_id.value == before.snapshot_id.value + 2
+    assert isinstance(reader._read_table(latest.snapshot_id), DeltaReadView)
 
 
 @pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
@@ -1556,15 +1634,19 @@ def test_delta_rejects_incompatible_metadata_without_writing(
 
 
 @pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
+@pytest.mark.parametrize("incremental", [False, True])
 def test_delta_point_sets_rebase_disjoint_ranges_without_rewriting_metadata(
     delta_database: tuple[str | Path, GraphArrowSettings],
+    incremental: bool,
 ) -> None:
     from deltalake import DeltaTable
 
     from grapharrow.storage.delta import _storage_options
 
     path, settings = delta_database
-    settings = settings.model_copy(update={"edge_parquet_range_size": 2})
+    settings = settings.model_copy(
+        update={"edge_parquet_range_size": 2, "delta_incremental_refresh_enabled": incremental}
+    )
     first = build_application(path, settings=settings)
     second = build_application(path, settings=settings)
     first.use_cases.cypher.execute(CREATE_EDGE_RANGES)

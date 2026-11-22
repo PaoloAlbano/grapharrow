@@ -138,10 +138,14 @@ class Interfaces:
 def interfaces(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> Any:
-    backend = request.param
+    incremental = request.param == "delta-incremental"
+    backend = "delta" if incremental else request.param
     if backend == "delta":
         pytest.importorskip("deltalake")
     monkeypatch.setenv("GRAPHARROW_STORAGE_BACKEND", backend)
+    if incremental:
+        monkeypatch.setenv("GRAPHARROW_DELTA_INCREMENTAL_REFRESH_ENABLED", "true")
+        monkeypatch.setenv("GRAPHARROW_DELTA_MANAGED_RETENTION", "true")
     path = tmp_path / "db"
     embedded = Database(path)
     with embedded.write_transaction() as session:
@@ -503,6 +507,69 @@ def test_writes_are_visible_across_interfaces_with_ana_snapshot_isolation(
     report["new_session"] = interfaces.fetch(fresh, after["handle"])["rows"]
     assert report["new_session"] == [{"count": 6}]
     report["passed"] = True
+
+
+@pytest.mark.parametrize("interfaces", ["delta-incremental"], indirect=True)
+def test_delta_incremental_refresh_across_ana_rest_and_bolt(
+    interfaces: Interfaces, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from deltalake import DeltaTable
+    from deltalake.exceptions import DeltaError
+
+    from grapharrow.storage.delta import DeltaStorageBackend
+    from grapharrow.storage.delta_read_view import DeltaReadView
+
+    backend = interfaces.rest.app.state.grapharrow.storage_backend
+    assert isinstance(backend, DeltaStorageBackend)
+
+    def count(session: dict[str, str]) -> list[dict[str, Any]]:
+        handle = interfaces.call(session, "count_nodes", {"label": "Person", "alias": "total"})
+        return interfaces.fetch(session, handle["handle"])["rows"]
+
+    initial = interfaces.session()
+    assert count(initial) == [{"total": 5}]
+    interfaces.write("rest", "CREATE (:Person {name: 'REST'})", {})
+    first = interfaces.session()
+    assert count(first) == [{"total": 6}]
+    assert backend._read_version is not None
+    assert isinstance(backend._read_version.table, DeltaReadView)
+    cursor = backend._read_refresh_cursor
+    assert cursor is not None
+
+    interfaces.write("bolt", "CREATE (:Person {name: 'Bolt'})", {})
+    calls = 0
+    update = DeltaTable.update_incremental
+
+    def fail_reader(table: DeltaTable) -> None:
+        nonlocal calls
+        if table is cursor:
+            calls += 1
+            raise DeltaError("Injected incremental replay failure")
+        update(table)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(DeltaTable, "update_incremental", fail_reader)
+        second = interfaces.session()
+        assert count(second) == [{"total": 7}]
+        assert calls == 1
+        assert backend._read_refresh_cursor is None
+        assert backend._read_version is not None
+        assert isinstance(backend._read_version.table, DeltaTable)
+
+    interfaces.write("bolt", "CREATE (:Person {name: 'Recovered'})", {})
+    recovered = interfaces.session()
+    assert count(recovered) == [{"total": 8}]
+    assert backend._read_refresh_cursor is not None
+    assert backend._read_version is not None
+    assert isinstance(backend._read_version.table, DeltaReadView)
+    assert count(initial) == [{"total": 5}]
+    assert count(first) == [{"total": 6}]
+    assert count(second) == [{"total": 7}]
+    assert interfaces.rest_query("MATCH (p:Person) RETURN count(p) AS total", {})["rows"] == [
+        {"total": 8}
+    ]
+    with interfaces.bolt.session() as session:
+        assert session.run("MATCH (p:Person) RETURN count(p) AS total").data() == [{"total": 8}]
 
 
 @pytest.mark.parametrize("writer", ["embedded", "rest", "bolt"])

@@ -63,6 +63,7 @@ from grapharrow.repositories.graph import (
 from grapharrow.storage.contracts import CatalogStore, GraphStore, SnapshotStore, StorageMaintenance
 from grapharrow.storage.delta_graph import DeltaEdgeRange, DeltaGraphStore, dataset_ref
 from grapharrow.storage.delta_inventory import inspect_delta_storage, plan_delta_retention
+from grapharrow.storage.delta_read_view import DeltaReadView
 from grapharrow.storage.delta_retention import MANAGED_DESCRIPTION, DeltaRetentionCoordinator
 from grapharrow.storage.models import (
     DeltaPinRecoveryResult,
@@ -98,6 +99,7 @@ _SCHEMA = pa.schema(
 )
 _RECEIPT_COLUMNS = ["key_hash", "request_hash", "response_json"]
 _CONFLICT = "Database changed since this write began. Retry in a new transaction."
+_ReadSource = DeltaTable | DeltaReadView
 
 
 class _DeltaWriter:
@@ -165,7 +167,7 @@ class _Head:
 
 @dataclass(frozen=True)
 class _ReadVersion:
-    table: DeltaTable
+    table: _ReadSource
     manifest: SnapshotManifest
     catalog: VersionedCatalog
     head: _Head
@@ -174,7 +176,11 @@ class _ReadVersion:
     @cached_property
     def graph_files(self) -> dict[str, tuple[DatasetFile, ...]]:
         try:
-            actions = pa.table(self.table.get_add_actions(flatten=True))
+            actions = (
+                self.table.actions
+                if isinstance(self.table, DeltaReadView)
+                else pa.table(self.table.get_add_actions(flatten=True))
+            )
             rows = actions.select(["path", "partition.kind", "num_records"]).to_pylist()
         except (DeltaError, pa.ArrowException, OSError) as exc:
             raise StorageError("Could not read the active Delta graph files.") from exc
@@ -232,6 +238,8 @@ class DeltaStorageBackend:
             else SnapshotTableCache(settings.snapshot_table_cache_max_bytes)
         )
         self._retain_read_version = snapshot_tables.max_bytes > 0
+        self._incremental_refresh = settings.delta_incremental_refresh_enabled
+        self._read_refresh_cursor: DeltaTable | None = None
         self._read_version: _ReadVersion | None = None
         self._read_refresh_observation: tuple[SnapshotManifest, int] | None = None
         self._read_version_lock = Lock()
@@ -327,17 +335,17 @@ class DeltaStorageBackend:
             for file in files
         )
 
-    def _read_table(self, snapshot_id: SnapshotId) -> DeltaTable:
+    def _read_table(self, snapshot_id: SnapshotId) -> _ReadSource:
         cached = self._read_version
         if cached is not None and cached.manifest.snapshot_id == snapshot_id:
             return cached.table
         return self._require_table(snapshot_id)
 
-    def _describe_read_version(self, table: DeltaTable) -> _ReadVersion:
+    def _describe_read_version(self, table: _ReadSource) -> _ReadVersion:
         with self.pin_snapshot(SnapshotId(table.version() + 1)):
             return self._describe_pinned_read_version(table)
 
-    def _describe_pinned_read_version(self, table: DeltaTable) -> _ReadVersion:
+    def _describe_pinned_read_version(self, table: _ReadSource) -> _ReadVersion:
         """Retain only the latest observed version, with a handle used exclusively for reads."""
         snapshot_id = SnapshotId(table.version() + 1)
         cached = self._read_version
@@ -367,7 +375,9 @@ class DeltaStorageBackend:
             return entry
 
     @staticmethod
-    def _graph_metadata_file(table: DeltaTable) -> tuple[str, str | None, str] | None:
+    def _graph_metadata_file(table: _ReadSource) -> tuple[str, str | None, str] | None:
+        if isinstance(table, DeltaReadView):
+            return table.metadata_file()
         # Reader features can change the visible rows without replacing a Parquet file.
         if table.protocol().min_reader_version > 2:
             return None
@@ -403,7 +413,7 @@ class DeltaStorageBackend:
         raise StorageError(f"Missing commit information for Delta version {version}.")
 
     def _manifest(
-        self, table: DeltaTable, head: _Head, catalog: VersionedCatalog
+        self, table: _ReadSource, head: _Head, catalog: VersionedCatalog
     ) -> SnapshotManifest:
         version = table.version()
         if head.metadata_version != version:
@@ -452,7 +462,7 @@ class DeltaStorageBackend:
                             # Reuse an overlapping refresh or recheck if it started earlier.
                             continue
                         opened_at = monotonic_ns()
-                        table = self._try_open()
+                        table = self._refresh_read_source(cached)
                         if table is None:
                             break
                         snapshot = pin.enter_context(self._borrow_open_snapshot(table))
@@ -463,6 +473,34 @@ class DeltaStorageBackend:
         # Initialization can acquire the writer lock. Do it outside the refresh lock.
         with self._borrow_bootstrapped_snapshot() as snapshot:
             yield snapshot
+
+    def _refresh_read_source(self, cached: _ReadVersion | None) -> _ReadSource | None:
+        """Refresh under the read refresh lock and publish a detached view."""
+        if not self._incremental_refresh:
+            return self._try_open()
+        previous = self._read_refresh_cursor
+        self._read_refresh_cursor = None
+        cursor = previous if previous is not None else self._try_open()
+        if cursor is None:
+            return None
+        try:
+            if previous is not None:
+                cursor.update_incremental()
+            # A stale probe may have found a commit beyond the cursor. Reopen
+            # if replay failed to advance to a new view of the head.
+            if (
+                previous is not None
+                and cached is not None
+                and cursor.version() + 1 <= cached.manifest.snapshot_id.value
+            ):
+                return self._try_open()
+            detached = DeltaReadView.capture(cursor, self._uri, self._options)
+        except (DeltaError, OSError, pa.ArrowException):
+            return self._try_open()
+        if detached is None:
+            return cursor if previous is None else self._try_open()
+        self._read_refresh_cursor = cursor
+        return detached
 
     def _cached_snapshot_is_current(self, snapshot_id: SnapshotId) -> bool:
         if isinstance(self._layout.delta_dir, Path):
@@ -515,7 +553,7 @@ class DeltaStorageBackend:
 
     @contextmanager
     def _borrow_open_snapshot(
-        self, source: DeltaTable | SnapshotManifest
+        self, source: _ReadSource | SnapshotManifest
     ) -> Iterator[SnapshotManifest]:
         if isinstance(source, SnapshotManifest):
             with self.pin_snapshot(source.snapshot_id):
@@ -1146,7 +1184,7 @@ def _metadata_table(head: _Head, catalog: VersionedCatalog, *, managed: bool = F
 
 
 def _partition(
-    table: DeltaTable,
+    table: _ReadSource,
     kind: str,
     columns: list[str],
     expression: object = None,
@@ -1158,10 +1196,13 @@ def _partition(
             "edges": _EDGE_PARTITION_PREDICATE,
             "nodes": _NODE_PARTITION_PREDICATE,
         }
-        dataset = table.to_pyarrow_dataset(
-            file_pruning_predicate=(partition_filters.get(kind) if not exact else None)
-            or [("kind", "=", kind)]
-        )
+        partition_filter = partition_filters.get(kind) if not exact else None
+        if isinstance(table, DeltaReadView):
+            dataset = table.partition_dataset(kind, include_ranges=partition_filter is not None)
+        else:
+            dataset = table.to_pyarrow_dataset(
+                file_pruning_predicate=partition_filter or [("kind", "=", kind)]
+            )
         if kind == "metadata" or kind.startswith("receipt-"):
             # Avoid background Parquet work on Delta's Python-backed filesystem
             # when a writer exits immediately after reading metadata or receipts.
@@ -1176,16 +1217,17 @@ def _partition(
         raise StorageError(f"Could not read the Delta {kind} partition.") from exc
 
 
-def _metadata(table: DeltaTable) -> tuple[_Head, VersionedCatalog]:
+def _metadata(table: _ReadSource) -> tuple[_Head, VersionedCatalog]:
     rows = _partition(table, "metadata", ["properties_json", "key_hash"])
     if rows.num_rows != 1:
         raise StorageError("Expected exactly one metadata row at the captured Delta version.")
     try:
         payload = orjson.loads(rows["properties_json"][0].as_py())
         data = payload["graph"]
-        expected_format = (
-            _MANAGED_FORMAT if table.metadata().description == MANAGED_DESCRIPTION else _FORMAT
+        description = (
+            table.description if isinstance(table, DeltaReadView) else table.metadata().description
         )
+        expected_format = _MANAGED_FORMAT if description == MANAGED_DESCRIPTION else _FORMAT
         if payload["format"] != expected_format or "metadata_version" not in data:
             raise StorageError("Unsupported GraphArrow Delta layout. Use a new database path.")
         width = data["edge_range_size"]
