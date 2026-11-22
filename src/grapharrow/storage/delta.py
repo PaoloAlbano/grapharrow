@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from functools import cached_property
 from pathlib import Path
 from threading import Lock, RLock
-from time import sleep
+from time import monotonic_ns, sleep
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -169,6 +169,7 @@ class _ReadVersion:
     manifest: SnapshotManifest
     catalog: VersionedCatalog
     head: _Head
+    metadata_file: tuple[str, str | None, str] | None
 
     @cached_property
     def graph_files(self) -> dict[str, tuple[DatasetFile, ...]]:
@@ -232,6 +233,7 @@ class DeltaStorageBackend:
         )
         self._retain_read_version = snapshot_tables.max_bytes > 0
         self._read_version: _ReadVersion | None = None
+        self._read_refresh_observation: tuple[SnapshotManifest, int] | None = None
         self._read_version_lock = Lock()
         self._read_refresh_lock = Lock()
         self._head_probe_lock = Lock()
@@ -338,17 +340,44 @@ class DeltaStorageBackend:
     def _describe_pinned_read_version(self, table: DeltaTable) -> _ReadVersion:
         """Retain only the latest observed version, with a handle used exclusively for reads."""
         snapshot_id = SnapshotId(table.version() + 1)
+        cached = self._read_version
+        if cached is not None and cached.manifest.snapshot_id == snapshot_id:
+            return cached
         with self._read_version_lock:
             cached = self._read_version
             if cached is not None and cached.manifest.snapshot_id == snapshot_id:
                 return cached
-            head, catalog = _metadata(table)
-            entry = _ReadVersion(table, self._manifest(table, head, catalog), catalog, head)
+            metadata_file = self._graph_metadata_file(table) if self._retain_read_version else None
+            if (
+                cached is not None
+                and cached.manifest.snapshot_id.value < snapshot_id.value
+                and metadata_file is not None
+                and metadata_file == cached.metadata_file
+            ):
+                head, catalog = cached.head, cached.catalog
+            else:
+                head, catalog = _metadata(table)
+            entry = _ReadVersion(
+                table, self._manifest(table, head, catalog), catalog, head, metadata_file
+            )
             if self._retain_read_version and (
                 cached is None or cached.manifest.snapshot_id.value < snapshot_id.value
             ):
                 self._read_version = entry
             return entry
+
+    @staticmethod
+    def _graph_metadata_file(table: DeltaTable) -> tuple[str, str | None, str] | None:
+        # Reader features can change the visible rows without replacing a Parquet file.
+        if table.protocol().min_reader_version > 2:
+            return None
+        try:
+            files = table.file_uris(file_pruning_predicate=[("kind", "=", "metadata")])
+        except (DeltaError, OSError, ValueError):
+            return None
+        if len(files) != 1:
+            return None
+        return files[0], table.metadata().description, table.schema().to_json()
 
     @cached_property
     def _log_storage(self) -> DeltaStorageHandler:
@@ -400,25 +429,34 @@ class DeltaStorageBackend:
     def borrow_current_snapshot(self) -> Iterator[SnapshotManifest]:
         """Hold the selected snapshot from its metadata read through the caller's work."""
         if self._retain_read_version:
+            started = monotonic_ns()
             with ExitStack() as pin:
                 snapshot: SnapshotManifest | None = None
                 while snapshot is None:
                     cached = self._read_version
-                    if cached is not None and self._cached_snapshot_is_current(
-                        cached.manifest.snapshot_id
+                    observation = self._read_refresh_observation
+                    if cached is not None and (
+                        # A refresh started after this borrow can be its freshness check.
+                        (
+                            observation is not None
+                            and observation[0] is cached.manifest
+                            and observation[1] > started
+                        )
+                        or self._cached_snapshot_is_current(cached.manifest.snapshot_id)
                     ):
                         pin.enter_context(self.pin_snapshot(cached.manifest.snapshot_id))
                         snapshot = cached.manifest
                         continue
                     with self._read_refresh_lock:
                         if self._read_version is not cached:
-                            # Probe the new version again. The refresh may have
-                            # selected it before this caller arrived.
+                            # Reuse an overlapping refresh or recheck if it started earlier.
                             continue
+                        opened_at = monotonic_ns()
                         table = self._try_open()
                         if table is None:
                             break
                         snapshot = pin.enter_context(self._borrow_open_snapshot(table))
+                        self._read_refresh_observation = (snapshot, opened_at)
                 if snapshot is not None:
                     yield snapshot
                     return

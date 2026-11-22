@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from multiprocessing.connection import Connection
 from pathlib import Path
-from threading import Event
+from threading import Barrier, Event
 from typing import Any
 
 import orjson
@@ -287,6 +287,76 @@ def test_delta_shares_head_refresh_and_rechecks_after_waiting(
         assert leader.result(5).value == stale.value + 1
     retention = writer.storage_backend.maintenance.storage_inventory().retention
     assert retention is not None and retention.active_pins == 0
+
+
+def test_delta_waiters_share_a_refresh_started_after_they_arrive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("deltalake")
+    from grapharrow.storage.delta import DeltaStorageBackend
+
+    settings = GraphArrowSettings(storage_backend="delta", delta_managed_retention=True)
+    writer = build_application(tmp_path / "graph", settings=settings)
+    writer.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    reader = build_application(tmp_path / "graph", settings=settings).storage_backend
+    assert isinstance(reader, DeltaStorageBackend)
+    stale = reader.capture_snapshot().snapshot_id
+    writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025})
+    probe = reader._probe_next_commit
+    entered = Barrier(2)
+    checked: list[SnapshotId] = []
+
+    def synchronize_probe(snapshot_id: SnapshotId) -> bool:
+        checked.append(snapshot_id)
+        if snapshot_id == stale:
+            entered.wait(5)
+        return probe(snapshot_id)
+
+    monkeypatch.setattr(reader, "_probe_next_commit", synchronize_probe)
+    with ThreadPoolExecutor(2) as workers:
+        first = workers.submit(reader.capture_snapshot)
+        second = workers.submit(reader.capture_snapshot)
+        snapshot = first.result(5)
+        assert snapshot == second.result(5)
+        assert snapshot.snapshot_id.value == stale.value + 1
+    assert checked == [stale, stale]
+
+
+@pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
+def test_delta_refresh_reuses_only_unchanged_graph_metadata(
+    delta_database: tuple[str | Path, GraphArrowSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from grapharrow.storage import delta
+
+    path, settings = delta_database
+    writer = build_application(path, settings=settings)
+    writer.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    reader = build_application(path, settings=settings).storage_backend
+    before = reader.capture_snapshot()
+    writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025})
+    load_metadata = delta._metadata
+    opened_versions: list[int] = []
+
+    def count_reads(table):
+        opened_versions.append(table.version() + 1)
+        return load_metadata(table)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(delta, "_metadata", count_reads)
+        point_update = reader.capture_snapshot()
+        assert point_update.snapshot_id.value == before.snapshot_id.value + 1
+        assert opened_versions == []
+
+    writer.use_cases.cypher.execute("CREATE (:NewLabel)")
+    monkeypatch.setattr(delta, "_metadata", count_reads)
+    after = reader.capture_snapshot()
+    assert after.snapshot_id.value == point_update.snapshot_id.value + 1
+    assert [file.path.rsplit("/", 1)[-1] for file in after.node_labels] == [
+        "Author",
+        "Book",
+        "NewLabel",
+    ]
+    assert opened_versions == [after.snapshot_id.value]
 
 
 @pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
