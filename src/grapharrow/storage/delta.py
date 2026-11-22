@@ -227,6 +227,7 @@ class DeltaStorageBackend:
         self._uri = str(layout.delta_dir)
         self._options = _storage_options(layout.root, settings)
         self._writer = _DeltaWriter()
+        self._point_write_table: DeltaTable | None = None
         self._edge_range_size = settings.edge_parquet_range_size
         self._checkpoint_interval = settings.delta_checkpoint_interval
         self._manage_new_table = settings.delta_managed_retention
@@ -246,6 +247,7 @@ class DeltaStorageBackend:
         self._read_refresh_lock = Lock()
         self._head_probe_lock = Lock()
         self._queued_head_probes: dict[SnapshotId, Future[bool]] = {}
+        self._probed_commit_size: tuple[int, int] | None = None
         self._graph = DeltaGraphStore(
             self._read_partition,
             edge_ranges=self._read_edge_ranges,
@@ -396,11 +398,15 @@ class DeltaStorageBackend:
     def _commit_info(self, version: int) -> dict[str, Any]:
         path = f"_delta_log/{version:020d}.json"
         try:
-            # Supplying the size lets the handler skip an additional object-store HEAD.
-            info = self._log_storage.get_file_info([path])[0]
-            if info.type != pafs.FileType.File:
-                raise StorageError(f"Missing Delta log file for version {version}.")
-            storage = DeltaStorageHandler(self._uri, self._options, known_sizes={path: info.size})
+            probed = self._probed_commit_size
+            if probed is not None and probed[0] == version:
+                size = probed[1]
+            else:
+                info = self._log_storage.get_file_info([path])[0]
+                if info.type != pafs.FileType.File:
+                    raise StorageError(f"Missing Delta log file for version {version}.")
+                size = info.size
+            storage = DeltaStorageHandler(self._uri, self._options, known_sizes={path: size})
             with storage.open_input_file(path) as handle:
                 for line in handle.read().splitlines():
                     action = orjson.loads(line)
@@ -535,7 +541,11 @@ class DeltaStorageBackend:
             if isinstance(self._layout.delta_dir, Path):
                 (self._layout.delta_dir / path).stat()
                 return False
-            return bool(self._log_storage.get_file_info([path])[0].type == pafs.FileType.NotFound)
+            info = self._log_storage.get_file_info([path])[0]
+            if info.type == pafs.FileType.File and info.size is not None:
+                # A published JSON commit is immutable. Retain only the last size observed.
+                self._probed_commit_size = (snapshot_id.value, info.size)
+            return bool(info.type == pafs.FileType.NotFound)
         except FileNotFoundError:
             return True
         except (DeltaError, OSError, pa.ArrowException):
@@ -884,8 +894,7 @@ class DeltaStorageBackend:
             yield (after,)
             if before == after:
                 return
-            base = self._require_table(snapshot.snapshot_id)
-            self._commit_point(base, current.head.commit_id, kind, after)
+            self._commit_point(snapshot.snapshot_id, current.head.commit_id, kind, after)
 
     @contextmanager
     def edit_node_properties_by_id(
@@ -917,12 +926,27 @@ class DeltaStorageBackend:
             after = replace(before, properties={**before.properties, **properties})
             yield (after,)
             if before != after:
-                base = self._require_table(snapshot.snapshot_id)
-                self._commit_point(base, current.head.commit_id, kind, after)
+                self._commit_point(snapshot.snapshot_id, current.head.commit_id, kind, after)
+
+    def _take_point_write_table(self, snapshot_id: SnapshotId) -> DeltaTable:
+        """Take a writer-owned handle for exactly the pinned transaction version."""
+        table = self._point_write_table
+        self._point_write_table = None
+        if table is not None:
+            expected = snapshot_id.value - 1
+            try:
+                if table.version() < expected:
+                    table.update_incremental()
+                if table.version() == expected:
+                    return table
+            except (DeltaError, OSError):
+                pass
+        return self._require_table(snapshot_id)
 
     def _commit_point(
-        self, base: DeltaTable, metadata_id: str, kind: str, entity: EdgeRecord | NodeRecord
+        self, snapshot_id: SnapshotId, metadata_id: str, kind: str, entity: EdgeRecord | NodeRecord
     ) -> None:
+        base = self._take_point_write_table(snapshot_id)
         commit_id = uuid4().hex
         base_version = base.version()
         field, identifier = (
@@ -962,6 +986,7 @@ class DeltaStorageBackend:
             raise CommitOutcomeUnknownError("Could not confirm the Delta commit outcome.") from exc
         if metrics.get("num_updated_rows") != 1:
             raise CommitOutcomeUnknownError("Delta did not report exactly one updated entity.")
+        self._point_write_table = base
 
     def initialize(self) -> InitializationResult:
         snapshot = self.bootstrap_snapshot()

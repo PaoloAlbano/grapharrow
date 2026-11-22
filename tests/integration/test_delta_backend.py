@@ -221,6 +221,39 @@ def test_delta_snapshot_probe_reuses_the_head_and_detects_remote_commits(
     assert graph.load_state(snapshot=current).edges[0].properties == {"since": 2026}
 
 
+@pytest.mark.parametrize("delta_database", ["s3"], indirect=True)
+def test_delta_reuses_log_size_only_for_the_probed_commit(
+    delta_database: tuple[str | Path, GraphArrowSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from grapharrow.storage.delta import DeltaStorageBackend
+
+    path, settings = delta_database
+    writer = build_application(path, settings=settings)
+    writer.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    reader = build_application(path, settings=settings).storage_backend
+    assert isinstance(reader, DeltaStorageBackend)
+    original = reader.capture_snapshot()
+    storage = reader._log_storage
+    file_info = storage.get_file_info
+    heads: list[str] = []
+
+    def record_head(paths):
+        heads.extend(paths)
+        return file_info(paths)
+
+    monkeypatch.setattr(storage, "get_file_info", record_head)
+    writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025})
+    current = reader.capture_snapshot()
+    assert current.snapshot_id.value == original.snapshot_id.value + 1
+    assert heads == [f"_delta_log/{original.snapshot_id.value:020d}.json"]
+
+    writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2026})
+    published = reader._commit_info(current.snapshot_id.value)
+    assert isinstance(published["grapharrowPointCommitId"], str)
+    assert heads[-1] == f"_delta_log/{current.snapshot_id.value:020d}.json"
+    assert len(heads) == 2
+
+
 @pytest.mark.parametrize("commit_during_refresh", [False, True])
 @pytest.mark.parametrize("incremental", [False, True])
 def test_delta_shares_head_refresh_and_rechecks_after_waiting(
@@ -1694,6 +1727,9 @@ def test_delta_point_set_rejects_conflicting_changes(
     first = build_application(path, settings=settings)
     second = build_application(path, settings=settings)
     first.use_cases.cypher.execute(CREATE_EDGE_RANGES)
+    first.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2019})
+    # Make the reusable write handle lag behind the next pinned write.
+    second.use_cases.cypher.execute(SET_EDGE, {"id": 3, "since": 2022})
 
     with (
         pytest.raises(WriteConflictError),
@@ -1717,9 +1753,30 @@ def test_delta_point_set_rejects_conflicting_changes(
         latest = second.storage_backend.capture_snapshot()
     current = first.use_cases.graph.load_state()
     assert current.snapshot == latest
-    assert current.edges[0].properties == {"since": 2020}
+    assert current.edges[0].properties == {"since": 2019}
     if concurrent_change == "catalog":
         assert [index.name for index in current.catalog.indexes] == ["author_name"]
+
+
+@pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
+def test_delta_point_writes_reuse_a_writer_owned_handle(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+) -> None:
+    from grapharrow.storage.delta import DeltaStorageBackend
+
+    path, settings = delta_database
+    app = build_application(path, settings=settings)
+    app.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    backend = app.storage_backend
+    assert isinstance(backend, DeltaStorageBackend)
+    with backend.borrow_current_snapshot() as old:
+        app.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025})
+        handle = backend._point_write_table
+        assert handle is not None
+        app.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2026})
+        assert backend._point_write_table is handle
+        assert app.use_cases.graph.load_state(snapshot=old).edges[0].properties == {"since": 2020}
+        assert app.use_cases.graph.load_state().edges[0].properties == {"since": 2026}
 
 
 @pytest.mark.parametrize("delta_database", ["local"], indirect=True)
@@ -1769,6 +1826,51 @@ def test_delta_finds_rebased_commit_after_lost_acknowledgment(
     pointer = snapshots.load_current_pointer()
     _, receipt = snapshots.idempotency_base(pointer, sha256(b"receipt").hexdigest())
     assert receipt == base.idempotency_receipt
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+def test_delta_reassembles_only_the_edge_group_with_changed_files(
+    delta_database: tuple[str | Path, GraphArrowSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from grapharrow.domain.records import EdgeRecord, NodeRecord
+    from grapharrow.storage import delta_graph
+
+    path, settings = delta_database
+    settings = settings.model_copy(update={"edge_parquet_range_size": 1})
+    writer = build_application(path, settings=settings)
+    reader = build_application(path, settings=settings)
+    graph = writer.use_cases.graph
+    edge_count = delta_graph._MIN_GROUPED_EDGE_RANGES + 2
+    graph.publish_records(
+        previous_state=graph.load_state(),
+        new_nodes=(NodeRecord(1, ("Author",), {}), NodeRecord(2, ("Book",), {})),
+        new_edges=tuple(
+            EdgeRecord(i, "WROTE", 1, 2, {"since": 2020}) for i in range(1, edge_count + 1)
+        ),
+    )
+    store = reader.repositories.graph
+    old = reader.storage_backend.capture_snapshot()
+    before = store.load_edge_table(old.edges)
+    borrow = store._borrow_edge_range
+    rebuilt: list[str] = []
+
+    def count_range(snapshot_id, item):
+        rebuilt.append(item.partition)
+        return borrow(snapshot_id, item)
+
+    monkeypatch.setattr(store, "_borrow_edge_range", count_range)
+    writer.use_cases.cypher.execute(SET_EDGE, {"id": 40, "since": 2025})
+    head = reader.storage_backend.capture_snapshot()
+    current = store.load_edge_table(head.edges)
+    width = delta_graph._EDGE_RANGE_GROUP_SIZE
+    assert rebuilt == [f"edges-{index:020d}" for index in range(width, width * 2)]
+    assert current["edge_id"].to_pylist() == list(range(1, edge_count + 1))
+    years = [json.loads(value)["since"] for value in current["properties_json"].to_pylist()]
+    assert years == [2020] * 39 + [2025] + [2020] * (edge_count - 40)
+    assert store.load_edge_table(old.edges).equals(before)
+    assert all(
+        json.loads(value)["since"] == 2020 for value in before["properties_json"].to_pylist()
+    )
 
 
 @pytest.mark.parametrize("delta_database", ["local"], indirect=True)

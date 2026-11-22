@@ -23,6 +23,7 @@ _TableKey: TypeAlias = tuple[
         "edge_properties",
         "edge_endpoints",
         "edge_range",
+        "edge_range_group",
         "edge_range_properties",
     ],
     tuple[DatasetFile, ...],

@@ -32,6 +32,9 @@ from grapharrow.repositories.graph import (
     node_records_from_table,
 )
 
+_EDGE_RANGE_GROUP_SIZE = 32
+_MIN_GROUPED_EDGE_RANGES = 4 * _EDGE_RANGE_GROUP_SIZE
+
 
 def dataset_ref(
     snapshot_id: SnapshotId, kind: DatasetKind, count: int, name: str = ""
@@ -105,15 +108,35 @@ class DeltaGraphStore:
             return EDGE_SCHEMA.empty_table()
         snapshot_id = _snapshot_id(files[0])
         ranges = self._edge_ranges(snapshot_id)
-        if ranges:
-            with ExitStack() as leases:
-                return pa.concat_tables(
-                    [
-                        leases.enter_context(self._borrow_edge_range(snapshot_id, item))
-                        for item in ranges
-                    ]
+        if not ranges:
+            return self._edge_rows(files[0], EDGE_SCHEMA)
+        if len(ranges) < _MIN_GROUPED_EDGE_RANGES or not self._snapshot_tables.max_bytes:
+            return self._load_edge_ranges(snapshot_id, ranges)
+        with ExitStack() as leases:
+            blocks = []
+            for start in range(0, len(ranges), _EDGE_RANGE_GROUP_SIZE):
+                group = ranges[start : start + _EDGE_RANGE_GROUP_SIZE]
+                key = tuple(physical for item in group for physical in item.files)
+                blocks.append(
+                    leases.enter_context(
+                        self._snapshot_tables.borrow(
+                            ("edge_range_group", key),
+                            partial(self._load_edge_ranges, snapshot_id, group),
+                        )
+                    )
                 )
-        return self._edge_rows(files[0], EDGE_SCHEMA)
+            return pa.concat_tables(blocks)
+
+    def _load_edge_ranges(
+        self, snapshot_id: SnapshotId, ranges: tuple[DeltaEdgeRange, ...]
+    ) -> pa.Table:
+        with ExitStack() as leases:
+            return pa.concat_tables(
+                [
+                    leases.enter_context(self._borrow_edge_range(snapshot_id, item))
+                    for item in ranges
+                ]
+            )
 
     def _borrow_edge_range(
         self, snapshot_id: SnapshotId, item: DeltaEdgeRange
