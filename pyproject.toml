@@ -64,7 +64,7 @@ packages = ["src/grapharrow"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-  "/src", "/tests", "/vendor", "/docs", "/pyproject.toml", "/uv.lock",
+  "/src", "/tests", "/vendor", "/docs", "/charts", "/pyproject.toml", "/uv.lock",
   "/README.md", "/LICENSE", "/THIRD_PARTY_NOTICES.md", "/CONTRIBUTING.md",
   "/.github/release_metadata.py", "/.github/publish_release.py", "/.github/version.py",
   "/.github/opencypher_badge.py",

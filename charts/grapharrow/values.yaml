@@ -1,0 +1,48 @@
+replicaCount: 1
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+requestMetrics:
+  enabled: true
+  # Optional Secret containing a metrics-token key for scrapers.
+  existingSecret: ""
+
+image:
+  repository: ghcr.io/paoloalbano/grapharrow
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+auth:
+  # The Secret must contain rest-token, bolt-token and clients.json.
+  existingSecret: ""
+
+storage:
+  backend: native
+  # Delta and Native readers require an s3:// or az:// database path.
+  uri: ""
+  existingSecret: ""
+  readOnly: false
+  pvc:
+    existingClaim: ""
+    # Set "-" to disable dynamic provisioning.
+    storageClass: ""
+    size: 10Gi
+
+service:
+  type: ClusterIP
+  annotations: {}
+
+resources:
+  http: {}
+  bolt: {}
+
+gateway:
+  replicaCount: 2
+  image: haproxy:3.2-alpine@sha256:7816a9801a6846b912bc37e48529808e2fa87c3c47992441940f68e393ebcfeb
+  resources: {}

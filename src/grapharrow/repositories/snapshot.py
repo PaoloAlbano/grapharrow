@@ -36,11 +36,16 @@ class SnapshotRepository:
         self,
         layout: DatabaseLayout,
         filesystem: FileSystemAdapter | None = None,
+        *,
+        read_only: bool = False,
+        writer_lock_dir: Path | None = None,
     ) -> None:
         """Bind the layout and filesystem used to manage manifests and the current pointer."""
         self._layout = layout
         self._filesystem = filesystem or FileSystemAdapter()
-        self._writer = WriterCoordinator(layout.root, self._filesystem)
+        self._writer = WriterCoordinator(
+            layout.root, self._filesystem, read_only=read_only, lock_dir=writer_lock_dir
+        )
         self._idempotency = IdempotencyIndex(layout.root, self._filesystem)
 
     @property

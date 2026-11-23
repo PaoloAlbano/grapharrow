@@ -17,6 +17,7 @@ from weakref import WeakValueDictionary
 import pyarrow.fs as pafs  # type: ignore[import-untyped]
 
 from grapharrow.adapters.filesystem import FileSystemAdapter
+from grapharrow.core.errors import ReadOnlyError
 
 
 @dataclass
@@ -79,7 +80,14 @@ def _lock_file(handle: BinaryIO) -> None:
 class WriterCoordinator:
     """Use a reentrant process lock and an OS file lock for native local storage."""
 
-    def __init__(self, root: str | Path, filesystem: FileSystemAdapter) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        filesystem: FileSystemAdapter,
+        *,
+        read_only: bool = False,
+        lock_dir: Path | None = None,
+    ) -> None:
         resolved, location = filesystem.resolve(root)
         while isinstance(resolved, pafs.SubTreeFileSystem):
             location = f"{resolved.base_path.rstrip('/')}/{location.lstrip('/')}"
@@ -87,18 +95,25 @@ class WriterCoordinator:
         self.local_root = (
             Path(location).resolve() if isinstance(resolved, pafs.LocalFileSystem) else None
         )
+        self._lock_dir = self.local_root or lock_dir
         self._key = str(self.local_root) if self.local_root is not None else str(root).rstrip("/")
         self._state = _state_for(self._key)
+        self.read_only = read_only
+
+    def ensure_writable(self) -> None:
+        if self.read_only:
+            raise ReadOnlyError("This GraphArrow process serves a read-only database.")
 
     @contextmanager
     def hold(self) -> Iterator[None]:
+        self.ensure_writable()
         if self._state.pid != os.getpid():
             self._state = _state_for(self._key)
         state = self._state
         with state.lock:
-            if state.depth == 0 and self.local_root is not None:
-                self.local_root.mkdir(parents=True, exist_ok=True)
-                handle = (self.local_root / ".grapharrow-writer.lock").open("a+b", buffering=0)
+            if state.depth == 0 and self._lock_dir is not None:
+                self._lock_dir.mkdir(parents=True, exist_ok=True)
+                handle = (self._lock_dir / ".grapharrow-writer.lock").open("a+b", buffering=0)
                 try:
                     _lock_file(handle)
                 except BaseException:

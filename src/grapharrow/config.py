@@ -22,6 +22,8 @@ class GraphArrowSettings(BaseSettings):
     environment: str = Field(default="development")
     database_path: str | Path | None = Field(default=None)
     storage_backend: Literal["native", "delta"] = Field(default="native")
+    storage_read_only: bool = Field(default=False)
+    native_writer_lock_dir: Path | None = Field(default=None)
     delta_incremental_refresh_enabled: bool = Field(
         default=False,
         description="Use incremental replay when refreshing cached Delta snapshots.",
@@ -39,6 +41,8 @@ class GraphArrowSettings(BaseSettings):
     server_port: int = Field(default=8000)
     rest_prefix: str = Field(default="/v1")
     server_auth_token: str | None = Field(default=None)
+    request_metrics_enabled: bool = Field(default=False)
+    request_metrics_token: str | None = Field(default=None, min_length=1)
     ana_enabled: bool = Field(default=True)
     ana_schema_entry: str = Field(default="overview")
     ana_session_route: str | None = Field(

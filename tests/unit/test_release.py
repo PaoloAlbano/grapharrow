@@ -300,6 +300,12 @@ def publication(metadata: Any, artifacts: Path, monkeypatch: pytest.MonkeyPatch)
     }.items():
         monkeypatch.setenv(key, value)
     monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+    Path("helm-dist").mkdir()
+    Path("helm-dist/grapharrow-0.1.0.tgz").write_bytes(b"validated chart")
+    Path("image-reports").mkdir()
+    for arch in ("amd64", "arm64"):
+        for report in ("spdx", "buildkit", "vulnerabilities"):
+            Path(f"image-reports/image-{arch}.{report}.json").write_text("{}")
     calls = []
 
     def run(*args: str, capture: bool = False, **kwargs: Any) -> str:
@@ -307,17 +313,18 @@ def publication(metadata: Any, artifacts: Path, monkeypatch: pytest.MonkeyPatch)
         if args[:2] == ("gh", "api"):
             return "[[]]" if "--paginate" in args else json.dumps({"sha": "a" * 40})
         if args[:3] == ("docker", "image", "inspect"):
-            arch = args[3].split("-")[-1]
+            arch = args[3].rsplit("-", 1)[-1]
             return json.dumps(
                 [
                     {
                         "Architecture": arch,
                         "Os": "linux",
                         "Config": {
+                            "User": "65532:65532",
                             "Labels": {
                                 "org.opencontainers.image.version": "0.1.0",
                                 "org.opencontainers.image.revision": "a" * 40,
-                            }
+                            },
                         },
                     }
                 ]
@@ -333,6 +340,10 @@ def publication(metadata: Any, artifacts: Path, monkeypatch: pytest.MonkeyPatch)
 def test_publication_promotes_tested_images_and_finalizes_last(publication: Any) -> None:
     publisher, calls = publication
     publisher.main()
+    assert [c[-1] for c in calls if c[:2] == ("docker", "load")] == [
+        "images/image-amd64.tar.gz",
+        "images/image-arm64.tar.gz",
+    ]
     assert [c[-1] for c in calls if c[:2] == ("docker", "push")] == [
         "ghcr.io/owner/grapharrow:0.1.0-amd64",
         "ghcr.io/owner/grapharrow:0.1.0-arm64",
@@ -340,6 +351,10 @@ def test_publication_promotes_tested_images_and_finalizes_last(publication: Any)
     assert not any("build" in c for c in calls)
     creation = next(c for c in calls if c[:3] == ("gh", "release", "create"))
     assert "--draft" in creation and "--verify-tag" in creation
+    assert "helm-dist/grapharrow-0.1.0.tgz" in creation
+    assert "image-reports/image-arm64.spdx.json" in creation
+    assert "image-reports/image-amd64.buildkit.json" in creation
+    assert "image-reports/image-amd64.vulnerabilities.json" in creation
     assert any(c[:4] == ("docker", "buildx", "imagetools", "create") for c in calls)
     assert calls[-2][:3] == ("gh", "release", "edit") and "--draft=false" in calls[-2]
     assert calls[-1] == ("docker", "logout", "ghcr.io")
@@ -414,17 +429,20 @@ def test_stable_release_rejects_assets_from_another_version(
     assert not calls
 
 
+@pytest.mark.parametrize(
+    "label", ["org.opencontainers.image.revision", "org.opencontainers.image.version"]
+)
 def test_wrong_image_identity_prevents_creating_release(
-    publication: Any, monkeypatch: pytest.MonkeyPatch
+    publication: Any, monkeypatch: pytest.MonkeyPatch, label: str
 ) -> None:
     publisher, calls = publication
     original = publisher.run
 
     def run(*args: str, **kwargs: Any) -> str:
         value = original(*args, **kwargs)
-        if args[:3] == ("docker", "image", "inspect"):
+        if args[:4] == ("docker", "image", "inspect", "grapharrow:check-arm64"):
             data = json.loads(value)
-            data[0]["Config"]["Labels"]["org.opencontainers.image.revision"] = "wrong"
+            data[0]["Config"]["Labels"][label] = "wrong"
             return json.dumps(data)
         return value
 
@@ -433,6 +451,14 @@ def test_wrong_image_identity_prevents_creating_release(
         publisher.main()
     assert not any(c[:3] == ("gh", "release", "create") for c in calls)
     assert calls[-1] == ("docker", "logout", "ghcr.io")
+
+
+def test_missing_report_prevents_any_registry_calls(publication: Any) -> None:
+    publisher, calls = publication
+    Path("image-reports/image-arm64.spdx.json").unlink()
+    with pytest.raises(ValueError, match="Missing validated image report"):
+        publisher.main()
+    assert not any(c[0] == "docker" for c in calls)
 
 
 def test_push_failure_keeps_the_release_unpublished(

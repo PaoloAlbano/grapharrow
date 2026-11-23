@@ -101,6 +101,10 @@ class TransactionError(GraphArrowError):
     """Raised when transactional operations fail."""
 
 
+class ReadOnlyError(TransactionError):
+    """Raised when a mutation is sent to a read-only database process."""
+
+
 class WriteConflictError(TransactionError):
     """The database changed after a writer captured its base state."""
 

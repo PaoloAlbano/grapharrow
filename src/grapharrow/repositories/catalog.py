@@ -62,6 +62,7 @@ class CatalogRepository:
 
     def stage(self, catalog: VersionedCatalog) -> str:
         """Write an immutable candidate and return its database-relative path."""
+        self._writer.ensure_writable()
         path = f"catalog/catalog-{catalog.version.value:06d}-{uuid4().hex}.json"
         self._filesystem.write_json(self._absolute_path(path), serialize_catalog(catalog))
         return path
@@ -71,6 +72,10 @@ class CatalogRepository:
         pointer = self._snapshots.try_load_current_pointer()
         if pointer is not None:
             return self._snapshots.load_at(pointer)
+        if self._writer.read_only:
+            raise StorageError(
+                "Initialize the Native database from its writer before opening a reader."
+            )
         with self._writer.hold():
             if self._snapshots.try_load_current_pointer() is None:
                 if self._filesystem.exists(self._layout.delta_initial_commit_path):

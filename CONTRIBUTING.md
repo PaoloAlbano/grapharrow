@@ -102,4 +102,5 @@ template asks for the problem, resulting behavior and relevant validation.
 The [CI and release guide](docs/releases.md) explains distribution checks and
 tag-driven releases. Main and PR checks build and test artifacts; pushing a
 matching `v*` tag runs full validation and then publishes GitHub Release assets
-and the two Docker architectures. PyPI publication is not configured.
+including the Helm chart and the Docker runtime for amd64 and arm64.
+PyPI publication is not configured.

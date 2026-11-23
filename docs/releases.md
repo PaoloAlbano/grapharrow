@@ -20,7 +20,8 @@ The README displays the Codecov result for `main`.
 | Wheel/source build | Once | Once |
 | Installed-wheel smoke | Python 3.11 and 3.15 | All five Python versions |
 | ANA and Cypher reference comparisons | One Python 3.12 job | One Python 3.12 job |
-| Docker build and smoke | Linux amd64 | Linux amd64 and arm64 |
+| Docker build, smoke tests and vulnerability scan | Linux amd64 | Linux amd64 and arm64 |
+| Helm profile lint and packaged-chart integration | Native on a PVC and Delta on Azurite | Native on a PVC and Delta on Azurite |
 
 Real-cloud tests and benchmarks are excluded from ordinary CI. Local integration
 checks include disk storage, simulated S3, interface comparisons, authentication,
@@ -33,11 +34,30 @@ in GitHub separately from the workflow files. A release reuses the same CI
 workflow with the complete matrix, including both container architectures.
 
 The wheel is built from the source distribution, checked for private-file
-exclusions and installed outside the checkout. Each runtime image installs that
-wheel and hash-locked runtime requirements, without development dependencies.
-Docker smoke checks cover authenticated REST, two isolated ANA sessions sharing
-the short handle `h1`, Bolt authentication/query execution and persistence after
-container restart. The runtime interpreter is Python 3.12 for both architectures.
+exclusions and installed outside the checkout. The Python 3.15 runtime image
+installs that wheel and hash-locked runtime requirements. Docker smoke checks
+cover the interpreter, authenticated REST, two isolated ANA sessions using
+the short handle `h1`, Bolt authentication and queries, and persistence after
+container restart with a read-only root filesystem. Trivy scans system
+packages and Python dependencies in the final images. CI retains the reports
+and fails if a high or critical finding has a fix available. Each report bundle
+includes an SPDX inventory and the BuildKit provenance record.
+
+CI installs the packaged Helm chart on kind using the tested runtime image.
+It runs the chart's `helm test` hook and checks Native persistence, read-only
+Native replicas on shared object storage, authenticated per-pod metrics,
+and Delta replica behavior. The Delta check also exercises the
+[TLS edge examples](kubernetes.md#https-for-rest-and-ana), including ANA
+session affinity across proxy replicas and certificate verification for
+REST and Bolt. It changes the StatefulSet scale subresource in autoscaling
+mode and checks that the gateway serves the new pods and preserves existing
+ANA sessions.
+
+To refresh the pinned base, resolve the current multi-platform digest for
+`python:3.15-slim-trixie` with `docker buildx imagetools inspect`, then update
+the digest in the [Dockerfile](../Dockerfile) and rerun CI. The Dockerfile
+applies Debian package updates before scanning. Update runtime Python
+dependencies through `uv.lock` and rerun CI.
 
 ## Preparing a release
 
@@ -95,8 +115,8 @@ version in `pyproject.toml` if it is ahead of the latest published stable
 version, or the next patch of the latest stable version. The suffix is the
 release workflow run number. The build checkout updates the package metadata
 and lockfile for the wheel and source archive. The commit on `main` retains
-its original version. GHCR publishes the versioned development image and its
-architecture tags. The stable release and Docker `latest` alias are unaffected.
+its original version. GHCR publishes a versioned development image and its
+architecture tags. The Docker `latest` tag tracks the latest stable release.
 
 The workflow creates a Nightly tag only after validation succeeds. If
 publication fails after creating the tag, inspect the tag, any draft and
@@ -105,12 +125,14 @@ silently replaced.
 
 ## Published artifacts
 
-For `v0.1.0`, the workflow creates a GitHub Release containing:
+For a release version `X.Y.Z`, the workflow creates a GitHub Release containing:
 
-- `grapharrow-0.1.0-py3-none-any.whl`;
-- `grapharrow-0.1.0.tar.gz`;
+- `grapharrow-X.Y.Z-py3-none-any.whl`;
+- `grapharrow-X.Y.Z.tar.gz`;
 - `runtime-requirements.txt`, the exported runtime lock used by Docker, including the `cloud` and `delta` extras;
-- `SHA256SUMS`, covering those artifacts.
+- `SHA256SUMS`, covering those artifacts;
+- a Helm chart package and `SHA256SUMS-helm`;
+- SPDX SBOMs, BuildKit provenance records and vulnerability reports for both architectures.
 
 Install the wheel downloaded from the release with:
 
@@ -121,14 +143,17 @@ python -m pip install ./grapharrow-0.1.0-py3-none-any.whl
 The wheel's dependencies use the requirement ranges in its metadata; installing
 it does not automatically enforce the repository lockfile.
 
-The corresponding container image is:
+The corresponding container image uses the release version as its tag.
 
 ```text
-ghcr.io/paoloalbano/grapharrow:0.1.0
+ghcr.io/paoloalbano/grapharrow:X.Y.Z
 ```
 
-It selects `linux/amd64` or `linux/arm64` automatically. Architecture-specific
-tags are `0.1.0-amd64` and `0.1.0-arm64`; the newest stable release also updates `latest`.
+The image selects `linux/amd64` or `linux/arm64` automatically. Append `-amd64` or
+`-arm64` to select an architecture explicitly. The newest stable release
+updates `latest`. The chart has its own version in `Chart.yaml` and is
+packaged with its application version set to `X.Y.Z`. See
+[Deploying GraphArrow on Kubernetes](kubernetes.md).
 See [Server Startup and Authentication](server-configuration.md#docker) for
 credentials, ports, persistent data and running Bolt from the image.
 
@@ -140,9 +165,10 @@ the image without authentication. See the
 
 ## Publication integrity and failures
 
-The release job downloads the tested wheel/source artifacts and saved container
-images from the same workflow run. It verifies artifact checksums, package/tag
-identity, remote tag identity and image version/revision/architecture labels.
+The release job downloads the tested wheel/source artifacts, Helm package,
+image reports and saved container images from the same workflow run. It
+verifies package checksums, package/tag identity, remote tag identity and
+the identity of each image, including its architecture and runtime user.
 It does not rebuild the package or the images during publication.
 
 Publishing uses the workflow's `GITHUB_TOKEN`, with write permissions restricted
@@ -154,7 +180,7 @@ image push, the job retries the same tested image up to twice. Versioned
 release assets and image tags are not
 automatically replaced. A
 failure after creating the release leaves a GitHub draft; it is only published
-after both architecture tags and their combined image are available. GitHub and
+after both architecture tags and the combined image are available. GitHub and
 GHCR publication are not a single atomic transaction: inspect any partial draft
 or container uploads before attempting recovery. The workflow refuses existing
 release versions or image tags rather than silently overwriting them. Use a new

@@ -180,17 +180,64 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}
           BUILD_VERSION: ${{ inputs.build-version }}
+          BUILDX_METADATA_PROVENANCE: max
         run: |
           version="${BUILD_VERSION:-$(python .github/release_metadata.py --version)}"
-          docker buildx build --load --platform "linux/$ARCH" \
-            --build-arg DISTRIBUTION_SOURCE=prebuilt \
+          mkdir image-reports
+          docker buildx build --load --platform "linux/$ARCH" --target runtime \
+            --no-cache-filter runtime --build-arg DISTRIBUTION_SOURCE=prebuilt \
             --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             --label "org.opencontainers.image.version=$version" \
             --cache-from "type=gha,scope=runtime-$ARCH" \
             --cache-to "type=gha,mode=max,scope=runtime-$ARCH" \
+            --metadata-file "image-reports/image-$ARCH.buildkit.json" \
             --tag "grapharrow:check-$ARCH" .
-      - name: Check auth, sessions, persistence and Bolt in the container
+          jq -e '."buildx.build.provenance".materials | length > 0' \
+            "image-reports/image-$ARCH.buildkit.json" > /dev/null
+      - name: Install the checksum-pinned vulnerability scanner
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          case "$ARCH" in
+            amd64) platform=64bit; checksum=bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf ;;
+            arm64) platform=ARM64; checksum=ab9d51f86e6a5fb936f605faff6b593ac51bc378fff4d3e8b9d58358b9c367c3 ;;
+            *) exit 1 ;;
+          esac
+          archive="$RUNNER_TEMP/trivy.tar.gz"
+          curl --fail --location --retry 3 --output "$archive" \
+            "https://github.com/aquasecurity/trivy/releases/download/v0.76.2/trivy_0.76.2_Linux-$platform.tar.gz"
+          printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check
+          tar -xzf "$archive" --directory "$RUNNER_TEMP" trivy
+      - name: Scan the final runtime and record its SPDX inventory
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          "$RUNNER_TEMP/trivy" image --download-db-only --no-progress
+          image="grapharrow:check-$ARCH"
+          report="image-reports/image-$ARCH"
+          "$RUNNER_TEMP/trivy" image --image-src docker --skip-db-update --no-progress \
+            --scanners vuln --format json --output "$report.vulnerabilities.json" "$image"
+          "$RUNNER_TEMP/trivy" image --image-src docker --no-progress \
+            --format spdx-json --output "$report.spdx.json" "$image"
+      - name: Retain scan reports, SBOMs and build provenance
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-reports-${{ matrix.arch }}
+          path: image-reports/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Require fixes for high and critical vulnerabilities
+        run: |
+          jq -e -s '
+            [.[].Results[].Vulnerabilities[]? |
+              select((.Severity == "HIGH" or .Severity == "CRITICAL") and (.FixedVersion // "") != "")]
+            | if length == 0 then true else
+                error(map("\(.VulnerabilityID) \(.PkgName) \(.InstalledVersion) -> \(.FixedVersion)") | join("\n"))
+              end
+          ' image-reports/*.vulnerabilities.json
+      - name: Check auth, sessions, persistence and Bolt with both backends
         env:
           ARCH: ${{ matrix.arch }}
           BUILD_VERSION: ${{ inputs.build-version }}
@@ -200,18 +247,99 @@ jobs:
             uv run --frozen --all-extras python .github/smoke_docker.py "grapharrow:check-$ARCH" \
               --storage-backend "$backend" --expected-version "$version"
           done
-      - name: Preserve the tested image for publication
-        if: inputs.release-build
+      - name: Preserve the tested image
+        if: inputs.release-build || matrix.arch == 'amd64'
         env:
           ARCH: ${{ matrix.arch }}
         run: docker save "grapharrow:check-$ARCH" | gzip > "image-$ARCH.tar.gz"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: inputs.release-build
+        if: inputs.release-build || matrix.arch == 'amd64'
         with:
           name: docker-${{ matrix.arch }}
           path: image-${{ matrix.arch }}.tar.gz
+          compression-level: 0
           if-no-files-found: error
           retention-days: 3
+
+  kubernetes:
+    name: Helm / kind
+    needs: docker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+      - run: uv sync --locked --all-extras --python 3.12
+      - name: Lint and render the deployment profiles
+        run: |
+          helm lint charts/grapharrow --strict --values charts/grapharrow/profiles/native.yaml
+          helm lint charts/grapharrow --strict --values charts/grapharrow/profiles/native-writer.yaml \
+            --set-string storage.uri=s3://graphs/smoke
+          helm lint charts/grapharrow --strict --values charts/grapharrow/profiles/native-readers.yaml \
+            --set-string storage.uri=s3://graphs/smoke --set autoscaling.enabled=true
+          helm lint charts/grapharrow --strict --values charts/grapharrow/profiles/delta-s3.yaml \
+            --set-string storage.uri=s3://graphs/smoke
+          helm lint charts/grapharrow --strict --values charts/grapharrow/profiles/delta-azure.yaml \
+            --set-string storage.uri=az://graphs/smoke
+          if helm template smoke charts/grapharrow --set auth.existingSecret=grapharrow-auth,replicaCount=2; then
+            echo "Expected the Native profile to reject multiple replicas" >&2
+            exit 1
+          fi
+          if helm template smoke charts/grapharrow --set auth.existingSecret=grapharrow-auth,storage.backend=delta; then
+            echo "Expected the Delta profile to require a shared URI" >&2
+            exit 1
+          fi
+      - name: Package the chart for installation
+        env:
+          BUILD_VERSION: ${{ inputs.build-version }}
+        run: |
+          version="${BUILD_VERSION:-$(python .github/release_metadata.py --version)}"
+          helm package charts/grapharrow --app-version "$version" --destination helm-dist
+          cd helm-dist
+          sha256sum grapharrow-*.tgz > SHA256SUMS-helm
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: docker-amd64
+          path: images
+      - name: Start a disposable kind cluster and import the tested image
+        run: |
+          export KUBECONFIG="$RUNNER_TEMP/grapharrow-kind.yaml"
+          printf 'KUBECONFIG=%s\n' "$KUBECONFIG" >> "$GITHUB_ENV"
+          cat > "$RUNNER_TEMP/kind.yaml" <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+            - role: worker
+            - role: worker
+          EOF
+          kind create cluster --name grapharrow-helm --config "$RUNNER_TEMP/kind.yaml" --wait 90s
+          docker load --input images/image-amd64.tar.gz
+          docker save --platform linux/amd64 --output "$RUNNER_TEMP/grapharrow.tar" grapharrow:check-amd64
+          for node in $(kind get nodes --name grapharrow-helm); do
+            docker exec -i "$node" ctr --namespace=k8s.io images import --platform linux/amd64 \
+              --no-unpack - < "$RUNNER_TEMP/grapharrow.tar"
+          done
+      - name: Test packaged deployments, metrics, and the TLS edge
+        run: >-
+          uv run --frozen --all-extras python .github/smoke_helm.py
+          grapharrow:check-amd64 --chart helm-dist/grapharrow-*.tgz
+      - name: Remove the kind cluster
+        if: always()
+        run: kind delete cluster --name grapharrow-helm
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: inputs.release-build
+        with:
+          name: helm-chart
+          path: helm-dist/
+          if-no-files-found: error
 
   ana-reference:
     name: ANA and Cypher reference
@@ -275,7 +403,7 @@ jobs:
   required:
     name: CI required
     if: always()
-    needs: [quality, tests, distributions, wheel-smoke, docker, ana-reference]
+    needs: [quality, tests, distributions, wheel-smoke, docker, kubernetes, ana-reference]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

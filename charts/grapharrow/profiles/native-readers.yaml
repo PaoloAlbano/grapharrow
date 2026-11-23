@@ -1,0 +1,21 @@
+replicaCount: 2
+
+auth:
+  existingSecret: grapharrow-auth
+
+storage:
+  backend: native
+  readOnly: true
+  # Supply the same database URI as the writer.
+  uri: ""
+  existingSecret: grapharrow-reader-storage
+
+resources:
+  http:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+  bolt:
+    requests:
+      cpu: 100m
+      memory: 128Mi

@@ -1,0 +1,26 @@
+replicaCount: 2
+
+auth:
+  existingSecret: grapharrow-auth
+
+storage:
+  backend: delta
+  # Supply your database URI with --set-string storage.uri.
+  uri: ""
+  existingSecret: grapharrow-azure-storage
+
+resources:
+  http:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+  bolt:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+gateway:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi

@@ -115,6 +115,7 @@ def build_application(
         catalog_store=repositories.catalog,
         snapshot_store=repositories.snapshot,
         graph_store=repositories.graph,
+        read_only=resolved_settings.storage_read_only,
         snapshot_tables=snapshot_tables,
         cypher_max_concurrent_queries=resolved_settings.cypher_max_concurrent_queries,
         property_index_max_bytes=resolved_settings.property_index_max_bytes,
@@ -138,7 +139,11 @@ def build_application(
     )
     local_root = storage_backend.writer.local_root
     schema_cache_disk = None
-    if local_root is not None and resolved_settings.ana_persistent_schema_cache_enabled:
+    if (
+        local_root is not None
+        and resolved_settings.ana_persistent_schema_cache_enabled
+        and not resolved_settings.storage_read_only
+    ):
         schema_cache_disk = (
             local_root / ".grapharrow-cache" / "ana-schema.json",
             resolved_filesystem,

@@ -762,6 +762,7 @@ class CypherQueryUseCase:
     def _compile_and_execute_write(
         self, tree: CypherParser.OC_CypherContext, source: str, params: dict[str, object]
     ) -> QueryResult:
+        self._graph_service.ensure_writable()
         from grapharrow.use_cases.cypher_expression import rule
         from grapharrow.use_cases.cypher_pipeline import needs_pipeline, walk
         from grapharrow.use_cases.cypher_validation import LegacyValidator

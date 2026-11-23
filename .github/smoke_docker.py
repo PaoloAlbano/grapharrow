@@ -16,6 +16,14 @@ import httpx
 from neo4j import GraphDatabase
 from neo4j.exceptions import AuthError, ServiceUnavailable, SessionExpired
 
+HARDENED = (
+    "--read-only",
+    "--tmpfs",
+    "/tmp:rw,nosuid,nodev,noexec,mode=1777",
+    "--cap-drop=ALL",
+    "--security-opt=no-new-privileges",
+)
+
 
 def docker(*args: str) -> str:
     return subprocess.check_output(["docker", *args], text=True).strip()
@@ -44,18 +52,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("image")
     parser.add_argument("--expected-version", default=version("grapharrow"))
+    parser.add_argument("--expected-python", default="3.15", help="Expected Python major.minor")
     parser.add_argument("--storage-backend", choices=("native", "delta"), default="native")
     args = parser.parse_args()
     expected = args.expected_version
     installed = docker(
         "run",
         "--rm",
+        *HARDENED,
         "--entrypoint",
         "/app/.venv/bin/python",
         args.image,
         "-c",
         "from importlib.metadata import version; from importlib.util import find_spec; "
-        "import sys, tempfile; "
+        "import bz2, ctypes, curses, dbm.gnu, dbm.ndbm, decimal, lzma, os, readline, "
+        "sqlite3, ssl, sys, tempfile, uuid, zlib; import pyarrow; "
+        "assert f'{sys.version_info.major}.{sys.version_info.minor}' == sys.argv[1], sys.version; "
+        "assert (os.getuid(), os.getgid()) == (65532, 65532); "
+        "assert ssl.create_default_context().get_ca_certs(); "
+        "assert find_spec('pip') is None; "
         "[version(name) for name in ('boto3', 'azure-identity', 'azure-storage-blob', "
         "'google-cloud-storage', 'deltalake')]; "
         "from grapharrow.app import build_application; "
@@ -67,6 +82,7 @@ def main() -> None:
         "name == sdk or name.startswith(sdk + '.') for sdk in sdk_modules)]; "
         "assert find_spec('agent_native_graph') is None; assert find_spec('neo4j') is None; "
         "print(version('grapharrow'))",
+        args.expected_python,
     )
     assert installed == expected, (installed, expected)
     identity = "grapharrow-smoke-" + uuid4().hex[:12]
@@ -74,6 +90,7 @@ def main() -> None:
     rest_key, ana_key, bolt_key = (secrets.token_urlsafe(32) for _ in range(3))
     docker("volume", "create", volume)
     container = None
+    bolt_container = None
     try:
         with tempfile.TemporaryDirectory(prefix="grapharrow-docker-auth-") as temporary:
             root = Path(temporary)
@@ -91,6 +108,7 @@ def main() -> None:
             container = docker(
                 "run",
                 "-d",
+                *HARDENED,
                 "--name",
                 identity,
                 "--env-file",
@@ -101,12 +119,9 @@ def main() -> None:
                 f"type=volume,source={volume},target=/data",
                 "-p",
                 "127.0.0.1::8000",
-                "-p",
-                "127.0.0.1::7687",
                 args.image,
             )
             http_port = docker("port", container, "8000/tcp").rsplit(":", 1)[1]
-            bolt_port = docker("port", container, "7687/tcp").rsplit(":", 1)[1]
             url = "http://127.0.0.1:" + http_port
             wait_ready(url)
             with httpx.Client(base_url=url, timeout=15) as public:
@@ -157,17 +172,27 @@ def main() -> None:
                     )
                     assert response.json()["result"]["rows"] == [[expected_count]], response.text
                     assert rest.delete("/sessions/current", headers=headers).status_code == 204
-                docker(
-                    "exec",
+                bolt_container = docker(
+                    "run",
                     "-d",
-                    container,
-                    "/app/.venv/bin/grapharrow-bolt",
+                    *HARDENED,
+                    "--name",
+                    identity + "-bolt",
+                    "--env-file",
+                    str(environment),
+                    "--mount",
+                    f"type=volume,source={volume},target=/data",
+                    "-p",
+                    "127.0.0.1::7687",
+                    args.image,
+                    "grapharrow-bolt",
                     "--host",
                     "0.0.0.0",
                     "--port",
                     "7687",
                     "--no-query-log",
                 )
+                bolt_port = docker("port", bolt_container, "7687/tcp").rsplit(":", 1)[1]
                 bolt_url = "bolt://127.0.0.1:" + bolt_port
                 deadline = time.monotonic() + 30
                 while True:
@@ -198,6 +223,8 @@ def main() -> None:
                     pass
                 else:
                     raise AssertionError("Bolt accepted an invalid password")
+                docker("stop", "--time", "5", bolt_container)
+                assert docker("inspect", "--format", "{{.State.ExitCode}}", bolt_container) == "0"
                 docker("restart", container)
                 http_port = docker("port", container, "8000/tcp").rsplit(":", 1)[1]
                 restarted_url = "http://127.0.0.1:" + http_port
@@ -211,11 +238,12 @@ def main() -> None:
                 "REST/ANA/Bolt and persistence"
             )
     finally:
-        if container:
-            try:
-                print(docker("logs", "--tail", "25", container))
-            finally:
-                docker("rm", "-f", container)
+        for process in (bolt_container, container):
+            if process:
+                try:
+                    print(docker("logs", "--tail", "25", process))
+                finally:
+                    docker("rm", "-f", process)
         docker("volume", "rm", volume)
 
 

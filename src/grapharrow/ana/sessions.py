@@ -66,6 +66,12 @@ class BackendSessions:
         self._closed = False
         self._opening = 0
 
+    @property
+    def session_count(self) -> int:
+        """Return the number of retained workflows without triggering cleanup."""
+        with self._condition:
+            return len(self._sessions)
+
     def _expire(self) -> None:
         with self._condition:
             cutoff = self._clock() - self._config.idle_timeout_s

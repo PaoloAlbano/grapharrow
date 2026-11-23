@@ -1,0 +1,26 @@
+{{- if include "grapharrow.useGateway" . }}
+{{- $minimum := ternary .Values.autoscaling.minReplicas .Values.replicaCount .Values.autoscaling.enabled }}
+{{- if gt (int $minimum) 1 }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "grapharrow.selector" . | nindent 6 }}
+---
+{{- end }}
+{{- if gt (int .Values.gateway.replicaCount) 1 }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}-gateway
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "grapharrow.gatewaySelector" . | nindent 6 }}
+{{- end }}
+{{- end }}

@@ -21,6 +21,8 @@ from release_metadata import (
     verify_checksums,
 )
 
+ARCHITECTURES = ("amd64", "arm64")
+
 
 def run(*args: str, capture: bool = False, **kwargs: Any) -> str:
     """Fail closed on unexpected GitHub or registry errors."""
@@ -60,6 +62,22 @@ def require_unused_image(image: str) -> None:
         or f"{image.lower()}: not found" in message
     ):
         raise RuntimeError(f"Could not verify container tag availability: {message}")
+
+
+def release_assets() -> list[Path]:
+    chart_dir = Path("helm-dist")
+    charts = list(chart_dir.glob("grapharrow-*.tgz"))
+    if len(charts) != 1:
+        raise ValueError("Expected exactly one validated Helm package")
+    run("sha256sum", "--check", "--strict", "SHA256SUMS-helm", cwd=chart_dir)
+    reports = []
+    for arch in ARCHITECTURES:
+        for suffix in ("spdx.json", "buildkit.json", "vulnerabilities.json"):
+            report = Path("image-reports") / f"image-{arch}.{suffix}"
+            if not report.is_file():
+                raise ValueError(f"Missing validated image report: {report}")
+            reports.append(report)
+    return [*charts, chart_dir / "SHA256SUMS-helm", *reports]
 
 
 def container_package_exists(repository: str) -> bool:
@@ -132,6 +150,7 @@ def main() -> None:
         return
     if any(r["tag_name"] == tag for r in releases):
         raise ValueError(f"Release {tag} already exists; inspect any previous partial run")
+    assets = release_assets()
     package_exists = container_package_exists(repository)
     latest = metadata["prerelease"] == "false"
     if latest:
@@ -155,12 +174,14 @@ def main() -> None:
         input=os.environ["GH_TOKEN"] + "\n",
     )
     try:
-        targets = [f"{image}:{version}", *(f"{image}:{version}-{a}" for a in ("amd64", "arm64"))]
+        target = f"{image}:{version}"
+        arch_tags = [f"{target}-{arch}" for arch in ARCHITECTURES]
         if package_exists:
-            for target in targets:
-                require_unused_image(target)
-        for arch in ("amd64", "arm64"):
-            run("docker", "load", "--input", str(Path("images") / f"image-{arch}.tar.gz"))
+            for candidate in (target, *arch_tags):
+                require_unused_image(candidate)
+        for arch in ARCHITECTURES:
+            archive = Path("images") / f"image-{arch}.tar.gz"
+            run("docker", "load", "--input", str(archive))
             info = json.loads(
                 run("docker", "image", "inspect", f"grapharrow:check-{arch}", capture=True)
             )[0]
@@ -168,6 +189,7 @@ def main() -> None:
             if (
                 info["Architecture"] != arch
                 or info["Os"] != "linux"
+                or info["Config"]["User"] != "65532:65532"
                 or labels.get("org.opencontainers.image.revision") != revision
                 or labels.get("org.opencontainers.image.version") != version
             ):
@@ -199,24 +221,15 @@ def main() -> None:
             f"GraphArrow {version} (Nightly)" if nightly else tag,
             *[str(p) for p in files],
             "dist/SHA256SUMS",
+            *map(str, assets),
         ]
         if metadata["prerelease"] == "true":
             args.extend(("--prerelease", "--latest=false"))
         run(*args)
-        for arch in ("amd64", "arm64"):
-            target = f"{image}:{version}-{arch}"
-            run("docker", "tag", f"grapharrow:check-{arch}", target)
-            push_image(target)
-        run(
-            "docker",
-            "buildx",
-            "imagetools",
-            "create",
-            "--tag",
-            f"{image}:{version}",
-            f"{image}:{version}-amd64",
-            f"{image}:{version}-arm64",
-        )
+        for arch, arch_tag in zip(ARCHITECTURES, arch_tags, strict=True):
+            run("docker", "tag", f"grapharrow:check-{arch}", arch_tag)
+            push_image(arch_tag)
+        run("docker", "buildx", "imagetools", "create", "--tag", target, *arch_tags)
         if latest:
             run(
                 "docker",
@@ -225,7 +238,7 @@ def main() -> None:
                 "create",
                 "--tag",
                 f"{image}:latest",
-                f"{image}:{version}",
+                target,
             )
         run(
             "gh",

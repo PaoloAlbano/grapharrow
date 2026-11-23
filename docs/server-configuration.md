@@ -181,8 +181,12 @@ client remains read-only.
 | Setting | Purpose |
 | --- | --- |
 | `GRAPHARROW_DATABASE_PATH` | Database root shared by HTTP and Bolt |
+| `GRAPHARROW_STORAGE_READ_ONLY` | Serve an initialized Native database as read-only. Defaults to `false` |
+| `GRAPHARROW_NATIVE_WRITER_LOCK_DIR` | Shared local lock directory for HTTP and Bolt processes writing to one Native object-store database |
 | `GRAPHARROW_SERVER_HOST` / `GRAPHARROW_SERVER_PORT` | HTTP bind address and port |
 | `GRAPHARROW_SERVER_AUTH_TOKEN` | Bearer token for REST query, write and administration routes |
+| `GRAPHARROW_REQUEST_METRICS_ENABLED` | Expose HTTP operation and ANA session metrics at `/v1/metrics` in Prometheus text format. Defaults to `false` outside Helm |
+| `GRAPHARROW_REQUEST_METRICS_TOKEN` | Optional bearer token scoped to the metrics endpoint |
 | `ANA_AUTH_FILE` | JSON file of ANA clients, API keys and profiles |
 | `GRAPHARROW_ANA_ENABLED` | Enable ANA in the HTTP process; defaults to `true` |
 | `GRAPHARROW_BOLT_HOST` / `GRAPHARROW_BOLT_PORT` | Bolt bind address and port |
@@ -204,6 +208,37 @@ The commands above bind to loopback. `--host 0.0.0.0` listens on all interfaces
 but does not enable authentication or encryption. These entrypoints serve
 plain HTTP and Bolt; use TLS termination or a secure tunnel for access over
 untrusted networks. Keep authentication configured for every exposed interface.
+
+### HTTP and ANA metrics
+
+When enabled, `GET /v1/metrics` uses the metrics token when configured, or
+the REST bearer token otherwise. Scrape each HTTP process separately.
+The `interface` label identifies `rest_cypher`
+(`POST /v1/query`) or `ana` (`POST /tools/call`).
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `grapharrow_http_operations_in_flight` | Gauge | Requests currently in progress by interface |
+| `grapharrow_http_operations_executing` | Gauge | Operations currently inside the Cypher executor or ANA session dispatcher by interface |
+| `grapharrow_http_operations_total` | Counter | Finished requests by interface and HTTP status, with `aborted` for requests that end without a response status |
+| `grapharrow_http_operation_duration_seconds` | Histogram | Server-side latency from request admission through response handling by interface |
+| `grapharrow_http_operation_execution_seconds` | Histogram | Time spent inside the Cypher executor or ANA session dispatcher by interface, including their storage and lock waits |
+| `grapharrow_rest_write_conflicts_total` | Counter | Snapshot write conflicts returned by REST |
+| `grapharrow_ana_sessions_open` | Gauge | Workflows currently retained by the ANA process, including idle workflows |
+| `grapharrow_ana_session_bytes` | Gauge | Estimated bytes charged to the ANA session budget |
+| `grapharrow_ana_session_limit_bytes` | Gauge | Configured ANA session budget in bytes |
+
+The duration histograms support fleet-wide percentiles. For example, to
+estimate p95 Cypher execution time in seconds across HTTP replicas, run:
+
+```promql
+histogram_quantile(
+  0.95,
+  sum by (le) (
+    rate(grapharrow_http_operation_execution_seconds_bucket{interface="rest_cypher"}[5m])
+  )
+)
+```
 The [ANA resource limits](ana-interface.md#workflows-and-results) account for
 retained state, not a complete CPU or process-memory boundary.
 
@@ -267,8 +302,8 @@ with httpx.Client(
 
 ## Docker
 
-The runtime image uses Python 3.13 on Debian Trixie slim by default. Run the
-following commands to build it and create the database volume.
+The runtime image uses Python 3.15 on Debian slim. It installs the GraphArrow
+wheel and locked runtime dependencies and runs as UID/GID `65532:65532`.
 
 ```sh
 docker build -t grapharrow:local .
@@ -276,10 +311,22 @@ docker volume create grapharrow-demo-data
 ```
 
 The generated environment file works with `--env-file`. Override the database
-and auth-file paths for the container. In the first terminal:
+and auth-file paths for the container. For this local example, keep
+`.local-secrets` at mode 0700 on the host and let the container read the mounted
+ANA file. In a shared deployment, mount the credential through the platform's
+secret system with read access for GID 65532.
+
+```sh
+chmod 0700 .local-secrets
+chmod 0644 .local-secrets/ana-clients.json
+```
+
+In the first terminal:
 
 ```sh
 docker run --rm --name grapharrow-http \
+  --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,mode=1777 \
+  --cap-drop ALL --security-opt no-new-privileges \
   --env-file .local-secrets/server.env \
   -e GRAPHARROW_DATABASE_PATH=/data/grapharrow \
   -e ANA_AUTH_FILE=/run/grapharrow/ana-clients.json \
@@ -293,6 +340,8 @@ In a second terminal, run Bolt from the same image and share the same volume:
 
 ```sh
 docker run --rm --name grapharrow-bolt \
+  --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,mode=1777 \
+  --cap-drop ALL --security-opt no-new-privileges \
   --env-file .local-secrets/server.env \
   -e GRAPHARROW_DATABASE_PATH=/data/grapharrow \
   --mount type=volume,source=grapharrow-demo-data,target=/data \
@@ -307,6 +356,16 @@ entrypoint above. Container listeners bind to all container interfaces, while
 the `-p 127.0.0.1:...` mappings expose them only on the host loopback address.
 The named volume retains database files after containers stop; removing an ANA
 session or stopping a server does not delete that data.
+
+A new named volume inherits the image's `/data` ownership. For existing
+volumes and bind mounts, arrange read and write access for UID/GID 65532
+before updating. Check the entire
+database tree, including files last written by a root-run container.
+
+## Kubernetes with Helm
+
+The [deployment guide](kubernetes.md) covers a single Native replica on a PVC
+and multiple Delta replicas on shared S3 or Azure Blob Storage.
 
 ## Multiple replicas on Kubernetes
 

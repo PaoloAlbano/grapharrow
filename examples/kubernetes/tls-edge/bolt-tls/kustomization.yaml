@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../https
+  - bolt-service.yaml
+configMapGenerator:
+  - name: grapharrow-tls-edge
+    behavior: merge
+    files:
+      - tls-bolt.cfg

@@ -1,0 +1,17 @@
+auth:
+  existingSecret: grapharrow-auth
+
+storage:
+  backend: native
+  pvc:
+    size: 10Gi
+
+resources:
+  http:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+  bolt:
+    requests:
+      cpu: 100m
+      memory: 128Mi

@@ -1,0 +1,158 @@
+{{- include "grapharrow.validate" . -}}
+{{- $local := and (eq .Values.storage.backend "native") (not .Values.storage.uri) -}}
+{{- $objectWriter := and (eq .Values.storage.backend "native") .Values.storage.uri (not .Values.storage.readOnly) -}}
+{{- $gateway := include "grapharrow.useGateway" . -}}
+{{- $image := include "grapharrow.image" . -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  serviceName: {{ .Release.Name }}-pods
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "grapharrow.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "grapharrow.selector" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        {{- include "grapharrow.podSecurityContext" . | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $gateway }}
+      topologySpreadConstraints:
+        {{- include "grapharrow.spread" (include "grapharrow.selector" .) | nindent 8 }}
+      {{- end }}
+      containers:
+      {{- range $name, $port := dict "http" 8000 "bolt" 7687 }}
+        - name: {{ $name }}
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          args: [{{ ternary "grapharrow-server" "grapharrow-bolt" (eq $name "http") | quote }}, "--host", "0.0.0.0", "--port", {{ printf "%d" $port | quote }}]
+          ports:
+            - name: {{ $name }}
+              containerPort: {{ $port }}
+          securityContext:
+            {{- include "grapharrow.securityContext" $ | nindent 12 }}
+          {{- with index $.Values.resources $name }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $.Values.storage.existingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ . | quote }}
+          {{- end }}
+          env:
+            - name: GRAPHARROW_STORAGE_BACKEND
+              value: {{ $.Values.storage.backend | quote }}
+            - name: GRAPHARROW_DATABASE_PATH
+              value: {{ ternary "/data/grapharrow" $.Values.storage.uri $local | quote }}
+            - name: GRAPHARROW_STORAGE_READ_ONLY
+              value: {{ $.Values.storage.readOnly | quote }}
+            {{- if $objectWriter }}
+            - name: GRAPHARROW_NATIVE_WRITER_LOCK_DIR
+              value: /run/grapharrow-writer
+            {{- end }}
+            {{- if eq $name "http" }}
+            - name: GRAPHARROW_REQUEST_METRICS_ENABLED
+              value: {{ $.Values.requestMetrics.enabled | quote }}
+            {{- if and $.Values.requestMetrics.enabled $.Values.requestMetrics.existingSecret }}
+            - name: GRAPHARROW_REQUEST_METRICS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.requestMetrics.existingSecret | quote }}
+                  key: metrics-token
+            {{- end }}
+            {{- if $gateway }}
+            - name: GRAPHARROW_ANA_SESSION_ROUTE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- end }}
+            - name: ANA_AUTH_FILE
+              value: /run/grapharrow/clients.json
+            - name: GRAPHARROW_SERVER_AUTH_TOKEN
+            {{- else }}
+            - name: GRAPHARROW_BOLT_LOG_QUERIES
+              value: "false"
+            - name: GRAPHARROW_BOLT_AUTH_TOKEN
+            {{- end }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "auth.existingSecret is required" $.Values.auth.existingSecret | quote }}
+                  key: {{ ternary "rest-token" "bolt-token" (eq $name "http") }}
+          startupProbe:
+            {{- if eq $name "http" }}
+            httpGet:
+              path: /health
+              port: http
+            {{- else }}
+            tcpSocket:
+              port: bolt
+            {{- end }}
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            {{- if eq $name "http" }}
+            httpGet:
+              path: /health
+              port: http
+            {{- else }}
+            tcpSocket:
+              port: bolt
+            {{- end }}
+            periodSeconds: 2
+          livenessProbe:
+            tcpSocket:
+              port: {{ $name }}
+            periodSeconds: 10
+          volumeMounts:
+            - name: {{ $name }}-tmp
+              mountPath: /tmp
+            {{- if $local }}
+            - name: data
+              mountPath: /data
+            {{- end }}
+            {{- if $objectWriter }}
+            - name: writer-lock
+              mountPath: /run/grapharrow-writer
+            {{- end }}
+            {{- if eq $name "http" }}
+            - name: ana-auth
+              mountPath: /run/grapharrow
+              readOnly: true
+            {{- end }}
+      {{- end }}
+      volumes:
+        - name: http-tmp
+          emptyDir: {}
+        - name: bolt-tmp
+          emptyDir: {}
+        {{- if $objectWriter }}
+        - name: writer-lock
+          emptyDir:
+            medium: Memory
+        {{- end }}
+        - name: ana-auth
+          secret:
+            secretName: {{ .Values.auth.existingSecret | quote }}
+            defaultMode: 0440
+            items:
+              - key: clients.json
+                path: clients.json
+        {{- if $local }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-data" .Release.Name) .Values.storage.pvc.existingClaim | quote }}
+        {{- end }}

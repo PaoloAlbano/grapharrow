@@ -389,12 +389,8 @@ See [Storage Backends](docs/storage-backends.md) for Delta setup.
 
 ## Docker
 
-The repository includes two Docker images:
-
-- `Dockerfile` for a lean runtime-style image with runtime dependencies only
-- `Dockerfile.dev` for development and test workflows
-
-Build the runtime image:
+The Debian slim runtime uses Python 3.15, runs as non-root and supports a
+read-only root filesystem. Build it locally with Docker.
 
 ```bash
 docker build -t grapharrow:runtime .
@@ -410,6 +406,10 @@ Build the development image:
 ```bash
 docker build -f Dockerfile.dev -t grapharrow:dev .
 ```
+
+The [Helm quickstart](docs/kubernetes.md#quickstart-on-a-single-pvc) installs
+GraphArrow from a release package. The same chart supports replicated Delta
+deployments on S3 and Azure.
 
 ## Current Status
 

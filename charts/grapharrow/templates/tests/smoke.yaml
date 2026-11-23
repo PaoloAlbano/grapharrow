@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ .Release.Name }}-smoke
+  labels:
+    app.kubernetes.io/name: grapharrow
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: smoke
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  restartPolicy: Never
+  activeDeadlineSeconds: 60
+  automountServiceAccountToken: false
+  securityContext:
+    {{- include "grapharrow.podSecurityContext" . | nindent 4 }}
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  containers:
+    - name: check
+      image: {{ include "grapharrow.image" . | quote }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      command: ["/app/.venv/bin/python"]
+      args:
+        - -c
+        - |
+          {{- .Files.Get "files/check_deployment.py" | nindent 10 }}
+      env:
+        - name: GRAPHARROW_SMOKE_HOST
+          value: {{ .Release.Name | quote }}
+      securityContext:
+        {{- include "grapharrow.securityContext" . | nindent 8 }}
+      volumeMounts:
+        - name: credentials
+          mountPath: /run/grapharrow-smoke-auth
+          readOnly: true
+  volumes:
+    - name: credentials
+      secret:
+        secretName: {{ required "auth.existingSecret is required" .Values.auth.existingSecret | quote }}
+        defaultMode: 0440
+        items:
+          - key: rest-token
+            path: rest-token
+          - key: bolt-token
+            path: bolt-token
+          - key: clients.json
+            path: clients.json

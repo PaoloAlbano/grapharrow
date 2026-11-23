@@ -114,10 +114,14 @@ class FileSystemAdapter:
                 raise ValueError(
                     "GRAPHARROW_AZURE_ACCOUNT_NAME is required when configuring Azure storage."
                 )
+            sas_token = settings.azure_sas_token
+            # Arrow appends the SAS query string directly to the service URL.
+            if sas_token and not sas_token.startswith("?"):
+                sas_token = "?" + sas_token
             scheme_filesystems["az"] = pafs.AzureFileSystem(
                 account_name=settings.azure_account_name,
                 account_key=settings.azure_account_key,
-                sas_token=settings.azure_sas_token,
+                sas_token=sas_token,
                 client_id=settings.azure_client_id,
                 client_secret=settings.azure_client_secret,
                 tenant_id=settings.azure_tenant_id,

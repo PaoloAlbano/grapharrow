@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- if include "grapharrow.useGateway" . }}
+    {{- include "grapharrow.gatewaySelector" . | nindent 4 }}
+    {{- else }}
+    {{- include "grapharrow.selector" . | nindent 4 }}
+    {{- end }}
+  ports:
+    {{- include "grapharrow.ports" . | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-pods
+spec:
+  clusterIP: None
+  selector:
+    {{- include "grapharrow.selector" . | nindent 4 }}
+  ports:
+    {{- include "grapharrow.ports" . | nindent 4 }}
+{{- if include "grapharrow.useGateway" . }}
+{{- range $ordinal := until (include "grapharrow.gatewaySlots" . | int) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $.Release.Name }}-pod-{{ $ordinal }}
+spec:
+  selector:
+    {{- include "grapharrow.selector" $ | nindent 4 }}
+    statefulset.kubernetes.io/pod-name: {{ $.Release.Name }}-{{ $ordinal }}
+  ports:
+    {{- include "grapharrow.ports" $ | nindent 4 }}
+{{- end }}
+{{- end }}

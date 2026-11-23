@@ -18,7 +18,7 @@ from grapharrow.adapters.property_index import PropertyIndexStore
 from grapharrow.adapters.snapshot_tables import SnapshotTableCache
 from grapharrow.adapters.writer import writer_locked
 from grapharrow.core import property_codec
-from grapharrow.core.errors import NotFoundError, QueryError, SchemaError
+from grapharrow.core.errors import NotFoundError, QueryError, ReadOnlyError, SchemaError
 from grapharrow.domain import (
     CatalogVersion,
     LabelDefinition,
@@ -81,6 +81,7 @@ class GraphStateUseCase:
         snapshot_store: SnapshotStore,
         graph_store: GraphStore,
         storage_backend: StorageBackend | None = None,
+        read_only: bool = False,
         cypher_max_concurrent_queries: int = 0,
         snapshot_table_cache_max_bytes: int = 64 * 1024 * 1024,
         snapshot_tables: SnapshotTableCache | None = None,
@@ -109,6 +110,7 @@ class GraphStateUseCase:
             )
         self._storage_backend = storage_backend
         self._writer = storage_backend.writer
+        self.read_only = read_only
         self._cypher_slots = (
             BoundedSemaphore(cypher_max_concurrent_queries)
             if cypher_max_concurrent_queries
@@ -131,6 +133,10 @@ class GraphStateUseCase:
     def writer_lock(self) -> AbstractContextManager[None]:
         """Serialize a complete database mutation with other coordinated writers."""
         return self._writer.hold()
+
+    def ensure_writable(self) -> None:
+        if self.read_only:
+            raise ReadOnlyError("This GraphArrow process serves a read-only database.")
 
     @contextmanager
     def cypher_query_slot(self) -> Generator[None, None, None]:
@@ -1285,7 +1291,8 @@ class GraphTransactionUseCase:
     ) -> None:
         """Start an isolated in-memory transaction from the current published snapshot."""
         self._graph_service = graph_service
-        with graph_service.writer_lock(), ExitStack() as leases:
+        guard = nullcontext() if graph_service.read_only else graph_service.writer_lock()
+        with guard, ExitStack() as leases:
             snapshot = base_snapshot or graph_service.capture_snapshot()
             leases.enter_context(graph_service.pin_snapshot(snapshot))
             self._base_state = graph_service.load_state(snapshot=snapshot)
@@ -1311,6 +1318,7 @@ class GraphTransactionUseCase:
     def statement(self) -> Generator[None, None, None]:
         """Keep earlier transaction changes if an updating statement fails."""
         self._ensure_open()
+        self.ensure_writable()
         before = self._state
         reuse_edge_table = self._reuse_edge_table_on_commit
         try:
@@ -1321,6 +1329,9 @@ class GraphTransactionUseCase:
             self._adjacency_table = None
             self._adjacency_index = None
             raise
+
+    def ensure_writable(self) -> None:
+        self._graph_service.ensure_writable()
 
     def adjacency_for_state(self, state: GraphState | GraphTabularState) -> GraphAdjacency | None:
         """Share published positions only for the exact base table; isolate overlays."""

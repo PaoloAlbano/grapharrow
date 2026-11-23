@@ -79,6 +79,9 @@ class NativeStorageBackend:
 
     def snapshot_open_guard(self) -> AbstractContextManager[None]:
         """Prevent vacuum from removing files while a snapshot is materialized."""
+        if self._writer.read_only:
+            # Native vacuum keeps every published snapshot reachable from the head.
+            return nullcontext()
         return self._writer.hold()
 
     def pin_snapshot(self, snapshot_id: SnapshotId) -> AbstractContextManager[None]:

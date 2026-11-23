@@ -1,0 +1,10 @@
+replicaCount: 1
+
+auth:
+  existingSecret: grapharrow-auth
+
+storage:
+  backend: native
+  # Supply the shared database URI with --set-string storage.uri.
+  uri: ""
+  existingSecret: grapharrow-writer-storage

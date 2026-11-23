@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from dataclasses import asdict
 from hashlib import sha256
 from pathlib import Path
@@ -36,10 +37,12 @@ from grapharrow.core.errors import (
     IdempotencyConflictError,
     NotFoundError,
     QueryError,
+    ReadOnlyError,
     StorageError,
     TransactionError,
     WriteConflictError,
 )
+from grapharrow.interfaces.request_metrics import RequestMetrics, install_request_metrics
 from grapharrow.interfaces.rest_arrow import (
     ARROW_CONTENT,
     arrow_response_type,
@@ -151,6 +154,16 @@ def create_rest_app(
         prefix=container.settings.rest_prefix,
         dependencies=[Depends(_require_server_auth)],
     )
+    request_metrics = (
+        install_request_metrics(
+            app,
+            prefix=protected_router.prefix,
+            ana_enabled=container.settings.ana_enabled,
+            token=container.settings.request_metrics_token or container.settings.server_auth_token,
+        )
+        if container.settings.request_metrics_enabled
+        else None
+    )
 
     @public_router.get("/health")
     def health() -> dict[str, object]:
@@ -191,13 +204,17 @@ def create_rest_app(
         cypher = container.use_cases.cypher
         response.headers["Vary"] = "Accept"
         media_type = arrow_response_type(accept)
+        execution = request_metrics.execution("rest_cypher") if request_metrics else nullcontext()
         if idempotency_key is None:
             if media_type is not None:
-                result = cypher.execute_arrow(payload.query, payload.params)
+                with execution:
+                    result = cypher.execute_arrow(payload.query, payload.params)
                 if isinstance(result, QueryResult):
                     return arrow_rows_response(result.rows, result.columns, media_type)
                 return arrow_table_response(result, media_type)
-            return _query_envelope(cypher.execute(payload.query, payload.params))
+            with execution:
+                rows = cypher.execute(payload.query, payload.params)
+            return _query_envelope(rows)
 
         try:
             fingerprint = json.dumps(
@@ -205,13 +222,16 @@ def create_rest_app(
             )
         except ValueError as exc:
             raise QueryError("Idempotency-Key requires finite JSON parameters.") from exc
-        receipt = cypher.execute_idempotent_write(
-            payload.query,
-            payload.params,
-            key_hash=sha256(idempotency_key.encode("ascii")).hexdigest(),
-            request_hash=sha256(fingerprint.encode("utf-8")).hexdigest(),
-            encode_response=_encode_idempotent_response,
-        )
+        key_hash = sha256(idempotency_key.encode("ascii")).hexdigest()
+        request_hash = sha256(fingerprint.encode("utf-8")).hexdigest()
+        with execution:
+            receipt = cypher.execute_idempotent_write(
+                payload.query,
+                payload.params,
+                key_hash=key_hash,
+                request_hash=request_hash,
+                encode_response=_encode_idempotent_response,
+            )
         replay = json.loads(receipt)
         if media_type is not None:
             data = replay["data"]
@@ -432,11 +452,11 @@ def create_rest_app(
 
     app.include_router(public_router)
     app.include_router(protected_router)
-    _register_error_handlers(app)
+    _register_error_handlers(app, request_metrics)
     if container.settings.ana_enabled:
         from grapharrow.interfaces.ana import install_ana_routes
 
-        install_ana_routes(app, container)
+        install_ana_routes(app, container, request_metrics=request_metrics)
     return app
 
 
@@ -458,11 +478,20 @@ def _require_server_auth(
         )
 
 
-def _register_error_handlers(app: FastAPI) -> None:
+def _register_error_handlers(app: FastAPI, request_metrics: RequestMetrics | None) -> None:
     """Register the API exception handlers used by this REST application."""
+
+    @app.exception_handler(ReadOnlyError)
+    async def read_only_handler(_: Request, exc: ReadOnlyError) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content=_error("READ_ONLY", str(exc)),
+        )
 
     @app.exception_handler(WriteConflictError)
     async def write_conflict_handler(_: Request, exc: WriteConflictError) -> JSONResponse:
+        if request_metrics is not None:
+            request_metrics.write_conflict()
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
             content=_error("WRITE_CONFLICT", str(exc)),

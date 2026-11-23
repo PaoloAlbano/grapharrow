@@ -1,0 +1,78 @@
+{{- if include "grapharrow.useGateway" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-gateway
+data:
+  haproxy.cfg: |
+    {{- include "grapharrow.gatewayConfig" . | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-gateway
+spec:
+  replicas: {{ .Values.gateway.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "grapharrow.gatewaySelector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "grapharrow.gatewaySelector" . | nindent 8 }}
+      annotations:
+        checksum/haproxy: {{ include "grapharrow.gatewayConfig" . | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          nodeTaintsPolicy: Honor
+          matchLabelKeys: [pod-template-hash]
+          labelSelector:
+            matchLabels:
+              {{- include "grapharrow.gatewaySelector" . | nindent 14 }}
+      containers:
+        - name: haproxy
+          image: {{ .Values.gateway.image | quote }}
+          command: ["/usr/local/sbin/haproxy"]
+          args: ["-W", "-db", "-f", "/usr/local/etc/haproxy/haproxy.cfg"]
+          securityContext:
+            {{- include "grapharrow.securityContext" . | nindent 12 }}
+          {{- with .Values.gateway.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: 8000
+            - name: bolt
+              containerPort: 7687
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+          livenessProbe:
+            tcpSocket:
+              port: http
+          volumeMounts:
+            - name: config
+              mountPath: /usr/local/etc/haproxy
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-gateway
+{{- end }}

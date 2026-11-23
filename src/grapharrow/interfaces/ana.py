@@ -1,6 +1,6 @@
 """ANA-compatible HTTP adapter using GraphArrow auth, catalog and sessions."""
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Response
@@ -21,6 +21,7 @@ from grapharrow.ana.sessions import (
     SessionNotFound,
 )
 from grapharrow.app import GraphArrowApplication
+from grapharrow.interfaces.request_metrics import RequestMetrics
 from grapharrow.use_cases.ana import SUPPORTED_ANA_TOOLS, GraphArrowAgentBackend
 from grapharrow.use_cases.ana_resources import AnaQuotaExceeded, AnaResourceBudget
 
@@ -34,7 +35,12 @@ class ToolCallRequest(BaseModel):
     args: dict[str, Any] = Field(default_factory=dict)
 
 
-def install_ana_routes(app: FastAPI, application: GraphArrowApplication) -> None:
+def install_ana_routes(
+    app: FastAPI,
+    application: GraphArrowApplication,
+    *,
+    request_metrics: RequestMetrics | None = None,
+) -> None:
     """Add compatible root routes and share the application's shutdown lifecycle."""
     if not application.settings.rest_prefix.strip("/"):
         raise ValueError("ANA requires a non-root REST prefix, such as /v1")
@@ -65,6 +71,8 @@ def install_ana_routes(app: FastAPI, application: GraphArrowApplication) -> None
     router = APIRouter(lifespan=lifespan)
     app.state.ana_sessions = sessions
     app.state.ana_resource_budget = budget
+    if request_metrics is not None:
+        request_metrics.ana_resources = sessions, budget
 
     def authenticate(
         authorization: str | None = Header(default=None, alias="Authorization"),
@@ -147,9 +155,10 @@ def install_ana_routes(app: FastAPI, application: GraphArrowApplication) -> None
         if request.tool not in callable_names or not permitted(principal, request.tool):
             raise HTTPException(status_code=403, detail="Tool is not permitted")
         try:
-            result = sessions.call(
-                session_id, request.tool, request.args, owner_id=principal.subject
-            )
+            with request_metrics.execution("ana") if request_metrics else nullcontext():
+                result = sessions.call(
+                    session_id, request.tool, request.args, owner_id=principal.subject
+                )
         except SessionNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except AnaQuotaExceeded as exc:

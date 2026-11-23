@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import socket
 import socketserver
 import struct
@@ -16,7 +17,7 @@ from typing import Any, cast
 from grapharrow.adapters import FileSystemAdapter
 from grapharrow.app import GraphArrowApplication, build_application
 from grapharrow.config import GraphArrowSettings
-from grapharrow.core.errors import GraphArrowError, QueryError, WriteConflictError
+from grapharrow.core.errors import GraphArrowError, QueryError, ReadOnlyError, WriteConflictError
 from grapharrow.core.temporal import DAY, NANOS, Duration, Instant, TemporalResult
 from grapharrow.interfaces.cypher_guard import query_requires_write
 from grapharrow.use_cases import CypherQueryUseCase, GraphTransactionUseCase
@@ -482,11 +483,7 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
             _send_failure(
                 self.request,
                 self.codec,
-                code=(
-                    "Neo.TransientError.Transaction.Outdated"
-                    if isinstance(exc, WriteConflictError)
-                    else "GraphArrow.QueryError"
-                ),
+                code=_transaction_error_code(exc),
                 message=str(exc),
             )
             return
@@ -554,11 +551,7 @@ class _BoltRequestHandler(socketserver.BaseRequestHandler):
             _send_failure(
                 self.request,
                 self.codec,
-                code=(
-                    "Neo.TransientError.Transaction.Outdated"
-                    if isinstance(exc, WriteConflictError)
-                    else "GraphArrow.QueryError"
-                ),
+                code=_transaction_error_code(exc),
                 message=str(exc),
             )
             return
@@ -831,21 +824,23 @@ def main() -> int:
             "bolt_log_queries": False if args.no_query_log else settings.bolt_log_queries,
         }
     )
-    handle = start_bolt_server(build_bolt_application(database_path, settings=resolved_settings))
-    if resolved_settings.bolt_log_queries:
-        print(
-            "[grapharrow-bolt] runtime "
-            f"cwd={os.getcwd()!r} "
-            f"db={str(database_path)!r} "
-            f"bolt_module={__file__!r} "
-            f"cypher_module={cypher_module.__file__!r}",
-            flush=True,
-        )
+    previous = signal.signal(signal.SIGTERM, signal.default_int_handler)
     try:
-        handle.thread.join()
+        with run_bolt_server(database_path, settings=resolved_settings) as handle:
+            if resolved_settings.bolt_log_queries:
+                print(
+                    "[grapharrow-bolt] runtime "
+                    f"cwd={os.getcwd()!r} "
+                    f"db={str(database_path)!r} "
+                    f"bolt_module={__file__!r} "
+                    f"cypher_module={cypher_module.__file__!r}",
+                    flush=True,
+                )
+            handle.thread.join()
     except KeyboardInterrupt:
-        handle.stop()
         print("[grapharrow-bolt] stopped", flush=True)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
     return 0
 
 
@@ -1133,6 +1128,14 @@ def _send_failure(
             [metadata],
         ),
     )
+
+
+def _transaction_error_code(error: GraphArrowError) -> str:
+    if isinstance(error, ReadOnlyError):
+        return "Neo.ClientError.General.ForbiddenOnReadOnlyDatabase"
+    if isinstance(error, WriteConflictError):
+        return "Neo.TransientError.Transaction.Outdated"
+    return "GraphArrow.QueryError"
 
 
 def _validate_auth(metadata: dict[str, Any], *, expected_token: str | None) -> str | None:

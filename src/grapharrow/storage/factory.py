@@ -21,6 +21,8 @@ def create_storage_backend(
 ) -> StorageBackend:
     """Build only the requested implementation and retain the supplied I/O adapters."""
     if settings.storage_backend == "delta":
+        if settings.storage_read_only:
+            raise StorageError("Read-only server mode requires the Native storage backend.")
         try:
             from grapharrow.storage.delta import DeltaStorageBackend
         except ModuleNotFoundError as exc:
@@ -37,7 +39,12 @@ def create_storage_backend(
     from grapharrow.repositories import CatalogRepository, GraphRepository, SnapshotRepository
     from grapharrow.storage.native import NativeStorageBackend
 
-    snapshots = SnapshotRepository(layout=layout, filesystem=filesystem)
+    snapshots = SnapshotRepository(
+        layout=layout,
+        filesystem=filesystem,
+        read_only=settings.storage_read_only,
+        writer_lock_dir=settings.native_writer_lock_dir,
+    )
     return NativeStorageBackend(
         catalog=CatalogRepository(layout=layout, filesystem=filesystem, snapshot_store=snapshots),
         snapshot=snapshots,

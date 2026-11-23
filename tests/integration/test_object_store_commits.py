@@ -11,7 +11,7 @@ import pytest
 from grapharrow.adapters.object_pointer import Revision
 from grapharrow.app import build_application
 from grapharrow.config import GraphArrowSettings
-from grapharrow.core.errors import WriteConflictError
+from grapharrow.core.errors import ReadOnlyError, WriteConflictError
 from grapharrow.domain import SnapshotId
 from tests.integration.support import MotoS3Context, list_object_keys
 
@@ -330,7 +330,11 @@ def test_s3_retention_preview_uses_one_head_during_concurrent_publication(
 
 
 def _pause_before_parquet_read(uri: str, endpoint: str, channel: Connection) -> None:
-    reader = build_application(uri, settings=_s3_settings(uri, endpoint))
+    settings = _s3_settings(uri, endpoint).model_copy(update={"storage_read_only": True})
+    reader = build_application(uri, settings=settings)
+    reader.use_cases.admin.initialize()
+    with pytest.raises(ReadOnlyError):
+        reader.use_cases.cypher.execute("CREATE (:Forbidden)")
     graph = reader.use_cases.graph
     read = graph.load_node_property_table
     paused = False

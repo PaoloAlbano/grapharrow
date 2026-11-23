@@ -1,0 +1,7 @@
+Verify REST, ANA, and Bolt from inside the cluster.
+
+  helm test {{ .Release.Name }} --namespace {{ .Release.Namespace }} --logs
+
+Open the HTTP and Bolt ports locally.
+
+  kubectl --namespace {{ .Release.Namespace }} port-forward service/{{ .Release.Name }} 8000:8000 7687:7687

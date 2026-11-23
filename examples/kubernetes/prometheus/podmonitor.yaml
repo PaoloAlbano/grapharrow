@@ -1,0 +1,22 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: grapharrow
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: grapharrow
+      app.kubernetes.io/component: server
+    matchExpressions:
+      - key: app.kubernetes.io/instance
+        operator: In
+        values: [grapharrow, grapharrow-writer, grapharrow-readers]
+  podMetricsEndpoints:
+    - port: http
+      path: /v1/metrics
+      interval: 15s
+      authorization:
+        type: Bearer
+        credentials:
+          name: grapharrow-metrics
+          key: metrics-token

@@ -94,6 +94,15 @@ jobs:
           pattern: docker-*
           merge-multiple: true
           path: images
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-reports-*
+          merge-multiple: true
+          path: image-reports
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: helm-chart
+          path: helm-dist
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - name: Publish the verified wheel, sources and multi-platform image
+      - name: Publish the verified wheel, sources, multi-platform image and Helm chart
         run: python .github/publish_release.py

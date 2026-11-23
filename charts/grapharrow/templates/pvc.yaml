@@ -1,0 +1,18 @@
+{{- if and (eq .Values.storage.backend "native") (not .Values.storage.uri) (not .Values.storage.pvc.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-data
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- if eq .Values.storage.pvc.storageClass "-" }}
+  storageClassName: ""
+  {{- else if .Values.storage.pvc.storageClass }}
+  storageClassName: {{ .Values.storage.pvc.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.pvc.size | quote }}
+{{- end }}
