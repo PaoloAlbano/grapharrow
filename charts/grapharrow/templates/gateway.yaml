@@ -68,10 +68,15 @@ spec:
             tcpSocket:
               port: http
           volumeMounts:
+            - name: runtime
+              mountPath: /run/haproxy
             - name: config
               mountPath: /usr/local/etc/haproxy
               readOnly: true
       volumes:
+        - name: runtime
+          emptyDir:
+            medium: Memory
         - name: config
           configMap:
             name: {{ .Release.Name }}-gateway

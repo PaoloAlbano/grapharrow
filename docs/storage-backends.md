@@ -44,12 +44,13 @@ bucketed by hash prefix. A keyed REST write publishes its response in the same
 commit as its graph updates.
 
 New Delta databases partition edges into ranges of 8,192 IDs by default.
-A compatible autocommit `SET` by edge ID reads and replaces only the affected
-edge range. This path applies to updates that preserve existing scalar
-property types on graphs without constraints when the request carries no REST
-idempotency key. The full graph write path also reuses unchanged edge range
-files. Property projections are derived from the graph version selected by
-each reader.
+A compatible autocommit `SET` by node or edge ID rewrites one canonical range.
+This path applies to updates that preserve existing scalar property types on
+graphs without constraints. With a REST idempotency key, the same commit also
+replaces the receipt bucket, preserving earlier receipts in that bucket. Keyed
+writes that leave the entity unchanged or match no rows use the general write
+path to record their response. Property projections are derived from the graph
+version selected by each reader.
 
 `GRAPHARROW_EDGE_PARQUET_RANGE_SIZE` overrides the range width at database
 creation or explicit compaction. Set it to `0` for a single edge partition.
@@ -75,12 +76,17 @@ bounds the most recent Delta node lookup retained between sessions. It
 defaults to 16 MiB. Set it to `0` to retain lookups only while sessions use them.
 
 A general mutation publishes only against its captured base version. For
-compatible point `SET` operations on disjoint edge ranges, Delta can rebase
+compatible point `SET` operations on disjoint node or edge ranges, Delta can rebase
 the commit without replaying the query as long as the graph metadata remains
 unchanged. A conflicting file rewrite or a change to graph metadata, including
 catalog updates and compaction, rejects the pending point update. The Delta
 log identifies point commits by a unique ID so the writer can check whether
 publication succeeded if the storage response is lost.
+
+Keyed point writes can also rebase when their receipt buckets are disjoint.
+A competing write to the same bucket can return a write conflict even when
+the graph ranges differ. Concurrent submissions with the same key resolve
+through the committed receipt.
 
 When capturing a snapshot, a replica can reuse its cached Delta manifest if
 the next commit file is absent. Each capture checks storage directly. A new

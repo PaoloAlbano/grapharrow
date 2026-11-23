@@ -8,7 +8,7 @@ import math
 import os
 import re
 from collections.abc import Callable, Generator, Iterable, Mapping
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Any, Literal, TypeAlias, cast
 
@@ -27,7 +27,7 @@ from grapharrow.core.errors import (
     WriteConflictError,
 )
 from grapharrow.core.temporal import Duration, Instant
-from grapharrow.domain import IndexKind, PropertyOwnerKind
+from grapharrow.domain import IndexKind, PropertyOwnerKind, SnapshotManifest
 from grapharrow.domain.scan import ScanOperator, ScanPredicate
 from grapharrow.domain.snapshot import IdempotencyReceipt
 from grapharrow.interfaces.opencypher.generated.vendor.opencypher.GraphArrowCypherParser import (
@@ -532,6 +532,20 @@ CompiledQuery: TypeAlias = (
 
 
 @dataclass(slots=True)
+class _IdempotentWrite:
+    base: SnapshotManifest
+    key_hash: str
+    request_hash: str
+    encode_response: Callable[[QueryResult], str]
+    receipt: IdempotencyReceipt | None = None
+
+    def prepare_receipt(self, result: QueryResult) -> IdempotencyReceipt:
+        response = self.encode_response(_public_query_result(result))
+        self.receipt = IdempotencyReceipt(self.key_hash, self.request_hash, response)
+        return self.receipt
+
+
+@dataclass(slots=True)
 class _CompilerState:
     anonymous_index: int = 0
     reserved_variables: frozenset[str] = frozenset()
@@ -653,33 +667,27 @@ class CypherQueryUseCase:
         graph = self._graph_service
         if not isinstance(graph, GraphStateUseCase):
             raise QueryError.unsupported("Idempotency requires an autocommit data write.")
-        with graph.cypher_query_slot(), graph.writer_lock(), ExitStack() as leases:
+        with graph.cypher_query_slot(), graph.writer_lock():
             base, receipt = graph.idempotency_base(key_hash)
             if receipt is not None:
                 return _replay_response(receipt, request_hash)
 
-            with _query_phase("compile"):
-                tree = self._parse_cache.parse(query)
-                if not contains_updates(tree):
-                    raise QueryError.unsupported("Idempotency-Key requires a Cypher data write.")
-                # The lookup and transaction use the same snapshot. A concurrent publication
-                # after the lookup must go through commit conflict handling below.
-                transaction = leases.enter_context(
-                    GraphTransactionUseCase(graph, base_snapshot=base)
-                )
-                executor = self._transaction_executor(transaction)
-                result = executor._compile_and_execute_write(tree, query.strip(), params)
-            response = encode_response(_public_query_result(result))
+            write = _IdempotentWrite(base, key_hash, request_hash, encode_response)
             try:
-                transaction.commit(
-                    idempotency_receipt=IdempotencyReceipt(key_hash, request_hash, response)
-                )
+                with _query_phase("compile"):
+                    tree = self._parse_cache.parse(query)
+                    if not contains_updates(tree):
+                        raise QueryError.unsupported(
+                            "Idempotency-Key requires a Cypher data write."
+                        )
+                    self._compile_and_execute_write(tree, query.strip(), params, idempotency=write)
             except WriteConflictError:
                 _, receipt = graph.idempotency_base(key_hash)
                 if receipt is None:
                     raise
                 return _replay_response(receipt, request_hash)
-            return response
+            assert write.receipt is not None
+            return write.receipt.response_json
 
     def _execute(
         self, query: str, params: dict[str, object] | None, *, arrow: bool = False
@@ -760,7 +768,12 @@ class CypherQueryUseCase:
             return self._execute_compiled(compiled)
 
     def _compile_and_execute_write(
-        self, tree: CypherParser.OC_CypherContext, source: str, params: dict[str, object]
+        self,
+        tree: CypherParser.OC_CypherContext,
+        source: str,
+        params: dict[str, object],
+        *,
+        idempotency: _IdempotentWrite | None = None,
     ) -> QueryResult:
         self._graph_service.ensure_writable()
         from grapharrow.use_cases.cypher_expression import rule
@@ -817,27 +830,41 @@ class CypherQueryUseCase:
                         if isinstance(compiled, CompiledMatchSetQuery):
                             from grapharrow.use_cases.cypher_point_set import try_point_set
 
-                            result = try_point_set(self, compiled)
+                            result = try_point_set(self, compiled, idempotency=idempotency)
                             if result is not None:
                                 return result
                         return self._execute_write(
-                            lambda executor: executor._execute_compiled(compiled)
+                            lambda executor: executor._execute_compiled(compiled),
+                            idempotency=idempotency,
                         )
         query = WriteCompiler(params, self._procedures).compile_write(tree)
         with _query_phase("runtime"):
-            return self._execute_write(lambda executor: WriteRuntime(executor).execute_write(query))
+            return self._execute_write(
+                lambda executor: WriteRuntime(executor).execute_write(query),
+                idempotency=idempotency,
+            )
 
-    def _execute_write(self, run: Callable[[CypherQueryUseCase], QueryResult]) -> QueryResult:
+    def _execute_write(
+        self,
+        run: Callable[[CypherQueryUseCase], QueryResult],
+        *,
+        idempotency: _IdempotentWrite | None = None,
+    ) -> QueryResult:
         graph = self._graph_service
         try:
             if isinstance(graph, GraphTransactionUseCase):
                 with graph.statement():
                     return run(self)
-            with graph.writer_lock(), GraphTransactionUseCase(graph) as transaction:
+            base = idempotency.base if idempotency is not None else None
+            with (
+                graph.writer_lock(),
+                GraphTransactionUseCase(graph, base_snapshot=base) as transaction,
+            ):
                 executor = self._transaction_executor(transaction)
                 with transaction.statement():
                     result = run(executor)
-                transaction.commit()
+                receipt = idempotency.prepare_receipt(result) if idempotency is not None else None
+                transaction.commit(idempotency_receipt=receipt)
                 return result
         except SchemaError as error:
             raise QueryError(

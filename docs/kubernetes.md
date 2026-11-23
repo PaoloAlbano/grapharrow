@@ -246,11 +246,45 @@ kubectl -n grapharrow get pods -o wide
 ```
 
 Scale-up is automatic. To reduce capacity during a quiet period, use
-`kubectl scale statefulset/grapharrow-s3 --namespace grapharrow --replicas=2`
-with your release name and a count within the HPA bounds. Clients whose pods
-are removed reconnect to Bolt or open a new ANA session. With a node
-autoscaler on the cluster, pods awaiting capacity can trigger provisioning
-of additional worker nodes, including an eligible spot node pool.
+the manual drain below. With a node autoscaler on the cluster, pods awaiting
+capacity can trigger provisioning of additional worker nodes, including an
+eligible spot node pool.
+
+### Drain a worker before scaling down
+
+For Delta and Native readers, run the script from the chart archive with
+Python 3 and `kubectl`. Use an account that can read the
+release's workloads, create and delete a Kubernetes Lease, execute a
+command in each gateway pod, and scale the StatefulSet. Target the desired
+cluster through your current kubeconfig or pass `--context`.
+
+```sh
+mkdir -p chart
+tar -xzf "$CHART" -C chart
+python3 chart/grapharrow/files/scale_down.py grapharrow-readers \
+  --namespace grapharrow --grace-seconds 60
+```
+
+The command removes one pod, starting with the highest ordinal. It sets
+that pod's HTTP and Bolt weights to zero on each gateway via a local Unix
+socket. New traffic goes to other pods. Existing ANA sessions still use
+their per-pod routes and existing Bolt connections can finish during the
+grace period, including transactions that write on Delta. At the deadline,
+the command requests one fewer replica.
+Clients that still have open workflows or connections on the departed pod
+must reconnect. The command restores the gateway weights after removal so
+the ordinal can take traffic again when it returns.
+
+Run the drain during a quiet period, above the HPA minimum when autoscaling
+is enabled. If the gateway pods change during the drain, the command
+cancels the scale-down and restores the weights on surviving gateways.
+The `<release>-drain` Lease serializes commands against the same release.
+If the process is forcibly killed, the Lease and runtime weights can remain
+in place. After confirming the drain has stopped, restore the affected
+server weights and delete the Lease before retrying. With chart defaults,
+the original weight is `1` in both pools.
+For a fixed replica count, update `replicaCount` in your saved Helm values
+so a later upgrade keeps the new size.
 
 ## HTTP request metrics
 

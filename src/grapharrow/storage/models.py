@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -15,6 +16,15 @@ from grapharrow.domain import (
     VersionedCatalog,
 )
 from grapharrow.domain.records import EdgeRecord, NodeRecord
+from grapharrow.domain.snapshot import IdempotencyReceipt
+
+
+@dataclass(frozen=True, slots=True)
+class PointWriteReceipt:
+    """Publish a receipt prepared after building the result, against the lookup snapshot."""
+
+    base: SnapshotManifest
+    prepare: Callable[[], IdempotencyReceipt]
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,6 +1,9 @@
 {{- define "grapharrow.gatewayConfig" -}}
 {{- $ordinals := until (include "grapharrow.gatewaySlots" . | int) -}}
 {{- $name := .Release.Name -}}
+global
+    stats socket /run/haproxy/admin.sock mode 600 level admin
+
 defaults
     timeout connect 5s
     timeout client 2m

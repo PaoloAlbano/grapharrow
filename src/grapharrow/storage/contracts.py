@@ -31,6 +31,7 @@ from grapharrow.storage.models import (
     DeltaRetentionResult,
     DeltaStorageInventory,
     InitializationResult,
+    PointWriteReceipt,
     RecoveryReport,
     RetentionPlan,
     VerificationReport,
@@ -241,9 +242,19 @@ class StorageBackend(Protocol):
         idempotency_receipt: IdempotencyReceipt | None = None,
     ) -> GraphState: ...
     def edit_edge_properties_by_id(
-        self, *, edge_id: int, rel_type: str | None, properties: dict[str, object]
+        self,
+        *,
+        edge_id: int,
+        rel_type: str | None,
+        properties: dict[str, object],
+        receipt: PointWriteReceipt | None = None,
     ) -> AbstractContextManager[tuple[EdgeRecord | None] | None]: ...
 
     def edit_node_properties_by_id(
-        self, *, node_id: int, labels: tuple[str, ...], properties: dict[str, object]
+        self,
+        *,
+        node_id: int,
+        labels: tuple[str, ...],
+        properties: dict[str, object],
+        receipt: PointWriteReceipt | None = None,
     ) -> AbstractContextManager[tuple[NodeRecord | None] | None]: ...

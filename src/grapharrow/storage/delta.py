@@ -70,6 +70,7 @@ from grapharrow.storage.models import (
     DeltaRetentionResult,
     DeltaStorageInventory,
     InitializationResult,
+    PointWriteReceipt,
     RecoveryReport,
     RetentionPlan,
     VerificationReport,
@@ -784,12 +785,7 @@ class DeltaStorageBackend:
                 edge_table = previous_state.edge_table
             if idempotency_receipt is not None:
                 kind = _receipt_partition(idempotency_receipt.key_hash)
-                receipts = _partition(base, kind, _RECEIPT_COLUMNS)
-                receipt = pa.Table.from_pylist(
-                    [asdict(idempotency_receipt)],
-                    schema=pa.schema([_SCHEMA.field(name) for name in _RECEIPT_COLUMNS]),
-                )
-                partitions[kind] = pa.concat_tables([receipts.cast(receipt.schema), receipt])
+                partitions[kind] = _append_receipt(base, kind, idempotency_receipt)
 
             head = _new_head(
                 len(nodes),
@@ -864,11 +860,27 @@ class DeltaStorageBackend:
         return head.manifest(snapshot_id, catalog.version)
 
     @contextmanager
+    def _borrow_point_snapshot(
+        self, receipt: PointWriteReceipt | None
+    ) -> Iterator[SnapshotManifest]:
+        if receipt is None:
+            with self.borrow_current_snapshot() as snapshot:
+                yield snapshot
+        else:
+            with self.pin_snapshot(receipt.base.snapshot_id):
+                yield receipt.base
+
+    @contextmanager
     def edit_edge_properties_by_id(
-        self, *, edge_id: int, rel_type: str | None, properties: dict[str, object]
+        self,
+        *,
+        edge_id: int,
+        rel_type: str | None,
+        properties: dict[str, object],
+        receipt: PointWriteReceipt | None = None,
     ) -> Generator[tuple[EdgeRecord | None] | None, None, None]:
         """Replace one canonical range after the caller builds its result successfully."""
-        with self._writer.hold(), self.borrow_current_snapshot() as snapshot:
+        with self._writer.hold(), self._borrow_point_snapshot(receipt) as snapshot:
             current = self._describe_pinned_read_version(self._read_table(snapshot.snapshot_id))
             width = current.head.edge_range_size
             if not width or current.catalog.constraints:
@@ -878,7 +890,7 @@ class DeltaStorageBackend:
             table = _partition(current.table, kind, EDGE_SCHEMA.names).cast(EDGE_SCHEMA)
             positions = pc.indices_nonzero(pc.equal(table["edge_id"], edge_id))
             if not len(positions):
-                yield (None,)
+                yield (None,) if receipt is None else None
                 return
             if len(positions) != 1:
                 yield None
@@ -891,17 +903,25 @@ class DeltaStorageBackend:
                 yield None
                 return
             after = replace(before, properties={**before.properties, **properties})
+            if receipt is not None and before == after:
+                yield None
+                return
             yield (after,)
             if before == after:
                 return
-            self._commit_point(snapshot.snapshot_id, current.head.commit_id, kind, after)
+            self._commit_point(snapshot.snapshot_id, current.head.commit_id, kind, after, receipt)
 
     @contextmanager
     def edit_node_properties_by_id(
-        self, *, node_id: int, labels: tuple[str, ...], properties: dict[str, object]
+        self,
+        *,
+        node_id: int,
+        labels: tuple[str, ...],
+        properties: dict[str, object],
+        receipt: PointWriteReceipt | None = None,
     ) -> Generator[tuple[NodeRecord | None] | None, None, None]:
         """Read a node by ID from its pinned range and publish through Delta OCC."""
-        with self._writer.hold(), self.borrow_current_snapshot() as snapshot:
+        with self._writer.hold(), self._borrow_point_snapshot(receipt) as snapshot:
             current = self._describe_pinned_read_version(self._read_table(snapshot.snapshot_id))
             if not current.head.node_ranges or current.catalog.constraints:
                 yield None
@@ -911,22 +931,27 @@ class DeltaStorageBackend:
                 current.table, kind, NODE_SCHEMA.names, ds.field("node_id") == node_id, exact=True
             )
             if not table.num_rows:
-                yield (None,)
+                yield (None,) if receipt is None else None
                 return
             if table.num_rows != 1:
                 yield None
                 return
             before = node_records_from_table(table)[0]
             if not set(labels).issubset(before.labels):
-                yield (None,)
+                yield (None,) if receipt is None else None
                 return
             if not _can_patch_properties(before, properties):
                 yield None
                 return
             after = replace(before, properties={**before.properties, **properties})
+            if receipt is not None and before == after:
+                yield None
+                return
             yield (after,)
             if before != after:
-                self._commit_point(snapshot.snapshot_id, current.head.commit_id, kind, after)
+                self._commit_point(
+                    snapshot.snapshot_id, current.head.commit_id, kind, after, receipt
+                )
 
     def _take_point_write_table(self, snapshot_id: SnapshotId) -> DeltaTable:
         """Take a writer-owned handle for exactly the pinned transaction version."""
@@ -944,8 +969,14 @@ class DeltaStorageBackend:
         return self._require_table(snapshot_id)
 
     def _commit_point(
-        self, snapshot_id: SnapshotId, metadata_id: str, kind: str, entity: EdgeRecord | NodeRecord
+        self,
+        snapshot_id: SnapshotId,
+        metadata_id: str,
+        kind: str,
+        entity: EdgeRecord | NodeRecord,
+        receipt: PointWriteReceipt | None,
     ) -> None:
+        prepared = receipt.prepare() if receipt is not None else None
         base = self._take_point_write_table(snapshot_id)
         commit_id = uuid4().hex
         base_version = base.version()
@@ -954,21 +985,28 @@ class DeltaStorageBackend:
             if isinstance(entity, NodeRecord)
             else ("edge_id", entity.edge_id)
         )
-        # The guard matches no row on the pinned base and matches any replacement
-        # metadata row during conflict checking. The update only writes the touched file.
-        predicate = (
-            f"(kind = '{kind}' AND {field} = {identifier}) OR "
-            f"(kind = 'metadata' AND (key_hash IS NULL OR key_hash <> '{metadata_id}'))"
+        # The guard matches no row in the base and matches replacement metadata during rebase.
+        guard = f"(kind = 'metadata' AND (key_hash IS NULL OR key_hash <> '{metadata_id}'))"
+        commit = CommitProperties(
+            custom_metadata={_POINT_COMMIT_ID: commit_id},
+            max_commit_retries=_POINT_COMMIT_RETRIES,
         )
+        properties = property_codec.dumps(entity.properties)
         try:
-            metrics = base.update(
-                predicate=predicate,
-                new_values={"properties_json": property_codec.dumps(entity.properties)},
-                commit_properties=CommitProperties(
-                    custom_metadata={_POINT_COMMIT_ID: commit_id},
-                    max_commit_retries=_POINT_COMMIT_RETRIES,
-                ),
-            )
+            if prepared is None:
+                metrics = base.update(
+                    predicate=f"(kind = '{kind}' AND {field} = {identifier}) OR {guard}",
+                    new_values={"properties_json": properties},
+                    commit_properties=commit,
+                )
+                if metrics.get("num_updated_rows") != 1:
+                    raise CommitOutcomeUnknownError(
+                        "Delta did not report exactly one updated entity."
+                    )
+            else:
+                self._commit_point_with_receipt(
+                    base, kind, field, identifier, properties, guard, prepared, commit
+                )
         except (DeltaError, OSError) as exc:
             # A successful rebase can publish at any version after the original base.
             # A retried conditional put can report a conflict with its own commit.
@@ -984,9 +1022,39 @@ class DeltaStorageBackend:
             if isinstance(exc, CommitFailedError):
                 raise WriteConflictError(_CONFLICT) from exc
             raise CommitOutcomeUnknownError("Could not confirm the Delta commit outcome.") from exc
-        if metrics.get("num_updated_rows") != 1:
-            raise CommitOutcomeUnknownError("Delta did not report exactly one updated entity.")
         self._point_write_table = base
+
+    def _commit_point_with_receipt(
+        self,
+        base: DeltaTable,
+        kind: str,
+        field: str,
+        identifier: int,
+        properties: str,
+        guard: str,
+        receipt: IdempotencyReceipt,
+        commit: CommitProperties,
+    ) -> None:
+        schema = NODE_SCHEMA if field == "node_id" else EDGE_SCHEMA
+        rows = _partition(base, kind, schema.names).cast(schema)
+        updated = rows.set_column(
+            schema.get_field_index("properties_json"),
+            schema.field("properties_json"),
+            pc.if_else(pc.equal(rows[field], identifier), properties, rows["properties_json"]),
+        )
+        receipts = _receipt_partition(receipt.key_hash)
+        # Overwrite both partitions in one transaction. A competing receipt in the same
+        # bucket, including an initially empty bucket, prevents a stale replace and replay.
+        data = pa.concat_tables(
+            [_rows(updated, kind), _rows(_append_receipt(base, receipts, receipt), receipts)]
+        )
+        write_deltalake(
+            base,
+            data,
+            mode="overwrite",
+            predicate=f"kind IN ('{kind}', '{receipts}') OR {guard}",
+            commit_properties=commit,
+        )
 
     def initialize(self) -> InitializationResult:
         snapshot = self.bootstrap_snapshot()
@@ -1290,6 +1358,14 @@ def _pointer(manifest: SnapshotManifest) -> CurrentSnapshotPointer:
 
 def _receipt_partition(key_hash: str) -> str:
     return f"receipt-{key_hash[:2]}"
+
+
+def _append_receipt(table: DeltaTable, kind: str, receipt: IdempotencyReceipt) -> pa.Table:
+    stored = _partition(table, kind, _RECEIPT_COLUMNS)
+    row = pa.Table.from_pylist(
+        [asdict(receipt)], schema=pa.schema([_SCHEMA.field(name) for name in _RECEIPT_COLUMNS])
+    )
+    return pa.concat_tables([stored.cast(row.schema), row])
 
 
 def _edge_partition(bucket: int) -> str:

@@ -18,6 +18,7 @@ from grapharrow.domain.records import EdgeRecord, NodeRecord
 from grapharrow.domain.snapshot import IdempotencyReceipt
 from grapharrow.repositories import CatalogRepository, GraphRepository, SnapshotRepository
 from grapharrow.storage.contracts import CatalogStore, GraphStore, SnapshotStore, StorageMaintenance
+from grapharrow.storage.models import PointWriteReceipt
 from grapharrow.storage.native_maintenance import NativeStorageMaintenance
 
 if TYPE_CHECKING:
@@ -89,7 +90,12 @@ class NativeStorageBackend:
 
     @contextmanager
     def edit_edge_properties_by_id(
-        self, *, edge_id: int, rel_type: str | None, properties: dict[str, object]
+        self,
+        *,
+        edge_id: int,
+        rel_type: str | None,
+        properties: dict[str, object],
+        receipt: PointWriteReceipt | None = None,
     ) -> Generator[tuple[EdgeRecord | None] | None, None, None]:
         """Publish a selective edit only after its caller successfully builds the result.
 
@@ -97,6 +103,9 @@ class NativeStorageBackend:
         represents a successful lookup with no match. Explicit transactions keep
         their existing staging and rollback path.
         """
+        if receipt is not None:
+            yield None
+            return
         with self.writer.hold():
             snapshot = self.capture_snapshot()
             catalog = self._catalog.load_for_snapshot(snapshot)
@@ -137,9 +146,17 @@ class NativeStorageBackend:
 
     @contextmanager
     def edit_node_properties_by_id(
-        self, *, node_id: int, labels: tuple[str, ...], properties: dict[str, object]
+        self,
+        *,
+        node_id: int,
+        labels: tuple[str, ...],
+        properties: dict[str, object],
+        receipt: PointWriteReceipt | None = None,
     ) -> Generator[tuple[NodeRecord | None] | None, None, None]:
         """Publish the touched node range and projections once the result is ready."""
+        if receipt is not None:
+            yield None
+            return
         with self.writer.hold():
             snapshot = self.capture_snapshot()
             if self._catalog.load_for_snapshot(snapshot).constraints:

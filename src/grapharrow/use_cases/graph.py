@@ -39,6 +39,7 @@ from grapharrow.repositories import (
 )
 from grapharrow.repositories.graph import EDGE_SCHEMA, _edges_table, _nodes_table
 from grapharrow.storage.contracts import CatalogStore, GraphStore, SnapshotStore, StorageBackend
+from grapharrow.storage.models import PointWriteReceipt
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,18 +174,28 @@ class GraphStateUseCase:
         return self._snapshot_store.idempotency_base(pointer, key_hash)
 
     def edit_edge_properties_by_id(
-        self, *, edge_id: int, rel_type: str | None, properties: dict[str, object]
+        self,
+        *,
+        edge_id: int,
+        rel_type: str | None,
+        properties: dict[str, object],
+        receipt: PointWriteReceipt | None = None,
     ) -> AbstractContextManager[tuple[EdgeRecord | None] | None]:
         """Let the selected backend prepare and atomically publish a selective edit."""
         return self._storage_backend.edit_edge_properties_by_id(
-            edge_id=edge_id, rel_type=rel_type, properties=properties
+            edge_id=edge_id, rel_type=rel_type, properties=properties, receipt=receipt
         )
 
     def edit_node_properties_by_id(
-        self, *, node_id: int, labels: tuple[str, ...], properties: dict[str, object]
+        self,
+        *,
+        node_id: int,
+        labels: tuple[str, ...],
+        properties: dict[str, object],
+        receipt: PointWriteReceipt | None = None,
     ) -> AbstractContextManager[tuple[NodeRecord | None] | None]:
         return self._storage_backend.edit_node_properties_by_id(
-            node_id=node_id, labels=labels, properties=properties
+            node_id=node_id, labels=labels, properties=properties, receipt=receipt
         )
 
     def load_state(self, *, snapshot: SnapshotManifest | None = None) -> GraphState:

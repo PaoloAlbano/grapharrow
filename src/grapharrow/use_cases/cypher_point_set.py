@@ -8,14 +8,25 @@ from typing import TYPE_CHECKING
 import pyarrow as pa  # type: ignore[import-untyped]
 
 from grapharrow.domain.records import EdgeRecord, NodeRecord
+from grapharrow.domain.snapshot import IdempotencyReceipt
+from grapharrow.storage.models import PointWriteReceipt
 from grapharrow.use_cases import cypher as core
 from grapharrow.use_cases.graph import GraphStateUseCase, QueryResult
 
 if TYPE_CHECKING:
-    from grapharrow.use_cases.cypher import CompiledMatchSetQuery, CypherQueryUseCase
+    from grapharrow.use_cases.cypher import (
+        CompiledMatchSetQuery,
+        CypherQueryUseCase,
+        _IdempotentWrite,
+    )
 
 
-def try_point_set(executor: CypherQueryUseCase, query: CompiledMatchSetQuery) -> QueryResult | None:
+def try_point_set(
+    executor: CypherQueryUseCase,
+    query: CompiledMatchSetQuery,
+    *,
+    idempotency: _IdempotentWrite | None = None,
+) -> QueryResult | None:
     """Decline shapes whose read dependencies extend beyond a single entity."""
     graph = executor._graph_service
     if not isinstance(graph, GraphStateUseCase) or len(query.match_patterns) != 1 or query.order_by:
@@ -59,36 +70,46 @@ def try_point_set(executor: CypherQueryUseCase, query: CompiledMatchSetQuery) ->
             or projection.metadata_only
         ):
             return None
+    result: QueryResult
+    receipt = None
+    if idempotency is not None:
+
+        def prepare_receipt() -> IdempotencyReceipt:
+            return idempotency.prepare_receipt(result)
+
+        receipt = PointWriteReceipt(idempotency.base, prepare_receipt)
     edit: AbstractContextManager[tuple[EdgeRecord | NodeRecord | None] | None]
     if node is not None:
         edit = graph.edit_node_properties_by_id(
-            node_id=predicate.value, labels=node.labels, properties=properties
+            node_id=predicate.value, labels=node.labels, properties=properties, receipt=receipt
         )
     else:
         assert edge is not None
         edit = graph.edit_edge_properties_by_id(
-            edge_id=predicate.value, rel_type=edge.rel_type, properties=properties
+            edge_id=predicate.value, rel_type=edge.rel_type, properties=properties, receipt=receipt
         )
     with edit as candidate:
         if candidate is None:
             return None
         entity = candidate[0]
         if not query.return_items:
-            return QueryResult((), ())
-        columns = {
-            f"{variable}.{item.field}": core._property_binding_array(
-                [entity.properties.get(item.field or "")] if entity is not None else []
+            result = QueryResult((), ())
+        else:
+            columns = {
+                f"{variable}.{item.field}": core._property_binding_array(
+                    [entity.properties.get(item.field or "")] if entity is not None else []
+                )
+                for item in query.return_items
+            }
+            result = executor._finalize_table_query_result(
+                query.return_items,
+                pa.table(columns),
+                distinct=query.distinct,
+                order_by=query.order_by,
+                skip=query.skip,
+                limit=query.limit,
             )
-            for item in query.return_items
-        }
-        return executor._finalize_table_query_result(
-            query.return_items,
-            pa.table(columns),
-            distinct=query.distinct,
-            order_by=query.order_by,
-            skip=query.skip,
-            limit=query.limit,
-        )
+    return result
 
 
 def _single_edge(pattern: core.CompiledPattern) -> core.RelationshipStep | None:

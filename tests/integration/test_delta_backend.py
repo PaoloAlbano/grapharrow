@@ -1759,6 +1759,174 @@ def test_delta_point_set_rejects_conflicting_changes(
 
 
 @pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
+@pytest.mark.parametrize("entity", ["node", "edge"])
+def test_lost_point_set_response_replays_without_rewriting_metadata(
+    delta_database: tuple[str | Path, GraphArrowSettings], entity: str
+) -> None:
+    path, settings = delta_database
+    reader = build_application(path, settings=settings)
+    reader.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    snapshots = reader.repositories.snapshot
+    initial = snapshots.load_current_pointer()
+    writer = create_rest_app(path, settings=settings)
+    query = (
+        SET_EDGE
+        if entity == "edge"
+        else "MATCH (n:Author) WHERE id(n)=$id SET n.name=$name RETURN n.name AS name"
+    )
+    payload = {
+        "query": query,
+        "params": {"id": 1, **({"since": 2025} if entity == "edge" else {"name": "Updated"})},
+    }
+    headers = {"Idempotency-Key": "point-once"}
+    body = bytearray()
+
+    async def disconnect(scope: Scope, receive: Receive, send: Send) -> None:
+        async def drop_response(message: Message) -> None:
+            if message["type"] == "http.response.body":
+                body.extend(message.get("body", b""))
+                raise ConnectionError("Response lost after point commit")
+
+        await writer(scope, receive, drop_response)
+
+    with pytest.raises(ConnectionError, match="Response lost after point commit"):
+        TestClient(disconnect).post("/v1/query", json=payload, headers=headers)
+
+    head = snapshots.load_current_pointer()
+    assert head.snapshot_id.value == initial.snapshot_id.value + 1
+    key = sha256(b"point-once").hexdigest()
+    before, missing = snapshots.idempotency_base(initial, key)
+    after, receipt = snapshots.idempotency_base(head, key)
+    assert missing is None and receipt is not None
+    assert receipt.response_json.encode() == body
+    assert after.idempotency_receipt is None  # No new graph metadata row was required.
+    graph = reader.use_cases.graph
+    if entity == "edge":
+        assert graph.load_state(snapshot=before).edges[0].properties == {"since": 2020}
+        assert graph.load_state(snapshot=after).edges[0].properties == {"since": 2025}
+    else:
+        assert graph.load_state(snapshot=before).nodes[0].properties == {"name": "Graph"}
+        assert graph.load_state(snapshot=after).nodes[0].properties == {"name": "Updated"}
+    replay = TestClient(create_rest_app(path, settings=settings)).post(
+        "/v1/query", json=payload, headers=headers
+    )
+    assert replay.status_code == 200 and replay.content == body
+    assert snapshots.load_current_pointer() == head
+
+
+@pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
+@pytest.mark.parametrize(
+    "overlap", ["disjoint", "same-range", "same-key", "key-mismatch", "receipt-bucket", "catalog"]
+)
+def test_concurrent_keyed_point_sets(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+    overlap: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from grapharrow.storage.delta import DeltaStorageBackend
+
+    path, settings = delta_database
+    settings = settings.model_copy(update={"edge_parquet_range_size": 2})
+    reader = build_application(path, settings=settings)
+    reader.use_cases.cypher.execute(CREATE_EDGE_RANGES)
+    first = TestClient(create_rest_app(path, settings=settings))
+    second = TestClient(create_rest_app(path, settings=settings))
+    base = reader.storage_backend.capture_snapshot()
+    second_id = {"same-range": 2, "same-key": 1}.get(overlap, 3)
+    second_value = 2025 if overlap == "same-key" else 2026
+    second_key = {"same-key": "first", "key-mismatch": "first", "receipt-bucket": "other-17"}.get(
+        overlap, "second"
+    )
+
+    def post(client, key, edge_id, value):
+        return client.post(
+            "/v1/query",
+            json={"query": SET_EDGE, "params": {"id": edge_id, "since": value}},
+            headers={"Idempotency-Key": key},
+        )
+
+    publish = DeltaStorageBackend._commit_point_with_receipt
+    winner = None
+    interleaved = False
+
+    def before_publish(backend, *args):
+        nonlocal winner, interleaved
+        if not interleaved:
+            interleaved = True
+            if overlap == "catalog":
+                reader.use_cases.indexes.create_index(
+                    name="author_name",
+                    kind="range",
+                    owner_kind="label",
+                    owner_name="Author",
+                    property_names=("name",),
+                )
+            else:
+                winner = post(second, second_key, second_id, second_value)
+                assert winner.status_code == 200, winner.text
+        publish(backend, *args)
+
+    monkeypatch.setattr(DeltaStorageBackend, "_commit_point_with_receipt", before_publish)
+    result = post(first, "first", 1, 2025)
+    assert interleaved
+    current = reader.use_cases.graph.load_state()
+    assert current.snapshot.snapshot_id.value == base.snapshot_id.value + (
+        2 if overlap == "disjoint" else 1
+    )
+    if overlap == "disjoint":
+        assert result.status_code == 200, result.text
+        assert current.edges[0].properties == {"since": 2025}
+    elif overlap == "same-key":
+        assert winner is not None and result.content == winner.content
+    else:
+        code = "IDEMPOTENCY_KEY_CONFLICT" if overlap == "key-mismatch" else "WRITE_CONFLICT"
+        assert result.status_code == 409 and result.json()["error"]["code"] == code, result.text
+        assert current.edges[0].properties == {"since": 2020}
+    if overlap == "catalog":
+        assert [index.name for index in current.catalog.indexes] == ["author_name"]
+    else:
+        assert current.edges[second_id - 1].properties == {"since": second_value}
+    if overlap == "receipt-bucket":
+        retry = post(first, "first", 1, 2025)
+        assert retry.status_code == 200, retry.text
+        replay = post(second, second_key, second_id, second_value)
+        assert winner is not None and replay.content == winner.content
+        assert reader.use_cases.graph.load_state().snapshot.snapshot_id.value == (
+            base.snapshot_id.value + 2
+        )
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+def test_keyed_point_set_replays_an_unchanged_or_empty_result(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+) -> None:
+    path, settings = delta_database
+    reader = build_application(path, settings=settings)
+    reader.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    first = TestClient(create_rest_app(path, settings=settings))
+    second = TestClient(create_rest_app(path, settings=settings))
+    for edge_id, rows in [(1, [{"since": 2020}]), (2, [])]:
+        payload = {"query": SET_EDGE, "params": {"id": edge_id, "since": 2020}}
+        key = {"Idempotency-Key": f"unchanged-{edge_id}"}
+        before = reader.storage_backend.capture_snapshot()
+        initial = first.post("/v1/query", json=payload, headers=key)
+        assert initial.status_code == 200 and initial.json()["data"]["rows"] == rows
+        assert (
+            reader.storage_backend.capture_snapshot().snapshot_id.value
+            == before.snapshot_id.value + 1
+        )
+
+        if edge_id == 1:
+            reader.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2026})
+        else:
+            reader.use_cases.cypher.execute(CREATE, {"name": "Another"})
+        after = reader.storage_backend.capture_snapshot()
+        replay = second.post("/v1/query", json=payload, headers=key)
+        assert replay.status_code == 200 and replay.content == initial.content
+        assert reader.storage_backend.capture_snapshot() == after
+
+
+@pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
 def test_delta_point_writes_reuse_a_writer_owned_handle(
     delta_database: tuple[str | Path, GraphArrowSettings],
 ) -> None:

@@ -3,20 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 import secrets
 import ssl
 import subprocess
+import sys
 import tarfile
 import time
 from base64 import b64encode
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event
 from typing import TypeVar
 
 import httpx
@@ -174,17 +177,19 @@ class Deployment:
         print(run("helm", action, *self.options, *args), flush=True)
 
     def profile(self, name: str) -> list[str]:
+        return ["--values", str(self.chart_file(f"profiles/{name}"))]
+
+    def chart_file(self, name: str) -> Path:
         if self.chart.is_dir():
-            path = self.chart / "profiles" / name
-        else:
-            path = self.temporary / name
-            with tarfile.open(self.chart, "r:gz") as archive:
-                member = archive.extractfile(f"grapharrow/profiles/{name}")
-                if member is None:
-                    raise ValueError(f"Chart profile is missing: {name}")
-                with member:
-                    path.write_bytes(member.read())
-        return ["--values", str(path)]
+            return self.chart / name
+        path = self.temporary / Path(name).name
+        with tarfile.open(self.chart, "r:gz") as archive:
+            member = archive.extractfile(f"grapharrow/{name}")
+            if member is None:
+                raise ValueError(f"Chart file is missing: {name}")
+            with member:
+                path.write_bytes(member.read())
+        return path
 
     def helm_test(self, release: str) -> None:
         subprocess.run(
@@ -584,6 +589,174 @@ spec:
             flush=True,
         )
 
+    def verify_worker_drain(
+        self, release: str, replicas: int, count: int, *, writable: bool = False
+    ) -> None:
+        gateways = self.pods("gateway", release=release)
+        gateway = next(iter(gateways))
+        ordinal = replicas - 1
+        target = f"{release}-{ordinal}"
+
+        def bolt_stats() -> dict[str, str]:
+            stats = kubectl(
+                "-n",
+                self.namespace,
+                "exec",
+                gateway,
+                "-c",
+                "haproxy",
+                "-i",
+                "--",
+                "socat",
+                "-",
+                "UNIX-CONNECT:/run/haproxy/admin.sock",
+                input_text="show stat\n",
+            )
+            return next(
+                row
+                for row in csv.DictReader(stats.removeprefix("# ").splitlines())
+                if row["pxname"] == "bolt" and row["svname"] == f"app_{ordinal}"
+            )
+
+        with (
+            forward(self.namespace, f"pod/{target}") as (direct, _),
+            forward(self.namespace, f"pod/{gateway}") as (http, bolt),
+            GraphDatabase.driver(bolt, auth=("smoke", self.bolt_key)) as driver,
+        ):
+            ana_session = self.session(direct)
+            assert ana_session["X-ANA-Session"].startswith(target + ".")
+            self.verify_ana(http, ana_session, count)
+            eventually(lambda: bolt_stats()["status"], "UP")
+            with ExitStack() as active:
+                query = "MATCH (n:Smoke) RETURN count(n) AS n"
+                transactions = []
+                departing = None
+                for _ in range(replicas):
+                    before = int(bolt_stats()["scur"])
+                    session = active.enter_context(driver.session())
+                    tx = active.enter_context(session.begin_transaction())
+                    assert tx.run(query).single()["n"] == count
+                    if int(bolt_stats()["scur"]) > before:
+                        departing = tx
+                    transactions.append(tx)
+                assert departing is not None, "No open Bolt transaction on the departing pod"
+                if writable:
+                    probe_id = departing.run(
+                        "CREATE (n:DrainProbe {value: 0}) RETURN id(n) AS id"
+                    ).single()["id"]
+                log_path = self.temporary / f"{release}-drain.log"
+                command = [
+                    sys.executable,
+                    str(self.chart_file("files/scale_down.py")),
+                    release,
+                    "--namespace",
+                    self.namespace,
+                    "--context",
+                    CONTEXT,
+                    "--grace-seconds",
+                    "24" if writable else "16",
+                ]
+                with (
+                    log_path.open("w") as output,
+                    subprocess.Popen(
+                        command,
+                        stdout=output,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    ) as drain,
+                ):
+                    eventually(lambda: f"Draining {target}" in log_path.read_text(), True)
+                    competing = subprocess.run(command, capture_output=True, text=True, timeout=8)
+                    assert competing.returncode != 0 and "AlreadyExists" in competing.stderr
+                    before = bolt_stats()["stot"]
+                    auth = {"Authorization": f"Bearer {self.ana_key}"}
+                    for pod in gateways:
+                        with port_forward(self.namespace, f"pod/{pod}", 8000) as ports:
+                            endpoint = f"http://127.0.0.1:{ports[8000]}"
+                            with httpx.Client(timeout=5, headers=auth) as client:
+                                for _ in range(4):
+                                    response = client.post(endpoint + "/sessions")
+                                    response.raise_for_status()
+                                    token = response.headers["X-ANA-Session"]
+                                    assert not token.startswith(target + "."), token
+                                    client.delete(
+                                        endpoint + "/sessions/current",
+                                        headers={"X-ANA-Session": token},
+                                    ).raise_for_status()
+                    for _ in range(3):
+                        self.verify_bolt(bolt, count)
+                    assert bolt_stats()["stot"] == before
+                    for tx in transactions:
+                        assert tx.run(query).single()["n"] == count
+                        tx.commit()
+                    response = self.ana(http, ana_session, "fetch", {"from": "h1"})
+                    response.raise_for_status()
+                    assert response.json()["result"]["rows"] == [[count]]
+                    if writable:
+                        stopped = Event()
+                        wrote, read = Event(), Event()
+                        executor = active.enter_context(ThreadPoolExecutor(max_workers=2))
+                        active.callback(stopped.set)
+                        writer = executor.submit(
+                            self.delta_drain_writes, http, probe_id, stopped, wrote
+                        )
+                        reader = executor.submit(
+                            self.delta_drain_reads, http, target, count, stopped, read
+                        )
+                        assert wrote.wait(timeout=12) and read.wait(timeout=2), (
+                            "No mixed traffic completed during the drain"
+                        )
+                    assert drain.wait(timeout=110) == 0, log_path.read_text()
+                    if writable:
+                        stopped.set()
+                        value = writer.result(timeout=30)
+                        workflows = reader.result(timeout=15)
+                        assert self.query(http, "MATCH (n:DrainProbe) RETURN n.value AS value") == [
+                            {"value": value}
+                        ]
+                        self.verify_ana(http, self.session(http), count)
+                        print(
+                            f"Delta drain completed {value} writes and {workflows} ANA workflows",
+                            flush=True,
+                        )
+        assert target not in self.pods("server", release=release)
+        assert len(self.pods("server", release=release)) == replicas - 1
+        assert not kubectl(
+            "-n", self.namespace, "get", f"lease/{release}-drain", "--ignore-not-found"
+        )
+        print(
+            f"{release} {replicas}→{replicas - 1} drain kept existing ANA and Bolt traffic"
+            + (" and completed mixed reads and writes" if writable else ""),
+            flush=True,
+        )
+
+    def delta_drain_writes(self, http: str, node_id: int, stop: Event, wrote: Event) -> int:
+        value = 0
+        while not stop.is_set():
+            value += 1
+            update = (
+                f"MATCH (n:DrainProbe) WHERE id(n)={node_id} "
+                f"SET n.value={value} RETURN n.value AS value"
+            )
+            assert self.query(http, update, idempotency_key=f"drain-{value}") == [{"value": value}]
+            wrote.set()
+            stop.wait(0.15)
+        return value
+
+    def delta_drain_reads(
+        self, http: str, target: str, count: int, stop: Event, read: Event
+    ) -> int:
+        workflows = 0
+        while not stop.is_set():
+            session = self.session(http)
+            assert not session["X-ANA-Session"].startswith(target + ".")
+            self.verify_ana(http, session, count)
+            httpx.delete(http + "/sessions/current", headers=session, timeout=10).raise_for_status()
+            workflows += 1
+            read.set()
+            stop.wait(0.15)
+        return workflows
+
     def native_readers(self) -> None:
         uri = ["--set-string", "storage.uri=az://graphs/native-readers"]
         self.helm(
@@ -675,6 +848,7 @@ spec:
                     lambda: self.session(reader)["X-ANA-Session"].startswith("native-readers-2."),
                     True,
                 )
+                self.verify_worker_drain("native-readers", 3, 2)
                 kubectl("-n", self.namespace, "scale", "statefulset/native-writer", "--replicas=0")
                 kubectl(
                     "-n",
@@ -786,6 +960,7 @@ spec:
             flush=True,
         )
         self.check_autoscaling(options, 9)
+        self.verify_worker_drain("grapharrow", 4, 9, writable=True)
 
 
 def main() -> None:
