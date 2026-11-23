@@ -560,7 +560,6 @@ spec:
 
             # Exercise the scale subresource used by the HPA without depending on CPU metrics.
             kubectl("-n", self.namespace, "scale", workload, "--replicas=4")
-            kubectl("-n", self.namespace, "rollout", "status", workload, "--timeout=60s")
             newer_pods = {"grapharrow-2", "grapharrow-3"}
             seen = set()
 
@@ -572,7 +571,8 @@ spec:
                     seen.add(owner)
                 return seen
 
-            eventually(new_workers, newer_pods)
+            # Exercise the session route as each new pod first enters the HTTP pool.
+            eventually(new_workers, newer_pods, timeout=60)
             response = self.ana(http, session, "fetch", {"from": "h1"})
             response.raise_for_status()
             assert response.json()["result"]["rows"] == [[count]]

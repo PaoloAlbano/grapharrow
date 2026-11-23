@@ -38,9 +38,9 @@ backend http_pool
 
 backend http_{{ . }}
     mode http
-    option httpchk GET /health
     retries 0
-    server app_{{ . }} {{ $name }}-pod-{{ . }}:8000 check inter 1s init-state down
+    # Route an issued session using the same health state that admitted it.
+    server app_{{ . }} {{ $name }}-pod-{{ . }}:8000 track http_pool/app_{{ . }}
 {{- end }}
 
 listen bolt
