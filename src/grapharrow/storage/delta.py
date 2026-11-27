@@ -83,6 +83,7 @@ _FORMAT = "grapharrow-delta-v1"
 _MANAGED_FORMAT = "grapharrow-delta-managed-v1"
 _POINT_COMMIT_ID = "grapharrowPointCommitId"
 _POINT_COMMIT_RETRIES = 10
+_POINT_RECOVERY_LOG_PROBES = 8
 _DEFAULT_EDGE_RANGE_SIZE = 8192
 _HEAD_PROBE_BATCH_SECONDS = 0.001
 # The string interval contains exactly the partition names with the 'edges-' prefix.
@@ -397,6 +398,12 @@ class DeltaStorageBackend:
         return DeltaStorageHandler(self._uri, self._options)
 
     def _commit_info(self, version: int) -> dict[str, Any]:
+        commit = self._maybe_commit_info(version)
+        if commit is None:
+            raise StorageError(f"Missing Delta log file for version {version}.")
+        return commit
+
+    def _maybe_commit_info(self, version: int) -> dict[str, Any] | None:
         path = f"_delta_log/{version:020d}.json"
         try:
             probed = self._probed_commit_size
@@ -404,8 +411,10 @@ class DeltaStorageBackend:
                 size = probed[1]
             else:
                 info = self._log_storage.get_file_info([path])[0]
+                if info.type == pafs.FileType.NotFound:
+                    return None
                 if info.type != pafs.FileType.File:
-                    raise StorageError(f"Missing Delta log file for version {version}.")
+                    raise StorageError(f"Invalid Delta log file for version {version}.")
                 size = info.size
             storage = DeltaStorageHandler(self._uri, self._options, known_sizes={path: size})
             with storage.open_input_file(path) as handle:
@@ -686,16 +695,14 @@ class DeltaStorageBackend:
             manifest = self._describe_read_version(table).manifest
             if pointer != _pointer(manifest):
                 raise StorageError("The Delta snapshot pointer does not match the log.")
-            rows = _partition(
-                table,
-                _receipt_partition(key_hash),
-                _RECEIPT_COLUMNS,
-                ds.field("key_hash") == key_hash,
-            ).to_pylist()
-            if len(rows) > 1:
-                raise StorageError("Duplicate idempotency receipts in the Delta snapshot.")
-            receipt = IdempotencyReceipt(**rows[0]) if rows else None
-            return manifest, receipt
+            return manifest, _find_receipt(table, key_hash)
+
+    def current_idempotency_base(
+        self, key_hash: str
+    ) -> tuple[SnapshotManifest, IdempotencyReceipt | None]:
+        """Reuse the freshness check and read the receipt from the pinned write base."""
+        with self.borrow_current_snapshot() as snapshot:
+            return snapshot, _find_receipt(self._read_table(snapshot.snapshot_id), key_hash)
 
     @writer_locked
     def write(self, catalog: VersionedCatalog, *, base: SnapshotManifest | None = None) -> str:
@@ -903,13 +910,14 @@ class DeltaStorageBackend:
                 yield None
                 return
             after = replace(before, properties={**before.properties, **properties})
-            if receipt is not None and before == after:
-                yield None
-                return
             yield (after,)
             if before == after:
+                if receipt is not None:
+                    self._commit_receipt(snapshot.snapshot_id, receipt.prepare())
                 return
-            self._commit_point(snapshot.snapshot_id, current.head.commit_id, kind, after, receipt)
+            self._commit_point(
+                snapshot.snapshot_id, current.head.commit_id, kind, after, receipt, range_rows=table
+            )
 
     @contextmanager
     def edit_node_properties_by_id(
@@ -944,14 +952,13 @@ class DeltaStorageBackend:
                 yield None
                 return
             after = replace(before, properties={**before.properties, **properties})
-            if receipt is not None and before == after:
-                yield None
-                return
             yield (after,)
             if before != after:
                 self._commit_point(
                     snapshot.snapshot_id, current.head.commit_id, kind, after, receipt
                 )
+            elif receipt is not None:
+                self._commit_receipt(snapshot.snapshot_id, receipt.prepare())
 
     def _take_point_write_table(self, snapshot_id: SnapshotId) -> DeltaTable:
         """Take a writer-owned handle for exactly the pinned transaction version."""
@@ -975,11 +982,10 @@ class DeltaStorageBackend:
         kind: str,
         entity: EdgeRecord | NodeRecord,
         receipt: PointWriteReceipt | None,
+        *,
+        range_rows: pa.Table | None = None,
     ) -> None:
         prepared = receipt.prepare() if receipt is not None else None
-        base = self._take_point_write_table(snapshot_id)
-        commit_id = uuid4().hex
-        base_version = base.version()
         field, identifier = (
             ("node_id", entity.node_id)
             if isinstance(entity, NodeRecord)
@@ -987,12 +993,11 @@ class DeltaStorageBackend:
         )
         # The guard matches no row in the base and matches replacement metadata during rebase.
         guard = f"(kind = 'metadata' AND (key_hash IS NULL OR key_hash <> '{metadata_id}'))"
-        commit = CommitProperties(
-            custom_metadata={_POINT_COMMIT_ID: commit_id},
-            max_commit_retries=_POINT_COMMIT_RETRIES,
-        )
         properties = property_codec.dumps(entity.properties)
-        try:
+        with self._point_publication(snapshot_id, max_retries=_POINT_COMMIT_RETRIES) as (
+            base,
+            commit,
+        ):
             if prepared is None:
                 metrics = base.update(
                     predicate=f"(kind = '{kind}' AND {field} = {identifier}) OR {guard}",
@@ -1004,17 +1009,44 @@ class DeltaStorageBackend:
                         "Delta did not report exactly one updated entity."
                     )
             else:
+                if range_rows is None:
+                    schema = NODE_SCHEMA if field == "node_id" else EDGE_SCHEMA
+                    range_rows = _partition(base, kind, schema.names).cast(schema)
                 self._commit_point_with_receipt(
-                    base, kind, field, identifier, properties, guard, prepared, commit
+                    base, kind, range_rows, field, identifier, properties, guard, prepared, commit
                 )
+
+    def _commit_receipt(self, snapshot_id: SnapshotId, receipt: IdempotencyReceipt) -> None:
+        # The response depends on the matched row even though this write does not replace it.
+        # Reject a new head so a changed range or catalog cannot invalidate the response.
+        with self._point_publication(snapshot_id, max_retries=0) as (base, commit):
+            kind = _receipt_partition(receipt.key_hash)
+            write_deltalake(
+                base,
+                _rows(_append_receipt(base, kind, receipt), kind),
+                mode="overwrite",
+                predicate=f"kind = '{kind}'",
+                commit_properties=commit,
+            )
+
+    @contextmanager
+    def _point_publication(
+        self, snapshot_id: SnapshotId, *, max_retries: int
+    ) -> Iterator[tuple[DeltaTable, CommitProperties]]:
+        base = self._take_point_write_table(snapshot_id)
+        base_version = base.version()
+        commit_id = uuid4().hex
+        commit = CommitProperties(
+            custom_metadata={_POINT_COMMIT_ID: commit_id}, max_commit_retries=max_retries
+        )
+        try:
+            yield base, commit
         except (DeltaError, OSError) as exc:
             # A successful rebase can publish at any version after the original base.
             # A retried conditional put can report a conflict with its own commit.
             try:
-                latest = self._require_table(None).version()
-                for version in range(latest, base_version, -1):
-                    if self._commit_info(version).get(_POINT_COMMIT_ID) == commit_id:
-                        return
+                if self._find_point_commit(base_version, commit_id):
+                    return
             except StorageError as read_error:
                 raise CommitOutcomeUnknownError(
                     "Could not confirm the Delta commit outcome."
@@ -1024,10 +1056,27 @@ class DeltaStorageBackend:
             raise CommitOutcomeUnknownError("Could not confirm the Delta commit outcome.") from exc
         self._point_write_table = base
 
+    def _find_point_commit(self, base_version: int, commit_id: str) -> bool:
+        # GraphArrow keeps the contiguous JSON log, including expired snapshots.
+        end = base_version + _POINT_RECOVERY_LOG_PROBES
+        for version in range(base_version + 1, end + 1):
+            entry = self._maybe_commit_info(version)
+            if entry is None:
+                return False
+            if entry.get(_POINT_COMMIT_ID) == commit_id:
+                return True
+        # Fall back to finding the latest version when the transaction's base is far behind.
+        latest = self._require_table(None).version()
+        return any(
+            self._commit_info(version).get(_POINT_COMMIT_ID) == commit_id
+            for version in range(latest, end, -1)
+        )
+
     def _commit_point_with_receipt(
         self,
         base: DeltaTable,
         kind: str,
+        rows: pa.Table,
         field: str,
         identifier: int,
         properties: str,
@@ -1035,11 +1084,9 @@ class DeltaStorageBackend:
         receipt: IdempotencyReceipt,
         commit: CommitProperties,
     ) -> None:
-        schema = NODE_SCHEMA if field == "node_id" else EDGE_SCHEMA
-        rows = _partition(base, kind, schema.names).cast(schema)
         updated = rows.set_column(
-            schema.get_field_index("properties_json"),
-            schema.field("properties_json"),
+            rows.schema.get_field_index("properties_json"),
+            rows.schema.field("properties_json"),
             pc.if_else(pc.equal(rows[field], identifier), properties, rows["properties_json"]),
         )
         receipts = _receipt_partition(receipt.key_hash)
@@ -1358,6 +1405,15 @@ def _pointer(manifest: SnapshotManifest) -> CurrentSnapshotPointer:
 
 def _receipt_partition(key_hash: str) -> str:
     return f"receipt-{key_hash[:2]}"
+
+
+def _find_receipt(table: _ReadSource, key_hash: str) -> IdempotencyReceipt | None:
+    rows = _partition(
+        table, _receipt_partition(key_hash), _RECEIPT_COLUMNS, ds.field("key_hash") == key_hash
+    ).to_pylist()
+    if len(rows) > 1:
+        raise StorageError("Duplicate idempotency receipts in the Delta snapshot.")
+    return IdempotencyReceipt(**rows[0]) if rows else None
 
 
 def _append_receipt(table: DeltaTable, kind: str, receipt: IdempotencyReceipt) -> pa.Table:

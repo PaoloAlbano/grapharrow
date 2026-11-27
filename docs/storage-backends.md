@@ -47,10 +47,11 @@ New Delta databases partition edges into ranges of 8,192 IDs by default.
 A compatible autocommit `SET` by node or edge ID rewrites one canonical range.
 This path applies to updates that preserve existing scalar property types on
 graphs without constraints. With a REST idempotency key, the same commit also
-replaces the receipt bucket, preserving earlier receipts in that bucket. Keyed
-writes that leave the entity unchanged or match no rows use the general write
-path to record their response. Property projections are derived from the graph
-version selected by each reader.
+replaces the receipt bucket, preserving earlier receipts in that bucket. A
+compatible keyed point write that leaves the entity unchanged replaces only
+the receipt bucket and requires the graph to remain at the captured version.
+Writes that match no rows use the general write path to record their response.
+Property projections are derived from the graph version selected by each reader.
 
 `GRAPHARROW_EDGE_PARQUET_RANGE_SIZE` overrides the range width at database
 creation or explicit compaction. Set it to `0` for a single edge partition.
@@ -81,7 +82,9 @@ the commit without replaying the query as long as the graph metadata remains
 unchanged. A conflicting file rewrite or a change to graph metadata, including
 catalog updates and compaction, rejects the pending point update. The Delta
 log identifies point commits by a unique ID so the writer can check whether
-publication succeeded if the storage response is lost.
+publication succeeded if the storage response is lost. Recovery checks the
+next log entries directly and opens the latest table when the base is farther
+behind.
 
 Keyed point writes can also rebase when their receipt buckets are disjoint.
 A competing write to the same bucket can return a write conflict even when

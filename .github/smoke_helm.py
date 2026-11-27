@@ -25,7 +25,7 @@ from typing import TypeVar
 import httpx
 from azure.storage.blob import BlobServiceClient, ContainerSasPermissions, generate_container_sas
 from neo4j import GraphDatabase, TrustCustomCAs
-from neo4j.exceptions import WriteServiceUnavailable
+from neo4j.exceptions import ServiceUnavailable, SessionExpired, WriteServiceUnavailable
 
 CONTEXT = "kind-grapharrow-helm"
 CHART = Path("charts/grapharrow")
@@ -619,7 +619,7 @@ spec:
             )
 
         with (
-            forward(self.namespace, f"pod/{target}") as (direct, _),
+            forward(self.namespace, f"pod/{target}") as (direct, direct_bolt),
             forward(self.namespace, f"pod/{gateway}") as (http, bolt),
             GraphDatabase.driver(bolt, auth=("smoke", self.bolt_key)) as driver,
         ):
@@ -628,6 +628,17 @@ spec:
             self.verify_ana(http, ana_session, count)
             eventually(lambda: bolt_stats()["status"], "UP")
             with ExitStack() as active:
+                if writable:
+                    with port_forward(self.namespace, f"pod/{release}-0", 8000) as ports:
+                        survivor = self.session(f"http://127.0.0.1:{ports[8000]}")
+                    self.verify_ana(http, survivor, count)
+                    replay_id = self.prepare_drain_replay(direct)
+                    target_driver = active.enter_context(
+                        GraphDatabase.driver(direct_bolt, auth=("smoke", self.bolt_key))
+                    )
+                    target_session = active.enter_context(target_driver.session())
+                    pending = active.enter_context(target_session.begin_transaction())
+                    pending.run("CREATE (:DrainUncommitted)").consume()
                 query = "MATCH (n:Smoke) RETURN count(n) AS n"
                 transactions = []
                 departing = None
@@ -719,6 +730,22 @@ spec:
                             f"Delta drain completed {value} writes and {workflows} ANA workflows",
                             flush=True,
                         )
+                        eventually(
+                            lambda: (
+                                self.ana(http, ana_session, "fetch", {"from": "h1"}).status_code
+                            ),
+                            404,
+                        )
+                        response = self.ana(http, survivor, "fetch", {"from": "h1"})
+                        response.raise_for_status()
+                        assert response.json()["result"]["rows"] == [[count]]
+                        try:
+                            pending.commit()
+                        except (ServiceUnavailable, SessionExpired):
+                            pass
+                        else:
+                            raise AssertionError("Bolt committed after its pod was removed")
+                        self.verify_drain_replay(http, replay_id)
         assert target not in self.pods("server", release=release)
         assert len(self.pods("server", release=release)) == replicas - 1
         assert not kubectl(
@@ -727,6 +754,51 @@ spec:
         print(
             f"{release} {replicas}→{replicas - 1} drain kept existing ANA and Bolt traffic"
             + (" and completed mixed reads and writes" if writable else ""),
+            flush=True,
+        )
+
+    @staticmethod
+    def drain_replay_query(node_id: int, value: int) -> str:
+        return (
+            f"MATCH (n:DrainReplay) WHERE id(n)={node_id} "
+            f"SET n.value={value} RETURN n.value AS value"
+        )
+
+    def prepare_drain_replay(self, direct: str) -> int:
+        node = self.query(direct, "CREATE (n:DrainReplay {value: 0}) RETURN id(n) AS id")[0]["id"]
+        headers = {"Authorization": f"Bearer {self.rest_key}", "Idempotency-Key": "drain-replay"}
+        with httpx.stream(
+            "POST",
+            direct + "/v1/query",
+            headers=headers,
+            json={"query": self.drain_replay_query(node, 17)},
+            timeout=25,
+        ) as response:
+            response.raise_for_status()
+            # The handler committed before sending the headers. Discard the response body.
+        return node
+
+    def verify_drain_replay(self, http: str, node_id: int) -> None:
+        def snapshot_id() -> int:
+            response = httpx.get(
+                http + "/v1/health",
+                headers={"Authorization": f"Bearer {self.rest_key}"},
+                timeout=10,
+            )
+            response.raise_for_status()
+            return response.json()["data"]["snapshot_id"]
+
+        assert self.query(http, "MATCH (n:DrainUncommitted) RETURN count(n) AS n") == [{"n": 0}]
+        assert self.query(http, "MATCH (n:DrainReplay) RETURN n.value AS value") == [{"value": 17}]
+        assert self.query(http, self.drain_replay_query(node_id, 23)) == [{"value": 23}]
+        before = snapshot_id()
+        assert self.query(
+            http, self.drain_replay_query(node_id, 17), idempotency_key="drain-replay"
+        ) == [{"value": 17}]
+        assert self.query(http, "MATCH (n:DrainReplay) RETURN n.value AS value") == [{"value": 23}]
+        assert snapshot_id() == before
+        print(
+            "Delta drain expired ANA handles, discarded an open Bolt write and replayed REST",
             flush=True,
         )
 

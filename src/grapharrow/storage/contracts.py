@@ -231,6 +231,10 @@ class StorageBackend(Protocol):
     def snapshot_open_guard(self) -> AbstractContextManager[None]: ...
     def pin_snapshot(self, snapshot_id: SnapshotId) -> AbstractContextManager[None]: ...
 
+    def current_idempotency_base(
+        self, key_hash: str
+    ) -> tuple[SnapshotManifest, IdempotencyReceipt | None]: ...
+
     def publish_graph(
         self,
         *,

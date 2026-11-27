@@ -88,6 +88,15 @@ class NativeStorageBackend:
     def pin_snapshot(self, snapshot_id: SnapshotId) -> AbstractContextManager[None]:
         return nullcontext()
 
+    def current_idempotency_base(
+        self, key_hash: str
+    ) -> tuple[SnapshotManifest, IdempotencyReceipt | None]:
+        pointer = self._snapshot.try_load_current_pointer()
+        if pointer is None:
+            self.capture_snapshot()
+            pointer = self._snapshot.load_current_pointer()
+        return self._snapshot.idempotency_base(pointer, key_hash)
+
     @contextmanager
     def edit_edge_properties_by_id(
         self,

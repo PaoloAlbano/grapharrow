@@ -270,10 +270,13 @@ that pod's HTTP and Bolt weights to zero on each gateway via a local Unix
 socket. New traffic goes to other pods. Existing ANA sessions still use
 their per-pod routes and existing Bolt connections can finish during the
 grace period, including transactions that write on Delta. At the deadline,
-the command requests one fewer replica.
-Clients that still have open workflows or connections on the departed pod
-must reconnect. The command restores the gateway weights after removal so
-the ordinal can take traffic again when it returns.
+the command requests one fewer replica. Workflows tied to the removed pod
+must open a new ANA session and recreate their handles. Bolt clients must
+reconnect. An open Bolt transaction that never sent `COMMIT` loses its
+pending changes. A REST client that missed a write response can
+[retry with the original idempotency key](transactions.md#retrying-rest-cypher-writes)
+through a surviving replica. The command restores the gateway weights after
+removal so the ordinal can take traffic again when it returns.
 
 Run the drain during a quiet period, above the HPA minimum when autoscaling
 is enabled. If the gateway pods change during the drain, the command

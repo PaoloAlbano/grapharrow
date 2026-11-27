@@ -167,11 +167,7 @@ class GraphStateUseCase:
 
     def idempotency_base(self, key_hash: str) -> tuple[SnapshotManifest, IdempotencyReceipt | None]:
         """Find a receipt and the write base in the same published history."""
-        pointer = self._snapshot_store.try_load_current_pointer()
-        if pointer is None:
-            self.capture_snapshot()
-            pointer = self._snapshot_store.load_current_pointer()
-        return self._snapshot_store.idempotency_base(pointer, key_hash)
+        return self._storage_backend.current_idempotency_base(key_hash)
 
     def edit_edge_properties_by_id(
         self,

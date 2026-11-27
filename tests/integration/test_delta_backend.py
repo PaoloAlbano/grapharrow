@@ -788,9 +788,9 @@ def test_managed_delta_holds_one_admission_from_snapshot_selection_to_completion
     else:
         publish = backend._commit_point
 
-        def observe_publication(*args: Any) -> None:
+        def observe_publication(*args: Any, **kwargs: Any) -> None:
             assert_active()
-            publish(*args)
+            publish(*args, **kwargs)
 
         monkeypatch.setattr(backend, "_commit_point", observe_publication)
         assert app.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2025}).rows == (
@@ -1162,6 +1162,43 @@ def test_lost_response_replays_one_complete_delta_commit(
         {"author": 1, "edge": 1, "name": "Graph"},
         {"author": 3, "edge": 2, "name": "Other"},
     )
+
+
+@pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
+@pytest.mark.parametrize("incremental", [False, True])
+def test_delta_current_receipt_reuses_fresh_snapshot_and_observes_another_replica(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+    incremental: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from grapharrow.storage.delta import DeltaStorageBackend
+
+    path, settings = delta_database
+    settings = settings.model_copy(update={"delta_incremental_refresh_enabled": incremental})
+    observer = build_application(path, settings=settings)
+    writer = TestClient(create_rest_app(path, settings=settings))
+    backend = observer.storage_backend
+    assert isinstance(backend, DeltaStorageBackend)
+    graph = observer.use_cases.graph
+    key_hash = sha256(b"published-by-writer").hexdigest()
+    initial, receipt = graph.idempotency_base(key_hash)
+    assert receipt is None
+
+    def unexpected_reopen() -> None:
+        pytest.fail("A fresh pinned snapshot should be reused for the receipt lookup.")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(backend, "_try_open", unexpected_reopen)
+        assert graph.idempotency_base(key_hash) == (initial, None)
+
+    committed = _post(writer, "Elsewhere", "published-by-writer")
+    assert committed.status_code == 200
+    current, receipt = graph.idempotency_base(key_hash)
+    assert current.snapshot_id.value == initial.snapshot_id.value + 1
+    assert receipt is not None and receipt.response_json.encode() == committed.content
+    with monkeypatch.context() as patch:
+        patch.setattr(backend, "_try_open", unexpected_reopen)
+        assert graph.idempotency_base(key_hash) == (current, receipt)
 
 
 def _write_until_killed(path: str, settings: GraphArrowSettings, key: str) -> None:
@@ -1538,8 +1575,11 @@ def _active_edge_files(table: Any) -> set[str]:
 
 
 @pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
+@pytest.mark.parametrize("idempotent", [False, True])
 def test_delta_point_set_reads_and_rewrites_only_its_range(
-    delta_database: tuple[str | Path, GraphArrowSettings], monkeypatch: pytest.MonkeyPatch
+    delta_database: tuple[str | Path, GraphArrowSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    idempotent: bool,
 ) -> None:
     from deltalake import DeltaTable
 
@@ -1556,10 +1596,10 @@ def test_delta_point_set_reads_and_rewrites_only_its_range(
     partition = delta._partition
     edge_reads = []
 
-    def observe(table: Any, kind: str, columns: list[str], expression: object = None) -> Any:
+    def observe(table: Any, kind: str, columns: list[str], *args: Any, **kwargs: Any) -> Any:
         if kind.startswith("edges"):
             edge_reads.append(kind)
-        return partition(table, kind, columns, expression)
+        return partition(table, kind, columns, *args, **kwargs)
 
     def unexpected_load(*_: object, **__: object) -> Any:
         pytest.fail("A point SET should not load or decode all canonical records.")
@@ -1567,9 +1607,18 @@ def test_delta_point_set_reads_and_rewrites_only_its_range(
     with monkeypatch.context() as patch:
         patch.setattr(delta, "_partition", observe)
         patch.setattr(app.use_cases.graph, "load_state", unexpected_load)
-        assert app.use_cases.cypher.execute(SET_EDGE, {"id": 3, "since": 2025}).rows == (
-            {"since": 2025},
-        )
+        parameters = {"id": 3, "since": 2025}
+        if idempotent:
+            response = app.use_cases.cypher.execute_idempotent_write(
+                SET_EDGE,
+                parameters,
+                key_hash=sha256(b"one-range").hexdigest(),
+                request_hash=sha256(b"one-range-request").hexdigest(),
+                encode_response=lambda result: orjson.dumps(result.rows).decode(),
+            )
+            assert orjson.loads(response) == [{"since": 2025}]
+        else:
+            assert app.use_cases.cypher.execute(SET_EDGE, parameters).rows == ({"since": 2025},)
     current = app.storage_backend.capture_snapshot()
     after = _active_edge_files(DeltaTable(uri, storage_options=options))
     assert current.snapshot_id.value == pinned.snapshot_id.value + 1
@@ -1927,6 +1976,78 @@ def test_keyed_point_set_replays_an_unchanged_or_empty_result(
 
 
 @pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
+@pytest.mark.parametrize("entity", ["node", "edge"])
+def test_delta_unchanged_set_commits_only_the_receipt(
+    delta_database: tuple[str | Path, GraphArrowSettings], entity: str
+) -> None:
+    from deltalake import DeltaTable
+
+    from grapharrow.storage.delta import _storage_options
+
+    path, settings = delta_database
+    app = build_application(path, settings=settings)
+    app.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    before = app.storage_backend.capture_snapshot()
+    uri = str(app.layout.delta_dir)
+    options = _storage_options(path, settings)
+    files = set(DeltaTable(uri, storage_options=options).file_uris())
+    query, params, rows = (
+        (SET_EDGE, {"id": 1, "since": 2020}, [{"since": 2020}])
+        if entity == "edge"
+        else (
+            "MATCH (n:Author) WHERE id(n)=$id SET n.name=$name RETURN n.name AS name",
+            {"id": 1, "name": "Graph"},
+            [{"name": "Graph"}],
+        )
+    )
+    client = TestClient(create_rest_app(path, settings=settings))
+    payload = {"query": query, "params": params}
+    headers = {"Idempotency-Key": "receipt-only"}
+    response = client.post("/v1/query", json=payload, headers=headers)
+    assert response.status_code == 200 and response.json()["data"]["rows"] == rows
+    after = app.storage_backend.capture_snapshot()
+    assert after.snapshot_id.value == before.snapshot_id.value + 1
+    current_files = set(DeltaTable(uri, storage_options=options).file_uris())
+    assert files < current_files and len(current_files - files) == 1
+    assert "kind=receipt-" in next(iter(current_files - files))
+    assert client.post("/v1/query", json=payload, headers=headers).content == response.content
+    assert app.storage_backend.capture_snapshot() == after
+
+
+@pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
+def test_delta_receipt_only_set_rejects_a_changed_base(
+    delta_database: tuple[str | Path, GraphArrowSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from grapharrow.storage.delta import DeltaStorageBackend
+
+    path, settings = delta_database
+    winner = build_application(path, settings=settings)
+    winner.use_cases.cypher.execute(CREATE, {"name": "Graph"})
+    before = winner.storage_backend.capture_snapshot()
+    client = TestClient(create_rest_app(path, settings=settings))
+    original = DeltaStorageBackend._commit_receipt
+
+    def interleave(backend: Any, snapshot: SnapshotId, receipt: IdempotencyReceipt) -> None:
+        winner.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2026})
+        original(backend, snapshot, receipt)
+
+    payload = {"query": SET_EDGE, "params": {"id": 1, "since": 2020}}
+    headers = {"Idempotency-Key": "stale-noop"}
+    with monkeypatch.context() as patch:
+        patch.setattr(DeltaStorageBackend, "_commit_receipt", interleave)
+        conflict = client.post("/v1/query", json=payload, headers=headers)
+    assert conflict.status_code == 409 and conflict.json()["error"]["code"] == "WRITE_CONFLICT"
+    key = sha256(b"stale-noop").hexdigest()
+    current, receipt = winner.use_cases.graph.idempotency_base(key)
+    assert current.snapshot_id.value == before.snapshot_id.value + 1 and receipt is None
+    assert winner.use_cases.graph.load_state().edges[0].properties == {"since": 2026}
+
+    retry = client.post("/v1/query", json=payload, headers=headers)
+    assert retry.status_code == 200 and retry.json()["data"]["rows"] == [{"since": 2020}]
+    assert winner.use_cases.graph.load_state().edges[0].properties == {"since": 2020}
+
+
+@pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
 def test_delta_point_writes_reuse_a_writer_owned_handle(
     delta_database: tuple[str | Path, GraphArrowSettings],
 ) -> None:
@@ -1947,15 +2068,19 @@ def test_delta_point_writes_reuse_a_writer_owned_handle(
         assert app.use_cases.graph.load_state().edges[0].properties == {"since": 2026}
 
 
-@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+@pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
 @pytest.mark.parametrize("reported_conflict", [False, True])
+@pytest.mark.parametrize("probe_limit", [1, 8])
 def test_delta_finds_rebased_commit_after_lost_acknowledgment(
     delta_database: tuple[str | Path, GraphArrowSettings],
     monkeypatch: pytest.MonkeyPatch,
     reported_conflict: bool,
+    probe_limit: int,
 ) -> None:
     from deltalake import DeltaTable
     from deltalake.exceptions import CommitFailedError
+
+    from grapharrow.storage import delta
 
     path, settings = delta_database
     settings = settings.model_copy(update={"edge_parquet_range_size": 2})
@@ -1969,22 +2094,36 @@ def test_delta_finds_rebased_commit_after_lost_acknowledgment(
     base = first.storage_backend.capture_snapshot()
     assert base.idempotency_receipt is not None
     original = DeltaTable.update
+    reopen = first.storage_backend._require_table
+    recovery_reopens = []
+    recovering = False
+
+    def observe_open(snapshot_id: SnapshotId | None) -> Any:
+        if recovering and snapshot_id is None:
+            recovery_reopens.append(snapshot_id)
+        return reopen(snapshot_id)
 
     def lose_acknowledgment(table: Any, **kwargs: Any) -> Any:
+        nonlocal recovering
         metrics = original(table, **kwargs)
         if "edge_id = 1)" in kwargs["predicate"]:
             second.use_cases.cypher.execute(SET_EDGE, {"id": 3, "since": 2027})
+            recovering = True
             if reported_conflict:
                 raise CommitFailedError("A retry encountered the already published commit.")
             raise OSError("The write succeeded but the connection was lost.")
         return metrics
 
     monkeypatch.setattr(DeltaTable, "update", lose_acknowledgment)
+    monkeypatch.setattr(delta, "_POINT_RECOVERY_LOG_PROBES", probe_limit)
+    monkeypatch.setattr(first.storage_backend, "_require_table", observe_open)
     with first.storage_backend.edit_edge_properties_by_id(
         edge_id=1, rel_type="WROTE", properties={"since": 2025}
     ) as pending:
         assert pending is not None and pending[0] is not None
         second.use_cases.cypher.execute(SET_EDGE, {"id": 3, "since": 2026})
+    assert len(recovery_reopens) == (1 if probe_limit == 1 else 0)
+    recovering = False
     state = first.use_cases.graph.load_state()
     assert state.snapshot.snapshot_id.value == base.snapshot_id.value + 3
     assert state.snapshot.idempotency_receipt is None
