@@ -19,11 +19,15 @@ _TableKey: TypeAlias = tuple[
     Literal[
         "nodes",
         "edges",
+        "edge_topology",
         "node_properties",
+        "ana_entity_search",
         "edge_properties",
         "edge_endpoints",
         "edge_range",
         "edge_range_group",
+        "edge_topology_range",
+        "edge_topology_range_group",
         "edge_range_properties",
     ],
     tuple[DatasetFile, ...],
@@ -58,6 +62,17 @@ class SnapshotTableCache:
         self._loading: dict[_TableKey, _Load] = {}
         self._active_loads = 0
         self._loader = local()
+
+    def project_cached(self, key: _TableKey, columns: list[str]) -> pa.Table | None:
+        """Project an already cached table without triggering a full load."""
+        if not self.max_bytes:
+            return None
+        with self._ready:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            self._entries.move_to_end(key)
+            return entry.table.select(columns)
 
     @contextmanager
     def borrow(self, key: _TableKey, load: Callable[[], pa.Table]) -> Iterator[pa.Table]:

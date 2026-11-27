@@ -41,6 +41,7 @@ EDGE_SCHEMA = pa.schema(
         ("properties_json", pa.string()),
     ]
 )
+EDGE_TOPOLOGY_SCHEMA = EDGE_SCHEMA.remove(EDGE_SCHEMA.get_field_index("properties_json"))
 
 NODE_LABEL_SCHEMA = pa.schema([("node_id", pa.int64())])
 
@@ -308,13 +309,19 @@ class GraphRepository:
             schema=NODE_SCHEMA,
         )
 
-    def load_edge_table(self, files: tuple[DatasetFile, ...]) -> pa.Table:
+    def load_edge_table(
+        self, files: tuple[DatasetFile, ...], *, topology_only: bool = False
+    ) -> pa.Table:
         """Load edge tables referenced by ``files`` into one Arrow table."""
 
         return self._parquet.read_dataset_table(
             [self._absolute_location(dataset_file.path) for dataset_file in files],
-            schema=EDGE_SCHEMA,
+            schema=EDGE_TOPOLOGY_SCHEMA if topology_only else EDGE_SCHEMA,
         )
+
+    @staticmethod
+    def edge_property_sources(files: tuple[DatasetFile, ...]) -> None:
+        return None
 
     def load_node_label_table(self, files: tuple[DatasetFile, ...]) -> pa.Table:
         """Load node label index tables referenced by ``files`` into one Arrow table."""

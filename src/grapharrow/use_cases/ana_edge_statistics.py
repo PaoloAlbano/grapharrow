@@ -1,9 +1,9 @@
-"""Reuse ANA relationship property statistics across local snapshots."""
+"""Reuse ANA relationship property statistics across snapshots."""
 
 from __future__ import annotations
 
 import json
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Iterable, Iterator
 from contextlib import suppress
 from hashlib import sha256
@@ -16,6 +16,8 @@ import pyarrow.compute as pc  # type: ignore[import-untyped]
 from grapharrow.adapters.filesystem import FileSystemAdapter
 from grapharrow.core import property_codec
 from grapharrow.core.temporal import Duration, Instant
+from grapharrow.domain import DatasetFile
+from grapharrow.storage.contracts import EdgePropertySource
 from grapharrow.use_cases.ana_resources import retained_size
 
 # Bump when the persisted statistics or their meaning changes.
@@ -42,7 +44,7 @@ class _RangeEntry(TypedDict):
 
 
 class EdgePropertyStatisticsCache:
-    """Reuse statistics for a bounded set of verified edge ID ranges."""
+    """Reuse statistics for a bounded set of edge ranges."""
 
     def __init__(
         self,
@@ -54,14 +56,46 @@ class EdgePropertyStatisticsCache:
         self._disk = disk
         self._max_bytes = max_bytes
         self._memory: dict[str, _RangeEntry] | None = {} if retain_in_memory else None
+        self._files: OrderedDict[tuple[DatasetFile, ...], tuple[_RangeStats, int]] = OrderedDict()
+        self._file_bytes = 0
 
     def discover(self, edges: pa.Table) -> tuple[list[str], list[dict[str, Any]]]:
         if not edges.num_rows:
             return [], []
         if not self._max_bytes or (self._disk is None and self._memory is None):
             return _summarize((_collect_properties(edges),))
+        self._files.clear()
+        self._file_bytes = 0
         previous = self._load(self._disk[0]) if self._disk is not None else self._memory or {}
         return _summarize(self._scan_ranges(edges, previous))
+
+    def discover_files(
+        self, sources: Iterable[EdgePropertySource]
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """Load properties only for ranges whose immutable file keys missed."""
+        if not self._max_bytes:
+            return _summarize(_collect_properties(load()) for _, load in sources)
+        if self._memory is not None:
+            self._memory.clear()
+        return _summarize(self._scan_files(sources))
+
+    def _scan_files(self, sources: Iterable[EdgePropertySource]) -> Iterator[_RangeStats]:
+        for files, load in sources:
+            entry = self._files.get(files)
+            if entry is not None:
+                self._files.move_to_end(files)
+                yield entry[0]
+                continue
+            stats = _collect_properties(load())
+            if files:
+                size = retained_size((files, stats)) + 128
+                if size <= self._max_bytes:
+                    while self._file_bytes + size > self._max_bytes:
+                        _, (_, released) = self._files.popitem(last=False)
+                        self._file_bytes -= released
+                    self._files[files] = stats, size
+                    self._file_bytes += size
+            yield stats
 
     def _load(self, path: Path) -> dict[str, _RangeEntry]:
         with suppress(OSError, ValueError, RecursionError):

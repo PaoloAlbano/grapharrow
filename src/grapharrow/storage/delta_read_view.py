@@ -54,7 +54,7 @@ class DeltaReadView:
             metadata.description,
             schema,
             delta_schema.to_json(),
-            actions.select(columns),
+            actions.select([*columns, "size_bytes"]),
             {kind: tuple(files) for kind, files in grouped.items()},
             uri.rstrip("/"),
             options,

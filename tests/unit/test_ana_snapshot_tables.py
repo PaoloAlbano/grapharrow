@@ -60,9 +60,13 @@ def test_concurrent_ana_workflows_share_canonical_and_label_tables(
     with ExitStack() as stack, ThreadPoolExecutor(max_workers=4) as pool:
         workflows = [stack.enter_context(backend) for backend in pool.map(open_workflow, range(4))]
         first = workflows[0]
-        assert calls == dict.fromkeys(["nodes", "edges", "lookup", *first._property_tables], 1)
+        assert calls == dict.fromkeys(["nodes", "edges", "lookup"], 1)
+        assert all(not backend._property_tables for backend in workflows)
+        for backend in workflows:
+            assert backend._property_table("Person") is not None
+        assert calls["Person"] == 1
+        assert calls["Company"] == 0
         assert first._property_tables["Person"].num_rows == 6
-        assert first._property_tables["Company"].num_rows == 4
         assert all(backend._state.node_table is first._state.node_table for backend in workflows)
         assert all(backend._state.edge_table is first._state.edge_table for backend in workflows)
         assert all(backend._node_lookup is first._node_lookup for backend in workflows)
@@ -94,9 +98,10 @@ def test_ana_projection_reuse_tracks_immutable_files_across_publication(tmp_path
             assert old._state.node_table is not current._state.node_table
             assert old._node_lookup is not current._node_lookup
             assert old._state.edge_table is current._state.edge_table
-            assert old._property_tables["Person"] is current._property_tables["Person"]
-            assert "Project" not in old._property_tables
-            assert current._property_tables["Project"].num_rows == 1
+            assert old._property_table("Person") is current._property_table("Person")
+            assert old._property_table("Project") is None
+            project = current._property_table("Project")
+            assert project is not None and project.num_rows == 1
         app.use_cases.admin.compact()
         app.use_cases.admin.vacuum()
         assert fetch(old, "count_nodes", {"label": "Person"})["rows"] == [[6]]
@@ -175,8 +180,10 @@ def test_failed_ana_open_releases_table_borrows(
     with monkeypatch.context() as patch:
         if failure == "read":
             patch.setattr(app.repositories.graph, "load_node_property_table", fail)
-            with pytest.raises(OSError, match="Projection read failed"):
-                GraphArrowAgentBackend(app)
+            with GraphArrowAgentBackend(app) as backend:
+                with pytest.raises(OSError, match="Projection read failed"):
+                    backend.call("node_search", {"label": "Person", "value": "Alice"})
+                assert not backend._property_tables
         else:
             with pytest.raises(AnaQuotaExceeded, match="server byte capacity"):
                 GraphArrowAgentBackend(app, resource_budget=budget)
@@ -194,8 +201,36 @@ def test_ana_falls_back_when_tables_exceed_cache_budget(tmp_path: Path) -> None:
     cache.max_bytes = 1
     with GraphArrowAgentBackend(app) as first, GraphArrowAgentBackend(app) as second:
         assert first._state.node_table is not second._state.node_table
-        assert first._property_tables["Person"] is not second._property_tables["Person"]
+        assert first._property_table("Person") is not second._property_table("Person")
         assert fetch(first, "count_nodes", {"label": "Person"}) == fetch(
             second, "count_nodes", {"label": "Person"}
         )
     assert cache.used_bytes == 0
+
+
+def test_failed_ana_tool_releases_its_new_lazy_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = load_grapharrow(tmp_path / "failed-tool")
+    budget = AnaResourceBudget()
+    cache = app.use_cases.graph.snapshot_tables
+    with GraphArrowAgentBackend(app, resource_budget=budget) as backend:
+        baseline = budget.used_bytes
+
+        def fail(*args: object, **kwargs: object) -> None:
+            assert "Person" in backend._property_tables
+            raise AnaQuotaExceeded("response quota")
+
+        args = {"label": "Person", "value": "Alice"}
+        with monkeypatch.context() as patch:
+            patch.setattr(backend._resources, "finalize", fail)
+            with pytest.raises(AnaQuotaExceeded, match="response quota"):
+                backend.call("node_search", args)
+        assert not backend._property_tables and budget.used_bytes == baseline
+        assert all(
+            entry.readers == 0
+            for key, entry in cache._entries.items()
+            if key[0] == "node_properties"
+        )
+        assert fetch(backend, "node_search", args)["rows"] == [["Alice"]]
+    assert budget.used_bytes == 0

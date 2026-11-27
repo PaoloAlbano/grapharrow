@@ -131,6 +131,7 @@ class AnaResources:
         if self._changes is not None:
             raise RuntimeError("An ANA resource call is already in progress")
         before_bytes, before_rows, before_handles = self.bytes, self._rows, self._handle_bytes
+        before_snapshot_bytes = self.snapshot_bytes
         changes: dict[str, tuple[int, int, int] | None] = {}
         self._changes = changes
         try:
@@ -142,6 +143,7 @@ class AnaResources:
                 else:
                     self.handles[key] = previous
             self._rows, self._handle_bytes = before_rows, before_handles
+            self.snapshot_bytes = before_snapshot_bytes
             # Restore an existing admission without rechecking a changed workflow limit.
             self.budget.adjust(before_bytes - self.bytes)
             self.bytes = before_bytes
@@ -172,16 +174,20 @@ class AnaResources:
 
     def reserve_snapshot_capacity(self, size: int) -> bool:
         """Reserve optional acceleration during setup without rejecting the base view."""
-        if type(size) is not int or size < 0:
-            raise ValueError("Snapshot capacity must be a non-negative integer")
         if self._changes is not None:
             raise RuntimeError("Snapshot capacity must be reserved before tool calls")
         try:
-            self._set_bytes(self.bytes + size)
+            self.charge_snapshot(size)
         except AnaQuotaExceeded:
             return False
-        self.snapshot_bytes += size
         return True
+
+    def charge_snapshot(self, size: int) -> None:
+        """Charge state retained for the life of the workflow."""
+        if type(size) is not int or size < 0:
+            raise ValueError("Snapshot capacity must be a non-negative integer")
+        self._set_bytes(self.bytes + size)
+        self.snapshot_bytes += size
 
     @property
     def usage(self) -> dict[str, int]:

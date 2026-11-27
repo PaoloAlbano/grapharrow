@@ -11,7 +11,9 @@ from grapharrow.ana.values import _int_arg, _validate_membership_operand
 
 
 class SchemaTools:
-    _schema: dict[str, Any]
+    @property
+    def _schema(self) -> dict[str, Any]:
+        raise NotImplementedError
 
     def _label_counts(self, labels: list[str]) -> dict[str, int]:
         raise NotImplementedError

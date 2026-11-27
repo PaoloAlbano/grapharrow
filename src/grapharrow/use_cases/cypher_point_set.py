@@ -11,6 +11,7 @@ from grapharrow.domain.records import EdgeRecord, NodeRecord
 from grapharrow.domain.snapshot import IdempotencyReceipt
 from grapharrow.storage.models import PointWriteReceipt
 from grapharrow.use_cases import cypher as core
+from grapharrow.use_cases.cypher_expression import Expression, property_value, public_value
 from grapharrow.use_cases.graph import GraphStateUseCase, QueryResult
 
 if TYPE_CHECKING:
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
         CypherQueryUseCase,
         _IdempotentWrite,
     )
+    from grapharrow.use_cases.cypher_write import WriteQuery
 
 
 def try_point_set(
@@ -109,6 +111,117 @@ def try_point_set(
                 skip=query.skip,
                 limit=query.limit,
             )
+    return result
+
+
+def try_point_set_batch(
+    executor: CypherQueryUseCase,
+    query: WriteQuery,
+    *,
+    idempotency: _IdempotentWrite | None = None,
+) -> QueryResult | None:
+    """Handle a parameterized UNWIND of independent relationship ID edits."""
+    from grapharrow.use_cases.cypher_pipeline import MatchStage, ProjectionStage, UnwindStage
+    from grapharrow.use_cases.cypher_write import SetStage
+
+    graph = executor._graph_service
+    if not isinstance(graph, GraphStateUseCase) or len(query.branches) != 1:
+        return None
+    stages = query.branches[0].stages
+    if len(stages) not in (3, 4):
+        return None
+    unwind, match, setter = stages[:3]
+    if (
+        not isinstance(unwind, UnwindStage)
+        or unwind.expression.kind != "literal"
+        or not unwind.expression.parameter
+        or type(unwind.expression.value) is not list
+        or not isinstance(match, MatchStage)
+        or match.optional
+        or match.paths
+        or len(match.patterns) != 1
+        or not isinstance(setter, SetStage)
+        or len(setter.items) != 1
+    ):
+        return None
+    edge = _single_edge(match.patterns[0])
+    if edge is None or edge.variable == unwind.variable:
+        return None
+    binding = Expression("variable", edge.variable)
+    source = Expression("variable", unwind.variable)
+    predicate = match.predicate
+    if predicate is None or predicate.kind != "compare" or predicate.value != ("=",):
+        return None
+    identifier, key = predicate.arguments
+    if identifier != Expression("function", "id", (binding,)) or (
+        key.kind != "property" or key.arguments != (source,)
+    ):
+        return None
+    item = setter.items[0]
+    value = item.value
+    if (
+        item.target != edge.variable
+        or item.mode != "property"
+        or value is None
+        or value.kind != "property"
+        or value.arguments != (source,)
+    ):
+        return None
+    returned: tuple[tuple[str, str], ...] = ()
+    if len(stages) == 4:
+        projection = stages[3]
+        if (
+            not isinstance(projection, ProjectionStage)
+            or projection.globals
+            or projection.distinct
+            or projection.predicate is not None
+            or projection.ordering
+            or projection.skip is not None
+            or projection.limit is not None
+            or any(e.kind != "property" or e.arguments != (binding,) for _, e in projection.items)
+        ):
+            return None
+        returned = tuple((name, e.value) for name, e in projection.items)
+    updates: dict[int, object] = {}
+    for row in unwind.expression.value:
+        if type(row) is not dict:
+            return None
+        edge_id, payload = row.get(key.value), row.get(value.value)
+        if (
+            type(edge_id) is not int
+            or not 0 < edge_id < 2**63
+            or edge_id in updates
+            or type(payload) not in (str, int, bool, float)
+        ):
+            return None
+        updates[edge_id] = payload
+    if not updates:
+        return None
+    result: QueryResult
+    receipt = None
+    if idempotency is not None:
+
+        def prepare_receipt() -> IdempotencyReceipt:
+            return idempotency.prepare_receipt(result)
+
+        receipt = PointWriteReceipt(idempotency.base, prepare_receipt)
+    with graph.edit_edge_property_batch(
+        property_name=item.key,
+        updates=updates,
+        rel_type=edge.rel_type,
+        receipt=receipt,
+    ) as edited:
+        if edited is None:
+            return None
+        rows = (
+            tuple(
+                {name: public_value(property_value(record, field)) for name, field in returned}
+                for record in edited
+            )
+            if returned
+            else ()
+        )
+        result = QueryResult(query.columns, rows)
     return result
 
 

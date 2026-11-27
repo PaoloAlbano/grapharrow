@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
 from functools import partial
@@ -23,6 +23,7 @@ from grapharrow.repositories.graph import (
     _EDGE_ENDPOINT_FIELDS,
     ADJACENCY_BY_SOURCE_SCHEMA,
     EDGE_SCHEMA,
+    EDGE_TOPOLOGY_SCHEMA,
     NODE_LABEL_SCHEMA,
     NODE_SCHEMA,
     _edge_property_schema,
@@ -31,9 +32,11 @@ from grapharrow.repositories.graph import (
     edge_records_from_table,
     node_records_from_table,
 )
+from grapharrow.storage.contracts import EdgePropertySource
 
 _EDGE_RANGE_GROUP_SIZE = 32
 _MIN_GROUPED_EDGE_RANGES = 4 * _EDGE_RANGE_GROUP_SIZE
+_EDGE_PROPERTY_COLUMNS = ["rel_type", "properties_json"]
 
 
 def dataset_ref(
@@ -103,15 +106,18 @@ class DeltaGraphStore:
             .sort_by([("node_id", "ascending")])
         )
 
-    def load_edge_table(self, files: tuple[DatasetFile, ...]) -> pa.Table:
+    def load_edge_table(
+        self, files: tuple[DatasetFile, ...], *, topology_only: bool = False
+    ) -> pa.Table:
+        schema = EDGE_TOPOLOGY_SCHEMA if topology_only else EDGE_SCHEMA
         if not files:
-            return EDGE_SCHEMA.empty_table()
+            return schema.empty_table()
         snapshot_id = _snapshot_id(files[0])
         ranges = self._edge_ranges(snapshot_id)
         if not ranges:
-            return self._edge_rows(files[0], EDGE_SCHEMA)
+            return self._edge_rows(files[0], schema)
         if len(ranges) < _MIN_GROUPED_EDGE_RANGES or not self._snapshot_tables.max_bytes:
-            return self._load_edge_ranges(snapshot_id, ranges)
+            return self._load_edge_ranges(snapshot_id, ranges, schema)
         with ExitStack() as leases:
             blocks = []
             for start in range(0, len(ranges), _EDGE_RANGE_GROUP_SIZE):
@@ -120,35 +126,71 @@ class DeltaGraphStore:
                 blocks.append(
                     leases.enter_context(
                         self._snapshot_tables.borrow(
-                            ("edge_range_group", key),
-                            partial(self._load_edge_ranges, snapshot_id, group),
+                            (
+                                "edge_topology_range_group"
+                                if topology_only
+                                else "edge_range_group",
+                                key,
+                            ),
+                            partial(self._load_edge_ranges, snapshot_id, group, schema),
                         )
                     )
                 )
             return pa.concat_tables(blocks)
 
     def _load_edge_ranges(
-        self, snapshot_id: SnapshotId, ranges: tuple[DeltaEdgeRange, ...]
+        self, snapshot_id: SnapshotId, ranges: tuple[DeltaEdgeRange, ...], schema: pa.Schema
     ) -> pa.Table:
         with ExitStack() as leases:
             return pa.concat_tables(
                 [
-                    leases.enter_context(self._borrow_edge_range(snapshot_id, item))
+                    leases.enter_context(self._borrow_edge_range(snapshot_id, item, schema))
                     for item in ranges
                 ]
             )
 
+    def edge_property_sources(
+        self, files: tuple[DatasetFile, ...]
+    ) -> Iterable[EdgePropertySource] | None:
+        if not files:
+            return ()
+        snapshot_id = _snapshot_id(files[0])
+        ranges = self._edge_ranges(snapshot_id)
+        if not ranges:
+            return None
+        return (
+            (item.files, partial(self._read_range_properties, snapshot_id, item)) for item in ranges
+        )
+
+    def _read_range_properties(self, snapshot_id: SnapshotId, item: DeltaEdgeRange) -> pa.Table:
+        cached = self._snapshot_tables.project_cached(
+            ("edge_range", item.files), _EDGE_PROPERTY_COLUMNS
+        )
+        if cached is not None:
+            return cached
+        return self._read_partition(snapshot_id, item.partition, _EDGE_PROPERTY_COLUMNS, None)
+
     def _borrow_edge_range(
-        self, snapshot_id: SnapshotId, item: DeltaEdgeRange
+        self, snapshot_id: SnapshotId, item: DeltaEdgeRange, schema: pa.Schema = EDGE_SCHEMA
     ) -> AbstractContextManager[pa.Table]:
+        topology_only = schema == EDGE_TOPOLOGY_SCHEMA
+
         def load() -> pa.Table:
+            if topology_only:
+                cached = self._snapshot_tables.project_cached(
+                    ("edge_range", item.files), schema.names
+                )
+                if cached is not None:
+                    return cached
             return (
-                self._read_partition(snapshot_id, item.partition, EDGE_SCHEMA.names, None)
-                .cast(EDGE_SCHEMA)
+                self._read_partition(snapshot_id, item.partition, schema.names, None)
+                .cast(schema)
                 .sort_by([("edge_id", "ascending")])
             )
 
-        return self._snapshot_tables.borrow(("edge_range", item.files), load)
+        return self._snapshot_tables.borrow(
+            ("edge_topology_range" if topology_only else "edge_range", item.files), load
+        )
 
     def _edge_rows(self, file: DatasetFile, schema: pa.Schema) -> pa.Table:
         rel_type = _name(file)

@@ -267,10 +267,13 @@ def test_projected_search_uses_canonical_labels_and_order(backend: Any) -> None:
 
 
 @pytest.mark.parametrize("direction", ["out", "in", "both"])
+@pytest.mark.parametrize("indexed", [False, True])
 def test_limited_expand_of_hubs_preserves_rows_and_full_union_count(
-    tmp_path: Path, direction: str
+    tmp_path: Path, direction: str, indexed: bool
 ) -> None:
     app = build_application(tmp_path / "hub-expand")
+    if not indexed:
+        app.settings.ana_adjacency_index_max_bytes_per_session = 0
     _, hubs = app.use_cases.graph.create_nodes_bulk(
         table=pa.table({"name": [f"hub-{index}" for index in range(8)]}),
         default_labels=("Hub",),

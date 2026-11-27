@@ -7,11 +7,11 @@ from collections.abc import Generator, Iterator
 from concurrent.futures import Future
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from copy import deepcopy
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from functools import cached_property
 from pathlib import Path
-from threading import Lock, RLock
+from threading import Lock, RLock, local
 from time import monotonic_ns, sleep
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -84,6 +84,8 @@ _MANAGED_FORMAT = "grapharrow-delta-managed-v1"
 _POINT_COMMIT_ID = "grapharrowPointCommitId"
 _POINT_COMMIT_RETRIES = 10
 _POINT_RECOVERY_LOG_PROBES = 8
+_RECEIPT_REUSE_MAX_ROWS = 1024
+_RECEIPT_REUSE_MAX_PARQUET_BYTES = 1024 * 1024
 _DEFAULT_EDGE_RANGE_SIZE = 8192
 _HEAD_PROBE_BATCH_SECONDS = 0.001
 # The string interval contains exactly the partition names with the 'edges-' prefix.
@@ -104,6 +106,18 @@ _CONFLICT = "Database changed since this write began. Retry in a new transaction
 _ReadSource = DeltaTable | DeltaReadView
 
 
+@dataclass(slots=True)
+class _ReceiptBucket:
+    snapshot_id: SnapshotId
+    key_hash: str
+    rows: pa.Table
+
+
+@dataclass(slots=True)
+class _WriterScope:
+    receipt_bucket: _ReceiptBucket | None = None
+
+
 class _DeltaWriter:
     """Serialize operations within one application. Delta arbitrates across replicas."""
 
@@ -111,11 +125,24 @@ class _DeltaWriter:
 
     def __init__(self) -> None:
         self._lock = RLock()
+        self._local = local()
+
+    @property
+    def scope(self) -> _WriterScope | None:
+        scope: _WriterScope | None = getattr(self._local, "scope", None)
+        return scope
 
     @contextmanager
     def hold(self) -> Iterator[None]:
         with self._lock:
-            yield
+            if self.scope is not None:
+                yield
+                return
+            self._local.scope = _WriterScope()
+            try:
+                yield
+            finally:
+                del self._local.scope
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,16 +203,39 @@ class _ReadVersion:
     metadata_file: tuple[str, str | None, str] | None
 
     @cached_property
-    def graph_files(self) -> dict[str, tuple[DatasetFile, ...]]:
+    def actions(self) -> pa.Table:
         try:
             actions = (
                 self.table.actions
                 if isinstance(self.table, DeltaReadView)
                 else pa.table(self.table.get_add_actions(flatten=True))
             )
-            rows = actions.select(["path", "partition.kind", "num_records"]).to_pylist()
+            columns = ["path", "partition.kind", "num_records"]
+            if "size_bytes" in actions.column_names:
+                columns.append("size_bytes")
+            return actions.select(columns)
         except (DeltaError, pa.ArrowException, OSError) as exc:
             raise StorageError("Could not read the active Delta graph files.") from exc
+
+    @cached_property
+    def receipt_buckets(self) -> dict[str, tuple[int, int]] | None:
+        columns = ["partition.kind", "num_records", "size_bytes"]
+        if not set(columns).issubset(self.actions.column_names):
+            return None
+        sizes: dict[str, tuple[int, int]] = {}
+        actions = self.actions.select(columns)
+        receipts = actions.filter(pc.starts_with(actions["partition.kind"], "receipt-"))
+        for row in receipts.to_pylist():
+            kind, count, size = row["partition.kind"], row["num_records"], row["size_bytes"]
+            if count is None or size is None:
+                return None
+            seen_count, seen_size = sizes.get(kind, (0, 0))
+            sizes[kind] = seen_count + count, seen_size + size
+        return sizes
+
+    @cached_property
+    def graph_files(self) -> dict[str, tuple[DatasetFile, ...]]:
+        rows = self.actions.select(["path", "partition.kind", "num_records"]).to_pylist()
         files: dict[str, list[DatasetFile]] = {}
         for row in rows:
             kind = row["partition.kind"]
@@ -211,6 +261,14 @@ class _ReadVersion:
             for kind, files in self.graph_files.items()
             if kind.startswith("edges-")
         )
+
+
+@dataclass(slots=True)
+class _ReadPin:
+    table: _ReadSource | None
+    description: _ReadVersion | None
+    readers: int = 1
+    load_lock: Any = field(default_factory=Lock)
 
 
 class DeltaStorageBackend:
@@ -246,6 +304,8 @@ class DeltaStorageBackend:
         self._read_version: _ReadVersion | None = None
         self._read_refresh_observation: tuple[SnapshotManifest, int] | None = None
         self._read_version_lock = Lock()
+        self._read_pins: dict[SnapshotId, _ReadPin] = {}
+        self._read_pins_lock = Lock()
         self._read_refresh_lock = Lock()
         self._head_probe_lock = Lock()
         self._queued_head_probes: dict[SnapshotId, Future[bool]] = {}
@@ -319,9 +379,32 @@ class DeltaStorageBackend:
             return _partition(self._read_table(snapshot_id), kind, columns, expression)
 
     def pin_snapshot(self, snapshot_id: SnapshotId) -> AbstractContextManager[None]:
+        return self._pin_read_snapshot(snapshot_id)
+
+    @contextmanager
+    def _pin_read_snapshot(
+        self, snapshot_id: SnapshotId, source: _ReadSource | None = None
+    ) -> Iterator[None]:
+        """Keep one reader-owned view until the last overlapping pin releases it."""
         if self._managed is None:
-            self._require_table(snapshot_id)
-        return self._retention.pin(snapshot_id.value) if self._managed else nullcontext()
+            source = self._require_table(snapshot_id)
+        retention = self._retention.pin(snapshot_id.value) if self._managed else nullcontext()
+        with retention:
+            with self._read_pins_lock:
+                pinned = self._read_pins.get(snapshot_id)
+                if pinned is None:
+                    recent = self._recent_read_version(snapshot_id)
+                    pinned = _ReadPin(recent.table if recent is not None else source, recent)
+                    self._read_pins[snapshot_id] = pinned
+                else:
+                    pinned.readers += 1
+            try:
+                yield
+            finally:
+                with self._read_pins_lock:
+                    pinned.readers -= 1
+                    if not pinned.readers:
+                        del self._read_pins[snapshot_id]
 
     @cached_property
     def _retention(self) -> DeltaRetentionCoordinator:
@@ -340,24 +423,50 @@ class DeltaStorageBackend:
         )
 
     def _read_table(self, snapshot_id: SnapshotId) -> _ReadSource:
-        cached = self._read_version
-        if cached is not None and cached.manifest.snapshot_id == snapshot_id:
-            return cached.table
-        return self._require_table(snapshot_id)
+        with self._read_pins_lock:
+            pinned = self._read_pins.get(snapshot_id)
+        if pinned is None:
+            recent = self._recent_read_version(snapshot_id)
+            return recent.table if recent is not None else self._require_table(snapshot_id)
+        if pinned.table is not None:
+            return pinned.table
+        with pinned.load_lock:
+            if pinned.table is None:
+                recent = self._recent_read_version(snapshot_id)
+                table = recent.table if recent is not None else self._require_table(snapshot_id)
+                pinned.description = recent
+                pinned.table = table
+            table = pinned.table
+        return table
+
+    def _recent_read_version(self, snapshot_id: SnapshotId) -> _ReadVersion | None:
+        recent = self._read_version
+        return recent if recent is not None and recent.manifest.snapshot_id == snapshot_id else None
 
     def _describe_read_version(self, table: _ReadSource) -> _ReadVersion:
         with self.pin_snapshot(SnapshotId(table.version() + 1)):
             return self._describe_pinned_read_version(table)
 
     def _describe_pinned_read_version(self, table: _ReadSource) -> _ReadVersion:
-        """Retain only the latest observed version, with a handle used exclusively for reads."""
+        """Reuse immutable metadata for the head or for a live snapshot pin."""
         snapshot_id = SnapshotId(table.version() + 1)
-        cached = self._read_version
-        if cached is not None and cached.manifest.snapshot_id == snapshot_id:
-            return cached
+        recent = self._recent_read_version(snapshot_id)
+        if recent is not None:
+            return recent
+        with self._read_pins_lock:
+            pin = self._read_pins.get(snapshot_id)
+        # A writer can pass its own DeltaTable here. Only describe and reuse the
+        # reader-owned table under this pin.
+        pinned = pin if pin is not None and pin.table is table else None
+        if pinned is not None and pinned.description is not None:
+            return pinned.description
         with self._read_version_lock:
+            if pinned is not None and pinned.description is not None:
+                return pinned.description
             cached = self._read_version
             if cached is not None and cached.manifest.snapshot_id == snapshot_id:
+                if pinned is not None:
+                    pinned.description = cached
                 return cached
             metadata_file = self._graph_metadata_file(table) if self._retain_read_version else None
             if (
@@ -372,6 +481,8 @@ class DeltaStorageBackend:
             entry = _ReadVersion(
                 table, self._manifest(table, head, catalog), catalog, head, metadata_file
             )
+            if pinned is not None:
+                pinned.description = entry
             if self._retain_read_version and (
                 cached is None or cached.manifest.snapshot_id.value < snapshot_id.value
             ):
@@ -579,8 +690,9 @@ class DeltaStorageBackend:
             with self.pin_snapshot(source.snapshot_id):
                 yield source
             return
-        with self.pin_snapshot(SnapshotId(source.version() + 1)):
-            yield self._describe_pinned_read_version(source).manifest
+        snapshot_id = SnapshotId(source.version() + 1)
+        with self._pin_read_snapshot(snapshot_id, source):
+            yield self._describe_pinned_read_version(self._read_table(snapshot_id)).manifest
 
     def _open_or_create(self) -> DeltaTable | SnapshotManifest:
         table = self._try_open()
@@ -702,7 +814,40 @@ class DeltaStorageBackend:
     ) -> tuple[SnapshotManifest, IdempotencyReceipt | None]:
         """Reuse the freshness check and read the receipt from the pinned write base."""
         with self.borrow_current_snapshot() as snapshot:
-            return snapshot, _find_receipt(self._read_table(snapshot.snapshot_id), key_hash)
+            table = self._read_table(snapshot.snapshot_id)
+            scope = self._writer.scope
+            if scope is None:
+                return snapshot, _find_receipt(table, key_hash)
+            previous = scope.receipt_bucket
+            scope.receipt_bucket = None
+            # The recheck following a conflict can only replay or raise.
+            if previous is not None and previous.key_hash == key_hash:
+                return snapshot, _find_receipt(table, key_hash)
+            kind = _receipt_partition(key_hash)
+            buckets = self._describe_pinned_read_version(table).receipt_buckets
+            if buckets is None:
+                return snapshot, _find_receipt(table, key_hash)
+            count, size = buckets.get(kind, (0, 0))
+            if count > _RECEIPT_REUSE_MAX_ROWS or size > _RECEIPT_REUSE_MAX_PARQUET_BYTES:
+                return snapshot, _find_receipt(table, key_hash)
+            rows = _partition(table, kind, _RECEIPT_COLUMNS)
+            receipt = _receipt_from_rows(rows.filter(pc.equal(rows["key_hash"], key_hash)))
+            if receipt is None:
+                scope.receipt_bucket = _ReceiptBucket(snapshot.snapshot_id, key_hash, rows)
+            return snapshot, receipt
+
+    def _append_write_receipt(
+        self, table: DeltaTable, kind: str, receipt: IdempotencyReceipt
+    ) -> pa.Table:
+        scope = self._writer.scope
+        bucket = scope.receipt_bucket if scope is not None else None
+        if (
+            bucket is not None
+            and bucket.snapshot_id.value == table.version() + 1
+            and bucket.key_hash == receipt.key_hash
+        ):
+            return _append_receipt(table, kind, receipt, stored=bucket.rows)
+        return _append_receipt(table, kind, receipt)
 
     @writer_locked
     def write(self, catalog: VersionedCatalog, *, base: SnapshotManifest | None = None) -> str:
@@ -792,7 +937,7 @@ class DeltaStorageBackend:
                 edge_table = previous_state.edge_table
             if idempotency_receipt is not None:
                 kind = _receipt_partition(idempotency_receipt.key_hash)
-                partitions[kind] = _append_receipt(base, kind, idempotency_receipt)
+                partitions[kind] = self._append_write_receipt(base, kind, idempotency_receipt)
 
             head = _new_head(
                 len(nodes),
@@ -920,6 +1065,78 @@ class DeltaStorageBackend:
             )
 
     @contextmanager
+    def edit_edge_property_batch(
+        self,
+        *,
+        property_name: str,
+        updates: dict[int, object],
+        rel_type: str | None,
+        receipt: PointWriteReceipt | None = None,
+    ) -> Generator[tuple[EdgeRecord, ...] | None, None, None]:
+        """Stage every touched range once and publish the complete batch atomically."""
+        with self._writer.hold(), self._borrow_point_snapshot(receipt) as snapshot:
+            current = self._describe_pinned_read_version(self._read_table(snapshot.snapshot_id))
+            width = current.head.edge_range_size
+            if not width or current.catalog.constraints or not updates:
+                yield None
+                return
+            ranges: dict[str, list[int]] = {}
+            for edge_id in updates:
+                ranges.setdefault(_edge_partition((edge_id - 1) // width), []).append(edge_id)
+            staged = {}
+            results = {}
+            for kind, ids in ranges.items():
+                table = _partition(current.table, kind, EDGE_SCHEMA.names).cast(EDGE_SCHEMA)
+                positions = pc.index_in(pa.array(ids, type=pa.int64()), value_set=table["edge_id"])
+                if positions.null_count:
+                    yield None
+                    return
+                changed: dict[int, str] = {}
+                for edge in self._graph.edge_records_from_table(table.take(positions)):
+                    properties = {property_name: updates[edge.edge_id]}
+                    if (rel_type is not None and edge.rel_type != rel_type) or (
+                        not _can_patch_properties(edge, properties)
+                    ):
+                        yield None
+                        return
+                    after = replace(edge, properties={**edge.properties, **properties})
+                    results[edge.edge_id] = after
+                    if after != edge:
+                        changed[edge.edge_id] = property_codec.dumps(after.properties)
+                if changed:
+                    matches = pc.index_in(
+                        table["edge_id"], value_set=pa.array(list(changed), type=pa.int64())
+                    )
+                    properties_json = pc.coalesce(
+                        pc.take(pa.array(list(changed.values())), matches), table["properties_json"]
+                    )
+                    staged[kind] = table.set_column(
+                        table.schema.get_field_index("properties_json"),
+                        table.schema.field("properties_json"),
+                        properties_json,
+                    )
+            yield tuple(results[edge_id] for edge_id in updates)
+            prepared = receipt.prepare() if receipt is not None else None
+            if not staged:
+                if prepared is not None:
+                    self._commit_receipt(snapshot.snapshot_id, prepared)
+                return
+            # Match the general batch writer's pinned-base policy, including
+            # ranges read for the result whose rows did not change.
+            with self._point_publication(snapshot.snapshot_id, max_retries=0) as (base, commit):
+                if prepared is not None:
+                    kind = _receipt_partition(prepared.key_hash)
+                    staged[kind] = self._append_write_receipt(base, kind, prepared)
+                kinds = ", ".join(f"'{kind}'" for kind in staged)
+                write_deltalake(
+                    base,
+                    pa.concat_tables([_rows(table, kind) for kind, table in staged.items()]),
+                    mode="overwrite",
+                    predicate=f"kind IN ({kinds})",
+                    commit_properties=commit,
+                )
+
+    @contextmanager
     def edit_node_properties_by_id(
         self,
         *,
@@ -1023,7 +1240,7 @@ class DeltaStorageBackend:
             kind = _receipt_partition(receipt.key_hash)
             write_deltalake(
                 base,
-                _rows(_append_receipt(base, kind, receipt), kind),
+                _rows(self._append_write_receipt(base, kind, receipt), kind),
                 mode="overwrite",
                 predicate=f"kind = '{kind}'",
                 commit_properties=commit,
@@ -1093,7 +1310,10 @@ class DeltaStorageBackend:
         # Overwrite both partitions in one transaction. A competing receipt in the same
         # bucket, including an initially empty bucket, prevents a stale replace and replay.
         data = pa.concat_tables(
-            [_rows(updated, kind), _rows(_append_receipt(base, receipts, receipt), receipts)]
+            [
+                _rows(updated, kind),
+                _rows(self._append_write_receipt(base, receipts, receipt), receipts),
+            ]
         )
         write_deltalake(
             base,
@@ -1410,14 +1630,21 @@ def _receipt_partition(key_hash: str) -> str:
 def _find_receipt(table: _ReadSource, key_hash: str) -> IdempotencyReceipt | None:
     rows = _partition(
         table, _receipt_partition(key_hash), _RECEIPT_COLUMNS, ds.field("key_hash") == key_hash
-    ).to_pylist()
-    if len(rows) > 1:
+    )
+    return _receipt_from_rows(rows)
+
+
+def _receipt_from_rows(rows: pa.Table) -> IdempotencyReceipt | None:
+    if rows.num_rows > 1:
         raise StorageError("Duplicate idempotency receipts in the Delta snapshot.")
-    return IdempotencyReceipt(**rows[0]) if rows else None
+    return IdempotencyReceipt(**rows.to_pylist()[0]) if rows.num_rows else None
 
 
-def _append_receipt(table: DeltaTable, kind: str, receipt: IdempotencyReceipt) -> pa.Table:
-    stored = _partition(table, kind, _RECEIPT_COLUMNS)
+def _append_receipt(
+    table: DeltaTable, kind: str, receipt: IdempotencyReceipt, *, stored: pa.Table | None = None
+) -> pa.Table:
+    if stored is None:
+        stored = _partition(table, kind, _RECEIPT_COLUMNS)
     row = pa.Table.from_pylist(
         [asdict(receipt)], schema=pa.schema([_SCHEMA.field(name) for name in _RECEIPT_COLUMNS])
     )

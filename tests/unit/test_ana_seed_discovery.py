@@ -149,6 +149,41 @@ def test_complex_seed_filters_keep_canonical_semantics(
             assert response(backend, "pattern_query", args) == actual
 
 
+def test_entity_search_reuses_normalized_projection_until_nodes_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = graph(tmp_path / "names", [{"name": f"item-{index}"} for index in range(100)])
+    from grapharrow.use_cases import ana_search
+
+    builds = 0
+    original = ana_search._normalize_entity_search
+
+    def normalize(table, keys, *, aliases):
+        nonlocal builds
+        builds += 1
+        return original(table, keys, aliases=aliases)
+
+    monkeypatch.setattr(ana_search, "_normalize_entity_search", normalize)
+    with GraphArrowAgentBackend(app) as original_workflow:
+        assert original_workflow.call("entity_resolve", {"label": "Item", "text": "item-50"})[
+            "preview"
+        ] == ["item-50"]
+        with GraphArrowAgentBackend(app) as second:
+            assert second.call("entity_resolve", {"label": "Item", "text": "item-80"})[
+                "preview"
+            ] == ["item-80"]
+        assert builds == 1
+        app.use_cases.cypher.execute("MATCH (n:Item {name:'item-50'}) SET n.name = 'changed'")
+        with GraphArrowAgentBackend(app) as current:
+            assert current.call("entity_resolve", {"label": "Item", "text": "changed"})[
+                "preview"
+            ] == ["changed"]
+        assert original_workflow.call("entity_resolve", {"label": "Item", "text": "item-50"})[
+            "preview"
+        ] == ["item-50"]
+        assert builds == 2
+
+
 @pytest.mark.parametrize("layout", ["current", "reordered", "missing_rows", "legacy"])
 def test_seed_materialization_scope_and_projection_fallbacks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: str
@@ -162,7 +197,8 @@ def test_seed_materialization_scope_and_projection_fallbacks(
         property_names=("name",),
     )
     with GraphArrowAgentBackend(app) as backend:
-        table = backend._property_tables["Item"]
+        table = backend._property_table("Item")
+        assert table is not None
         if layout == "reordered":
             table = table.take(pa.array(list(reversed(range(table.num_rows)))))
         elif layout == "missing_rows":
@@ -396,7 +432,8 @@ def test_entity_projection_layouts_preserve_ranking(
         rows = [row | {"node_id": f"application-{i}"} for i, row in enumerate(rows)]
     app = graph(tmp_path / "db", rows)
     with GraphArrowAgentBackend(app) as backend:
-        table = backend._property_tables["Item"]
+        table = backend._property_table("Item")
+        assert table is not None
         if layout == "reordered":
             table = table.take(pa.array(list(reversed(range(table.num_rows)))))
         elif layout == "missing_rows":
@@ -435,7 +472,8 @@ def test_ties_and_indexed_seed_filters_keep_canonical_identity(tmp_path: Path) -
         property_names=("description",),
     )
     with GraphArrowAgentBackend(app) as backend:
-        table = backend._property_tables["Item"]
+        table = backend._property_table("Item")
+        assert table is not None
         backend._property_tables["Item"] = table.take(pa.array(list(reversed(range(100)))))
         found = backend.call(
             "entity_resolve",
@@ -470,7 +508,8 @@ def test_entity_pruning_keeps_projection_json_errors(
         ],
     )
     with GraphArrowAgentBackend(app) as backend:
-        table = backend._property_tables["Item"]
+        table = backend._property_table("Item")
+        assert table is not None
         backend._property_tables["Item"] = table.set_column(
             table.schema.get_field_index("aliases"),
             table.schema.field("aliases"),

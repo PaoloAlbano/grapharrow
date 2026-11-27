@@ -529,7 +529,9 @@ def test_canonical_search_handles_missing_projections_and_reserved_properties(
         labels=("Item",), properties={"name": "alpha", "node_id": "external"}
     )
     with GraphArrowAgentBackend(app) as backend:
-        for table in [backend._property_tables["Item"], pa.table({})]:
+        current = backend._property_table("Item")
+        assert current is not None
+        for table in [current, pa.table({})]:
             backend._property_tables["Item"] = table
             assert (
                 backend.call("entity_resolve", {"label": "Item", "text": "alpha"})["matched_count"]

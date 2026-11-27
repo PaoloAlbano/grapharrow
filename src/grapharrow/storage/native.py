@@ -153,6 +153,16 @@ class NativeStorageBackend:
             )
             self._snapshot.publish(manifest, base=snapshot)
 
+    def edit_edge_property_batch(
+        self,
+        *,
+        property_name: str,
+        updates: dict[int, object],
+        rel_type: str | None,
+        receipt: PointWriteReceipt | None = None,
+    ) -> AbstractContextManager[tuple[EdgeRecord, ...] | None]:
+        return nullcontext(None)
+
     @contextmanager
     def edit_node_properties_by_id(
         self,

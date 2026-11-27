@@ -21,6 +21,7 @@ from grapharrow.core import property_codec
 from grapharrow.core.errors import NotFoundError, QueryError, ReadOnlyError, SchemaError
 from grapharrow.domain import (
     CatalogVersion,
+    DatasetFile,
     LabelDefinition,
     LabelId,
     RelationshipTypeDefinition,
@@ -37,7 +38,12 @@ from grapharrow.repositories import (
     NodeRecord,
     SnapshotRepository,
 )
-from grapharrow.repositories.graph import EDGE_SCHEMA, _edges_table, _nodes_table
+from grapharrow.repositories.graph import (
+    EDGE_SCHEMA,
+    EDGE_TOPOLOGY_SCHEMA,
+    _edges_table,
+    _nodes_table,
+)
 from grapharrow.storage.contracts import CatalogStore, GraphStore, SnapshotStore, StorageBackend
 from grapharrow.storage.models import PointWriteReceipt
 
@@ -194,6 +200,18 @@ class GraphStateUseCase:
             node_id=node_id, labels=labels, properties=properties, receipt=receipt
         )
 
+    def edit_edge_property_batch(
+        self,
+        *,
+        property_name: str,
+        updates: dict[int, object],
+        rel_type: str | None,
+        receipt: PointWriteReceipt | None = None,
+    ) -> AbstractContextManager[tuple[EdgeRecord, ...] | None]:
+        return self._storage_backend.edit_edge_property_batch(
+            property_name=property_name, updates=updates, rel_type=rel_type, receipt=receipt
+        )
+
     def load_state(self, *, snapshot: SnapshotManifest | None = None) -> GraphState:
         """Load the current catalog, snapshot, and graph records."""
 
@@ -238,7 +256,11 @@ class GraphStateUseCase:
 
     @contextmanager
     def borrow_tabular_state(
-        self, *, include_edges: bool = True, snapshot: SnapshotManifest | None = None
+        self,
+        *,
+        include_edges: bool = True,
+        snapshot: SnapshotManifest | None = None,
+        edge_topology_only: bool = False,
     ) -> Generator[GraphTabularState, None, None]:
         """Share canonical buffers until the snapshot reader releases them."""
         with ExitStack() as pins:
@@ -247,16 +269,14 @@ class GraphStateUseCase:
             else:
                 pins.enter_context(self.pin_snapshot(snapshot))
             catalog = self._catalog_store.load_for_snapshot(snapshot)
-            nodes, edges = snapshot.nodes, snapshot.edges
+            nodes = snapshot.nodes
             node_key = (
                 self._graph_store.node_cache_files(nodes)
                 if self.snapshot_tables.max_bytes
                 else nodes
             )
             edge_table = (
-                self.snapshot_tables.borrow(
-                    ("edges", edges), lambda: self._graph_store.load_edge_table(edges)
-                )
+                self.borrow_edge_table(snapshot, topology_only=edge_topology_only)
                 if include_edges
                 else nullcontext(EDGE_SCHEMA.empty_table())
             )
@@ -267,6 +287,26 @@ class GraphStateUseCase:
                 edge_table as borrowed_edges,
             ):
                 yield GraphTabularState(catalog, snapshot, node_table, borrowed_edges)
+
+    def borrow_edge_table(
+        self, snapshot: SnapshotManifest, *, topology_only: bool = False
+    ) -> AbstractContextManager[pa.Table]:
+        """Borrow an edge projection while the caller pins its snapshot."""
+        files = snapshot.edges
+        if topology_only:
+
+            def load_topology() -> pa.Table:
+                cached = self.snapshot_tables.project_cached(
+                    ("edges", files), EDGE_TOPOLOGY_SCHEMA.names
+                )
+                if cached is not None:
+                    return cached
+                return self._graph_store.load_edge_table(files, topology_only=True)
+
+            return self.snapshot_tables.borrow(("edge_topology", files), load_topology)
+        return self.snapshot_tables.borrow(
+            ("edges", files), partial(self._graph_store.load_edge_table, files)
+        )
 
     def load_node_property_table(
         self,
@@ -285,29 +325,15 @@ class GraphStateUseCase:
             predicates=predicates,
         )
 
-    @contextmanager
-    def borrow_node_property_tables(
-        self, *, snapshot: SnapshotManifest
-    ) -> Generator[dict[str, pa.Table], None, None]:
-        """Share full label projections directly from one published manifest."""
-        grouped = self._graph_store.group_node_property_files(snapshot.node_properties)
-        with ExitStack() as leases:
-            yield {
-                label: leases.enter_context(
-                    self.snapshot_tables.borrow(
-                        (
-                            "node_properties",
-                            self._graph_store.node_cache_files(files)
-                            if self.snapshot_tables.max_bytes
-                            else files,
-                        ),
-                        partial(
-                            self._graph_store.load_node_property_projection, files, label=label
-                        ),
-                    )
-                )
-                for label, files in grouped.items()
-            }
+    def borrow_node_property_projection(
+        self, files: tuple[DatasetFile, ...], *, label: str
+    ) -> AbstractContextManager[pa.Table]:
+        """Share one full label projection while the caller pins its snapshot."""
+        key = self._graph_store.node_cache_files(files) if self.snapshot_tables.max_bytes else files
+        return self.snapshot_tables.borrow(
+            ("node_properties", key),
+            partial(self._graph_store.load_node_property_projection, files, label=label),
+        )
 
     def lookup_node_property_table(
         self,

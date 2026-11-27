@@ -67,6 +67,61 @@ def test_narrow_reader_scan_never_loads_canonical_graph(
     assert count == 2
 
 
+@pytest.mark.parametrize("backend", ["native", "delta"])
+def test_fixed_hop_count_pipelines_preserve_duplicates_and_optional_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
+    if backend == "delta":
+        pytest.importorskip("deltalake")
+    app = build_application(
+        tmp_path / backend, settings=GraphArrowSettings(storage_backend=backend)
+    )
+    cypher = app.use_cases.cypher
+    cypher.execute(
+        "CREATE (a:Source {tags:['a']}), (b:Source), (:Source), "
+        "(x:Device {band:7, active:true, tags:[1,null]}), "
+        "(y:Device {band:7, active:false, tags:[1,null]}), (z:Device), "
+        "(a)-[:LINK]->(x), (a)-[:LINK]->(x), (a)-[:LINK]->(y), (b)-[:LINK]->(z)"
+    )
+    queries = (
+        (
+            "MATCH (:Source)-[:LINK]->(t:Device) WITH DISTINCT t.band AS band RETURN count(*) AS n",
+            2,
+        ),
+        (
+            "MATCH (s:Source) WITH s, s.tags AS tags "
+            "OPTIONAL MATCH (s)-[:LINK]->(t:Device) WHERE t.active = true "
+            "RETURN count(*) AS n",
+            4,
+        ),
+    )
+
+    def no_records(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("A supported scalar count materialized graph records")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(app.use_cases.graph, "load_state", no_records)
+        for query, expected in queries:
+            assert cypher.execute(query).rows == ({"n": expected},)
+    with monkeypatch.context() as patch:
+        patch.setenv("GRAPHARROW_DISABLE_CYPHER_COLUMNAR", "1")
+        for query, expected in queries:
+            assert cypher.execute(query).rows == ({"n": expected},)
+
+    cypher.execute("CREATE (:Source)-[:LINK]->(:Device {tags:[null,1]})")
+    list_query = (
+        "MATCH (:Source)-[:LINK]->(t:Device) WITH DISTINCT t.tags AS tags RETURN count(*) AS n"
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(app.use_cases.graph, "load_state", no_records)
+        assert cypher.execute(list_query).rows == ({"n": 3},)
+    cypher.execute("CREATE (:Source)-[:LINK]->(:Device {tags:[1.0,null]})")
+    # Mixed numeric encodings fall back and keep integer/floating equality.
+    assert cypher.execute(list_query).rows == ({"n": 3},)
+    monkeypatch.setenv("GRAPHARROW_DISABLE_CYPHER_COLUMNAR", "1")
+    assert cypher.execute(list_query).rows == ({"n": 3},)
+
+
 @pytest.mark.parametrize(
     "query",
     [

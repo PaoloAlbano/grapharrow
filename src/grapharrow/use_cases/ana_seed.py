@@ -98,7 +98,7 @@ def select_node_ids(
     """
     if not nodes or not filters:
         return nodes
-    table = backend._property_tables.get(label)
+    table = backend._property_table(label)
     remaining = filters
     keys = pa.array(nodes, type=pa.int64())
     if (

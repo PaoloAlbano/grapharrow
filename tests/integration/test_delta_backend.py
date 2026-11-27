@@ -31,6 +31,7 @@ from grapharrow.interfaces.cli import main
 from grapharrow.interfaces.embedded import Database
 from grapharrow.interfaces.rest import create_rest_app
 from grapharrow.use_cases.ana import GraphArrowAgentBackend
+from grapharrow.use_cases.ana_resources import AnaQuotaExceeded, AnaResourceBudget
 from tests.integration.delta_log_gate import pause_delta_log_put
 from tests.integration.support import MotoS3Context
 
@@ -51,6 +52,10 @@ CREATE_EDGE_RANGES = (
     "(a)-[:WROTE {since:2020}]->(b)"
 )
 SET_EDGE = "MATCH ()-[r:WROTE]->() WHERE id(r)=$id SET r.since=$since RETURN r.since AS since"
+BATCH_SET_EDGE = (
+    "UNWIND $updates AS u MATCH ()-[r:WROTE]->() WHERE id(r)=u.id "
+    "SET r.since=u.since RETURN r.since AS since"
+)
 
 
 @pytest.fixture
@@ -1523,8 +1528,11 @@ def test_delta_readers_reuse_projections_and_pin_ana_across_commits(
     assert projections == (1 if cache_enabled else 2)
     with GraphArrowAgentBackend(reader) as initial:
         assert ana_properties(initial) == [["Original", 2020]]
+        assert discoveries == 0
+        initial.call("schema_overview", {})
 
     with GraphArrowAgentBackend(reader) as pinned:
+        pinned.call("schema_overview", {})
         assert discoveries == (1 if cache_enabled else 2)
         writer.use_cases.cypher.execute(
             "MATCH (a:Author)-[r:WROTE]->() SET a.name = 'Changed', r.since = 2025"
@@ -1946,6 +1954,169 @@ def test_concurrent_keyed_point_sets(
 
 
 @pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+def test_delta_batch_set_reads_each_range_once_and_replays(
+    delta_database: tuple[str | Path, GraphArrowSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from grapharrow.storage import delta
+
+    path, settings = delta_database
+    settings = settings.model_copy(update={"edge_parquet_range_size": 2})
+    writer = build_application(path, settings=settings)
+    writer.use_cases.cypher.execute(CREATE_EDGE_RANGES)
+    base = writer.storage_backend.capture_snapshot()
+    original = delta._partition
+    reads = []
+
+    def observe(table, kind, columns, expression=None, **kwargs):
+        if kind.startswith("edges"):
+            reads.append(kind)
+        return original(table, kind, columns, expression, **kwargs)
+
+    payload = {
+        "query": BATCH_SET_EDGE,
+        "params": {
+            "updates": [
+                {"id": 3, "since": 2033},
+                {"id": 1, "since": 2031},
+                {"id": 2, "since": 2032},
+            ]
+        },
+    }
+    headers = {"Idempotency-Key": "batched-ranges"}
+    with TestClient(create_rest_app(path, settings=settings)) as client:
+        with monkeypatch.context() as patch:
+            patch.setattr(delta, "_partition", observe)
+            response = client.post("/v1/query", json=payload, headers=headers)
+            assert response.status_code == 200
+            assert response.json()["data"]["rows"] == [
+                {"since": 2033},
+                {"since": 2031},
+                {"since": 2032},
+            ]
+            assert (
+                client.post("/v1/query", json=payload, headers=headers).content == response.content
+            )
+        assert reads == ["edges-00000000000000000001", "edges-00000000000000000000"]
+    state = writer.use_cases.graph.load_state()
+    assert state.snapshot.snapshot_id.value == base.snapshot_id.value + 1
+    assert [edge.properties["since"] for edge in state.edges] == [2031, 2032, 2033, 2020]
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+def test_delta_batch_set_preserves_duplicate_and_missing_id_semantics(
+    delta_database: tuple[str | Path, GraphArrowSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, settings = delta_database
+    writer = build_application(path, settings=settings)
+    writer.use_cases.cypher.execute(CREATE_EDGE_RANGES)
+    before = writer.storage_backend.capture_snapshot()
+
+    def unsupported(**kwargs):
+        raise AssertionError("Duplicate IDs must use the general write path")
+
+    monkeypatch.setattr(writer.storage_backend, "edit_edge_property_batch", unsupported)
+    result = writer.use_cases.cypher.execute(
+        BATCH_SET_EDGE,
+        {
+            "updates": [
+                {"id": 1, "since": 2031},
+                {"id": 999, "since": 2034},
+                {"id": 1, "since": 2032},
+            ]
+        },
+    )
+    assert result.rows == ({"since": 2032}, {"since": 2032})
+    current = writer.use_cases.graph.load_state()
+    assert current.snapshot.snapshot_id.value == before.snapshot_id.value + 1
+    assert current.edges[0].properties == {"since": 2032}
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+def test_delta_batch_set_rejects_concurrent_publication_atomically(
+    delta_database: tuple[str | Path, GraphArrowSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from grapharrow.storage import delta
+
+    path, settings = delta_database
+    settings = settings.model_copy(update={"edge_parquet_range_size": 2})
+    writer = build_application(path, settings=settings)
+    writer.use_cases.cypher.execute(CREATE_EDGE_RANGES)
+    base = writer.storage_backend.capture_snapshot()
+    publish = delta.write_deltalake
+
+    def interleave(table, data, **kwargs):
+        if "edges-00000000000000000001" in kwargs.get("predicate", ""):
+            writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2099})
+        return publish(table, data, **kwargs)
+
+    payload = {
+        "query": BATCH_SET_EDGE,
+        "params": {"updates": [{"id": 1, "since": 2031}, {"id": 3, "since": 2033}]},
+    }
+    headers = {"Idempotency-Key": "batched-conflict"}
+    with TestClient(create_rest_app(path, settings=settings)) as client:
+        with monkeypatch.context() as patch:
+            patch.setattr(delta, "write_deltalake", interleave)
+            response = client.post("/v1/query", json=payload, headers=headers)
+        assert response.status_code == 409
+        state = writer.use_cases.graph.load_state()
+        assert state.snapshot.snapshot_id.value == base.snapshot_id.value + 1
+        assert [edge.properties["since"] for edge in state.edges] == [2099, 2020, 2020, 2020]
+        retry = client.post("/v1/query", json=payload, headers=headers)
+        assert retry.status_code == 200
+        assert retry.json()["data"]["rows"] == [{"since": 2031}, {"since": 2033}]
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+@pytest.mark.parametrize("since", [2020, 2025])
+@pytest.mark.parametrize("max_rows", [0, 1024])
+def test_delta_point_write_reuses_small_receipt_bucket(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+    since: int,
+    max_rows: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from grapharrow.storage import delta
+
+    path, settings = delta_database
+    reader = build_application(path, settings=settings)
+    reader.use_cases.cypher.execute(CREATE_EDGE_RANGES)
+    with TestClient(create_rest_app(path, settings=settings)) as client:
+        seed = client.post(
+            "/v1/query",
+            json={"query": SET_EDGE, "params": {"id": 2, "since": 2030}},
+            headers={"Idempotency-Key": "other-17"},
+        )
+        assert seed.status_code == 200
+        monkeypatch.setattr(delta, "_RECEIPT_REUSE_MAX_ROWS", max_rows)
+        original = delta._partition
+        buckets: list[tuple[int, str]] = []
+
+        def track(table, kind, columns, expression=None, **kwargs):
+            if kind.startswith("receipt-"):
+                buckets.append((table.version(), kind))
+            return original(table, kind, columns, expression, **kwargs)
+
+        monkeypatch.setattr(delta, "_partition", track)
+        base = reader.storage_backend.capture_snapshot()
+        payload = {"query": SET_EDGE, "params": {"id": 1, "since": since}}
+        response = client.post("/v1/query", json=payload, headers={"Idempotency-Key": "first"})
+        assert response.status_code == 200
+        assert response.json()["data"]["rows"] == [{"since": since}]
+        key = sha256(b"first").hexdigest()
+        assert key[:2] == sha256(b"other-17").hexdigest()[:2]
+        one_read = (base.snapshot_id.value - 1, f"receipt-{key[:2]}")
+        assert buckets == [one_read] * (1 if max_rows else 2)
+        head = reader.storage_backend.capture_snapshot()
+        assert head.snapshot_id.value == base.snapshot_id.value + 1
+        assert (
+            client.post("/v1/query", json=payload, headers={"Idempotency-Key": "first"}).content
+            == response.content
+        )
+        assert reader.storage_backend.capture_snapshot() == head
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
 def test_keyed_point_set_replays_an_unchanged_or_empty_result(
     delta_database: tuple[str | Path, GraphArrowSettings],
 ) -> None:
@@ -2161,9 +2332,9 @@ def test_delta_reassembles_only_the_edge_group_with_changed_files(
     borrow = store._borrow_edge_range
     rebuilt: list[str] = []
 
-    def count_range(snapshot_id, item):
+    def count_range(snapshot_id, item, schema):
         rebuilt.append(item.partition)
-        return borrow(snapshot_id, item)
+        return borrow(snapshot_id, item, schema)
 
     monkeypatch.setattr(store, "_borrow_edge_range", count_range)
     writer.use_cases.cypher.execute(SET_EDGE, {"id": 40, "since": 2025})
@@ -2200,14 +2371,14 @@ def test_delta_reuses_unchanged_ranges_in_cypher_projections_and_ana_tables(
     graph = reader.repositories.graph
     load_partition = graph._read_partition
     project_edges = delta_graph._edge_projection
-    reads: list[str] = []
+    reads: list[tuple[str, bool]] = []
     projections: list[list[int]] = []
 
     def observe_partition(
         snapshot_id: Any, kind: str, columns: list[str], expression: object
     ) -> Any:
         if kind.startswith("edges-"):
-            reads.append(kind)
+            reads.append((kind, "properties_json" in columns))
         return load_partition(snapshot_id, kind, columns, expression)
 
     def observe_projection(table: Any) -> Any:
@@ -2238,22 +2409,190 @@ def test_delta_reuses_unchanged_ranges_in_cypher_projections_and_ana_tables(
     assert len(reads) == 3
     with GraphArrowAgentBackend(reader) as pinned:
         assert ana_since(pinned) == [[2020]] * 5
+        assert len(reads) == 3
         reads.clear()
         projections.clear()
         writer.use_cases.cypher.execute(SET_EDGE, {"id": 3, "since": 2025})
         current = reader.storage_backend.capture_snapshot()
         with GraphArrowAgentBackend(reader) as fresh:
             assert sorted(ana_since(fresh)) == [[2020]] * 4 + [[2025]]
-        assert reads == ["edges-00000000000000000001"]
+        assert reads == [
+            ("edges-00000000000000000001", False),
+            ("edges-00000000000000000001", True),
+        ]
         after = project(current)
         assert projections == [[3, 4]]
-        assert reads == ["edges-00000000000000000001"]
+        assert len(reads) == 2
         assert project(base).equals(before, check_metadata=True)
         assert ana_since(pinned) == [[2020]] * 5
     records = list(reader.use_cases.graph.load_state(snapshot=current).edges)
     assert after.equals(
         _edge_property_table(records, _edge_property_schema(records)), check_metadata=True
     )
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+def test_delta_ana_loads_topology_before_reading_pinned_relationship_properties(
+    delta_database: tuple[str | Path, GraphArrowSettings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, settings = delta_database
+    writer = build_application(path, settings=settings)
+    reader = build_application(path, settings=settings)
+    writer.use_cases.cypher.execute(CREATE, {"name": "original"})
+    graph = reader.repositories.graph
+    read = graph._read_partition
+    projections: list[list[str]] = []
+
+    def track(snapshot_id: SnapshotId, kind: str, columns: list[str], expression: object):
+        if kind.startswith("edges"):
+            projections.append(columns)
+        return read(snapshot_id, kind, columns, expression)
+
+    monkeypatch.setattr(graph, "_read_partition", track)
+    budget = AnaResourceBudget()
+    with GraphArrowAgentBackend(reader, resource_budget=budget) as pinned:
+        seed = pinned.call("node_scan", {"label": "Author", "limit": 1})
+        result = pinned.call(
+            "expand",
+            {
+                "from": seed["handle"],
+                "source": "author",
+                "relationship_type": "WROTE",
+                "target_label": "Book",
+            },
+        )
+        assert result["matched_count"] == 1
+        assert projections == [["edge_id", "rel_type", "src_id", "dst_id"]]
+        assert pinned._schema_snapshot is None
+        writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": "later"})
+
+        before = pinned.resource_usage
+        with monkeypatch.context() as patch:
+
+            def reject(*args: Any) -> None:
+                raise AnaQuotaExceeded("test final admission failed")
+
+            patch.setattr(pinned._resources, "finalize", reject)
+            with pytest.raises(AnaQuotaExceeded, match="final admission"):
+                pinned.call("schema_overview", {})
+        assert pinned._schema_snapshot is None
+        assert pinned.resource_usage == before
+        assert budget.used_bytes == before["bytes"]
+
+        pinned.call("schema_overview", {})
+        with GraphArrowAgentBackend(reader) as fresh:
+            fresh.call("schema_overview", {})
+            assert fresh._schema["relationship_properties"][0]["propertyTypes"] == ["String"]
+        assert pinned._schema["relationship_properties"][0]["propertyTypes"] == ["Integer"]
+        assert pinned.resource_usage["snapshot_bytes"] > before["snapshot_bytes"]
+    assert budget.used_bytes == 0
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+def test_delta_pinned_read_view_survives_head_advance_and_releases(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, settings = delta_database
+    settings = settings.model_copy(update={"edge_parquet_range_size": 2})
+    writer = build_application(path, settings=settings)
+    reader = build_application(path, settings=settings)
+    writer.use_cases.cypher.execute(CREATE_EDGE_RANGES)
+    backend = reader.storage_backend
+    open_table = backend._require_table
+    opened: list[SnapshotId | None] = []
+
+    def track(snapshot_id: SnapshotId | None):
+        opened.append(snapshot_id)
+        return open_table(snapshot_id)
+
+    monkeypatch.setattr(backend, "_require_table", track)
+    with backend.borrow_current_snapshot() as pinned:
+        source = backend._read_table(pinned.snapshot_id)
+        writer.use_cases.cypher.execute(SET_EDGE, {"id": 3, "since": 2025})
+        current = backend.capture_snapshot()
+        assert current.snapshot_id != pinned.snapshot_id
+        with backend.pin_snapshot(pinned.snapshot_id):
+            first = reader.repositories.graph.load_edge_table(pinned.edges)
+            assert backend._read_table(pinned.snapshot_id) is source
+        assert json.loads(first["properties_json"][2].as_py())["since"] == 2020
+        assert pinned.snapshot_id not in opened
+        latest = reader.repositories.graph.load_edge_table(current.edges)
+        assert json.loads(latest["properties_json"][2].as_py())["since"] == 2025
+    assert not backend._read_pins
+
+    with backend.pin_snapshot(pinned.snapshot_id), ThreadPoolExecutor(max_workers=2) as workers:
+        requests = [workers.submit(backend._read_table, pinned.snapshot_id) for _ in range(2)]
+        historical, overlapping = [request.result(timeout=10) for request in requests]
+        assert historical is overlapping
+        with backend.pin_snapshot(pinned.snapshot_id):
+            assert backend._read_table(pinned.snapshot_id) is historical
+        assert backend._read_table(pinned.snapshot_id) is historical
+    assert opened.count(pinned.snapshot_id) == 1
+    assert not backend._read_pins
+
+
+@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
+@pytest.mark.parametrize("cache_enabled", [False, True])
+def test_delta_ana_schema_reads_only_changed_edge_property_ranges(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+    cache_enabled: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path, settings = delta_database
+    settings = settings.model_copy(
+        update={
+            "edge_parquet_range_size": 2,
+            "ana_edge_schema_cache_max_bytes": 1024 * 1024 if cache_enabled else 0,
+        }
+    )
+    writer = build_application(path, settings=settings)
+    reader = build_application(path, settings=settings)
+    writer.use_cases.cypher.execute(CREATE_EDGE_RANGES)
+    store = reader.repositories.graph
+    read = store._read_partition
+    properties: list[str] = []
+
+    def track(snapshot_id: SnapshotId, kind: str, columns: list[str], expression: object):
+        if kind.startswith("edges"):
+            assert columns in [
+                ["edge_id", "rel_type", "src_id", "dst_id"],
+                ["rel_type", "properties_json"],
+            ]
+            if "properties_json" in columns:
+                properties.append(kind)
+        return read(snapshot_id, kind, columns, expression)
+
+    def observed_types(workflow: GraphArrowAgentBackend) -> list[str]:
+        workflow.call("schema_overview", {})
+        return workflow._schema["relationship_properties"][0]["propertyTypes"]
+
+    monkeypatch.setattr(store, "_read_partition", track)
+    first_range = "edges-00000000000000000000"
+    second_range = "edges-00000000000000000001"
+    with GraphArrowAgentBackend(reader) as pinned:
+        assert observed_types(pinned) == ["Integer"]
+        assert properties == [first_range, second_range]
+
+        properties.clear()
+        writer.use_cases.cypher.execute(SET_EDGE, {"id": 3, "since": "later"})
+        with GraphArrowAgentBackend(reader) as fresh:
+            assert observed_types(fresh) == ["Integer", "String"]
+
+        assert properties == ([second_range] if cache_enabled else [first_range, second_range])
+        assert observed_types(pinned) == ["Integer"]
+
+        properties.clear()
+        writer.use_cases.cypher.execute(SET_EDGE, {"id": 3, "since": 2020})
+        with GraphArrowAgentBackend(reader) as reverted:
+            assert observed_types(reverted) == ["Integer"]
+        assert properties == ([second_range] if cache_enabled else [first_range, second_range])
+
+        properties.clear()
+        writer.use_cases.cypher.execute("CREATE (:Book {name: 'Standalone'})")
+        with GraphArrowAgentBackend(reader) as node_only:
+            assert observed_types(node_only) == ["Integer"]
+        assert properties == ([] if cache_enabled else [first_range, second_range])
 
 
 @pytest.mark.parametrize("delta_database", ["local"], indirect=True)
@@ -2296,7 +2635,6 @@ def test_delta_ana_reuses_node_data_until_node_files_change(
     assert baseline == {
         "_build_lookup": 1,
         "load_node_table": 1,
-        "load_node_property_projection": 2,
         "_discover_node_properties": 1,
     }
     with GraphArrowAgentBackend(reader) as pinned:
@@ -2305,14 +2643,17 @@ def test_delta_ana_reuses_node_data_until_node_files_change(
         with GraphArrowAgentBackend(reader) as edge_update:
             assert edge_update._state.snapshot != pinned._state.snapshot
             assert edge_update._state.node_table is pinned._state.node_table
-            assert edge_update._property_tables["Author"] is pinned._property_tables["Author"]
+            assert edge_update._property_table("Author") is pinned._property_table("Author")
             assert author_properties(edge_update) == {"name"}
-            assert calls == baseline
+            assert calls == baseline | {"load_node_property_projection": 1}
 
         writer.use_cases.cypher.execute("MATCH (a:Author) SET a.rank = 7")
         with GraphArrowAgentBackend(reader) as node_update:
             assert author_properties(node_update) == {"name", "rank"}
             assert node_update._state.node_table is not pinned._state.node_table
-            assert node_update._property_tables["Author"]["rank"].to_pylist() == [7]
-            assert calls == {name: times * 2 for name, times in baseline.items()}
+            projection = node_update._property_table("Author")
+            assert projection is not None and projection["rank"].to_pylist() == [7]
+            assert calls == {name: times * 2 for name, times in baseline.items()} | {
+                "load_node_property_projection": 2
+            }
         assert author_properties(pinned) == {"name"}

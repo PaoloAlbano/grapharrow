@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import ExitStack
+from contextlib import AbstractContextManager, ExitStack
 from copy import deepcopy
 from threading import RLock
 from typing import Any
@@ -24,7 +24,12 @@ from grapharrow.use_cases import ana_patterns, ana_roles, ana_search
 from grapharrow.use_cases.ana_edge_statistics import schema_property_type as _property_type
 from grapharrow.use_cases.ana_node_lookup import AnaNodeLookup
 from grapharrow.use_cases.ana_read_cache import AnaReadCache
-from grapharrow.use_cases.ana_resources import AnaLimits, AnaResourceBudget, AnaResources
+from grapharrow.use_cases.ana_resources import (
+    AnaLimits,
+    AnaResourceBudget,
+    AnaResources,
+    retained_size,
+)
 from grapharrow.use_cases.ana_runtime import AnaRuntime
 from grapharrow.use_cases.ana_schema_cache import SnapshotSchema
 from grapharrow.use_cases.graph import GraphTabularState
@@ -45,6 +50,7 @@ class GraphArrowAgentBackend(AnaRuntime):
         if self._handle_store.counter or self._handle_store.handles or self._handle_store.lineage:
             raise ValueError("A new ANA workflow requires an empty handle store")
         self._application = application
+        self._edge_topology_only = application.settings.storage_backend == "delta"
         self._schema_entry = schema_entry
         self._closed = False
         self._call_lock = RLock()
@@ -59,24 +65,32 @@ class GraphArrowAgentBackend(AnaRuntime):
         graph = application.use_cases.graph
         with application.storage_backend.snapshot_open_guard():
             self._snapshot_state: GraphTabularState | None = leases.enter_context(
-                graph.borrow_tabular_state()
-            )
-            self._property_tables = leases.enter_context(
-                graph.borrow_node_property_tables(snapshot=self._state.snapshot)
+                graph.borrow_tabular_state(edge_topology_only=self._edge_topology_only)
             )
         state = self._state
+        self._property_sources = application.repositories.graph.group_node_property_files(
+            state.snapshot.node_properties
+        )
+        self._property_tables: dict[str, pa.Table] = {}
+        self._property_leases: dict[str, ExitStack] = {}
+        self._new_projection_labels: list[str] | None = None
         node_files = application.repositories.graph.node_cache_files(state.snapshot.nodes)
         lookup = application._ana_node_lookups.get_or_create(node_files, state.node_table)
         self._node_lookup: AnaNodeLookup | None = lookup
-        self._schema_snapshot: SnapshotSchema | None = application._ana_schema_cache.get_or_create(
-            state.snapshot, self._discover_schema, node_files=node_files
-        )
-        # Responses can expose nested schema values to native callers.
-        self._schema = deepcopy(self._schema_snapshot.schema)
+        self._node_files = node_files
+        self._schema_snapshot: SnapshotSchema | None = None
+        self._schema_view: dict[str, Any] | None = None
+        if self._edge_topology_only:
+            self._relationship_types = tuple(pc.unique(state.edge_table["rel_type"]).to_pylist())
+        else:
+            schema = self._get_snapshot_schema()
+            self._schema_snapshot = schema
+            self._schema_view = deepcopy(schema.schema)
+            self._relationship_types = tuple(self._schema_view["relationship_types"])
         settings = application.settings
         adjacency_bytes = GraphAdjacency.reservation(
             self._state.edge_table.num_rows,
-            self._schema["relationship_types"],
+            self._relationship_types,
             settings.ana_adjacency_index_max_bytes_per_session,
             node_count=self._state.node_table.num_rows,
         )
@@ -103,8 +117,8 @@ class GraphArrowAgentBackend(AnaRuntime):
             resource_budget
             if resource_budget is not None
             else AnaResourceBudget(settings.ana_max_total_bytes),
-            (self._snapshot_state, self._property_tables),
-            shared_state=(self._schema_snapshot, self._schema),
+            (self._snapshot_state, self._property_sources),
+            shared_state=(self._schema_snapshot, self._schema_view, self._relationship_types),
             reserved_bytes=lookup.retained_bytes
             + (self._read_cache.max_bytes if self._read_cache is not None else 0),
         )
@@ -130,6 +144,37 @@ class GraphArrowAgentBackend(AnaRuntime):
             return read()
         return self._read_cache.get_or_create(key, read)
 
+    def _property_table(self, label: str) -> pa.Table | None:
+        table = self._property_tables.get(label)
+        if table is not None:
+            return table
+        files = self._property_sources.get(label)
+        if files is None:
+            return None
+        graph = self._application.use_cases.graph
+        with ExitStack() as leases:
+            table = leases.enter_context(graph.borrow_node_property_projection(files, label=label))
+            self._resources.charge_snapshot(retained_size(table))
+            self._property_tables[label] = table
+            self._property_leases[label] = leases.pop_all()
+        if self._new_projection_labels is not None:
+            self._new_projection_labels.append(label)
+        return table
+
+    def _tables_for_order(self, labels: Iterable[str]) -> Iterator[pa.Table]:
+        for label in labels:
+            table = self._property_table(label)
+            if table is not None:
+                yield table
+
+    def _borrow_entity_search(
+        self, label: str, load: Callable[[], pa.Table]
+    ) -> AbstractContextManager[pa.Table]:
+        graph = self._application.use_cases.graph
+        files = self._property_sources.get(label, ())
+        key = self._application.repositories.graph.node_cache_files(files)
+        return graph.snapshot_tables.borrow(("ana_entity_search", key), load)
+
     def call(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
         """Validate the call and record lineage in the workflow's store."""
         with self._call_lock:
@@ -139,6 +184,9 @@ class GraphArrowAgentBackend(AnaRuntime):
                 raise ValueError(f"Tool is not implemented by the GraphArrow ANA backend: {tool}")
             store = self._handle_store
             previous_fetch = self.last_fetch
+            previous_schema = self._schema_snapshot, self._schema_view
+            new_projection_labels: list[str] = []
+            self._new_projection_labels = new_projection_labels
             try:
                 with store.track_changes() as changes, self._resources.track_changes():
                     args = validate_args(tool, args)
@@ -153,8 +201,14 @@ class GraphArrowAgentBackend(AnaRuntime):
                     self._resources.finalize(store, touched, self.last_fetch)
                     return response
             except BaseException:
+                for label in reversed(new_projection_labels):
+                    self._property_tables.pop(label)
+                    self._property_leases.pop(label).close()
                 self.last_fetch = previous_fetch
+                self._schema_snapshot, self._schema_view = previous_schema
                 raise
+            finally:
+                self._new_projection_labels = None
 
     def _store(
         self,
@@ -193,8 +247,12 @@ class GraphArrowAgentBackend(AnaRuntime):
                 self._resources.close()
                 self.last_fetch = None
                 self._property_tables.clear()
+                self._property_sources.clear()
+                for lease in self._property_leases.values():
+                    lease.close()
+                self._property_leases.clear()
                 self._node_lookup = None
-                self._schema.clear()
+                self._schema_view = None
                 self._schema_snapshot = None
                 self._snapshot_state = None
                 self._snapshot_leases.close()
@@ -283,7 +341,7 @@ class GraphArrowAgentBackend(AnaRuntime):
         value = args["value"]
         if value is None:
             return dict(self._store([], focus=var))
-        table = self._property_tables.get(label)
+        table = self._property_table(label)
         if (
             table is not None
             and prop in table.column_names
@@ -362,11 +420,11 @@ class GraphArrowAgentBackend(AnaRuntime):
 
     def _traversal_scan(
         self, rel_type: str, *, properties: bool = False
-    ) -> ana_patterns.TraversalScan | None:
+    ) -> ana_patterns.TraversalScan:
         """Prepare the scan fallback once per expansion or pattern hop."""
+        edges = self._edges_with_properties() if properties else self._state.edge_table
         if self._adjacency is not None:
-            return None
-        edges = self._state.edge_table
+            return ana_patterns.TraversalScan(edges, None)
         if not properties:
             edges = edges.select(["edge_id", "rel_type", "src_id", "dst_id"])
         return ana_patterns.TraversalScan.for_relationship(edges, rel_type)
@@ -382,14 +440,12 @@ class GraphArrowAgentBackend(AnaRuntime):
         max_batch_rows: int | None = None,
         scan: ana_patterns.TraversalScan | None = None,
     ) -> Iterator[Iterable[dict[str, Any]]]:
-        edges = self._state.edge_table
-        if self._adjacency is not None:
-            return self._adjacency.rows_for_sources(
-                edges, rel_type, node_ids, columns, properties=properties
-            )
         if scan is None:
             scan = self._traversal_scan(rel_type, properties=properties)
-            assert scan is not None
+        if self._adjacency is not None:
+            return self._adjacency.rows_for_sources(
+                scan.edges, rel_type, node_ids, columns, properties=properties
+            )
         return ana_patterns.edges_for_sources(
             scan.edges,
             node_ids,
@@ -398,33 +454,6 @@ class GraphArrowAgentBackend(AnaRuntime):
             batch=batch,
             max_batch_rows=max_batch_rows,
         )
-
-    def _traversal_targets(
-        self,
-        rel_type: str,
-        node_ids: list[int],
-        columns: tuple[str, ...],
-        allowed: set[int],
-        scan: ana_patterns.TraversalScan | None = None,
-    ) -> set[int]:
-        if not node_ids:
-            return set()
-        edges = self._state.edge_table
-        if self._adjacency is not None:
-            return self._adjacency.targets(edges, rel_type, node_ids, columns, allowed)
-        if scan is None:
-            scan = self._traversal_scan(rel_type)
-            assert scan is not None
-        sources = pa.array(node_ids, type=pa.int64())
-        targets: set[int] = set()
-        for column in columns:
-            target = "dst_id" if column == "src_id" else "src_id"
-            mask = pc.is_in(scan.edges[column], sources)
-            if scan.relationship_mask is not None:
-                mask = pc.and_(scan.relationship_mask, mask)
-            selected = pc.filter(scan.edges[target], mask)
-            targets.update(set(pc.unique(selected).to_pylist()) & allowed)
-        return targets
 
     def _expand(self, args: dict[str, Any]) -> dict[str, Any]:
         handle = self._handle(str(args["from"]))
@@ -435,7 +464,7 @@ class GraphArrowAgentBackend(AnaRuntime):
         direction = str(args.get("direction", "out"))
         if direction not in {"in", "out", "both"}:
             raise ValueError(f"Unsupported direction: {direction}")
-        if rel_type not in self._schema["relationship_types"]:
+        if rel_type not in self._relationship_types:
             raise ValueError(f"Unknown relationship_type {rel_type!r}")
         limit = _int_arg(args, "limit", 10000, min_value=1)
         page_size = _int_arg(args, "page_size", 2000, min_value=1)
@@ -458,14 +487,27 @@ class GraphArrowAgentBackend(AnaRuntime):
             if direction == "in"
             else ("src_id", "dst_id")
         )
+        max_batch_rows = max(1024, limit)
         matches_by_source = self._edges_for_sources(
             rel_type,
             node_ids,
             source_columns,
             batch=limit >= len(node_ids),
-            max_batch_rows=max(1024, limit),
+            max_batch_rows=max_batch_rows,
             scan=scan,
         )
+        indexed_candidates = None
+        if self._adjacency is not None and node_ids and targets:
+            indexed_candidates = self._adjacency.select(
+                scan.edges, node_ids, (rel_type,), source_columns
+            )
+            if len(node_ids) <= limit and indexed_candidates.num_rows <= max_batch_rows:
+                matches_by_source = ana_patterns.edges_for_sources(
+                    indexed_candidates.select(["edge_id", "src_id", "dst_id"]),
+                    node_ids,
+                    source_columns,
+                    prefiltered=True,
+                )
         processed = 0
         for row, node_id, selected in zip(inputs, node_ids, matches_by_source, strict=True):
             processed += 1
@@ -487,9 +529,19 @@ class GraphArrowAgentBackend(AnaRuntime):
                     break
             if len(output) >= limit:
                 break
-        # The reference keeps a full query branch for union counts. Its branch
-        # uses input entities independently of the materialized traversal limit.
-        full_targets = self._traversal_targets(rel_type, node_ids, source_columns, targets, scan)
+        if indexed_candidates is not None:
+            full_targets = ana_patterns.traversal_targets(
+                ana_patterns.TraversalScan(indexed_candidates, None),
+                node_ids,
+                source_columns,
+                targets,
+                prefiltered=True,
+            )
+        elif self._adjacency is not None:
+            full_targets = set()
+        else:
+            # Keep the full branch scan independent of the bounded row materialization.
+            full_targets = ana_patterns.traversal_targets(scan, node_ids, source_columns, targets)
         metadata = self._entity_query_metadata(full_targets, var, label) if inputs else None
         result = self._store(output, focus=var, metadata=metadata)
         result.update(
@@ -576,7 +628,7 @@ class GraphArrowAgentBackend(AnaRuntime):
         self, rel_type: str, prop: str, *, limit: int = 3
     ) -> list[Any]:
         samples = []
-        edges = self._state.edge_table
+        edges = self._edges_with_properties()
         for item in edges.filter(pc.equal(edges["rel_type"], rel_type))["properties_json"]:
             value = property_codec.loads(item.as_py(), public=True).get(prop)
             if value is not None and value not in samples:
@@ -584,6 +636,27 @@ class GraphArrowAgentBackend(AnaRuntime):
             if len(samples) >= limit:
                 break
         return samples
+
+    def _edges_with_properties(self) -> pa.Table:
+        if not self._edge_topology_only:
+            return self._state.edge_table
+        with self._application.use_cases.graph.borrow_edge_table(self._state.snapshot) as edges:
+            return edges
+
+    def _get_snapshot_schema(self) -> SnapshotSchema:
+        return self._application._ana_schema_cache.get_or_create(
+            self._state.snapshot, self._discover_schema, node_files=self._node_files
+        )
+
+    @property
+    def _schema(self) -> dict[str, Any]:
+        if self._schema_view is None:
+            schema = self._get_snapshot_schema()
+            # Responses can expose nested schema values to native callers.
+            view = deepcopy(schema.schema)
+            self._resources.charge_snapshot(retained_size((schema, view)))
+            self._schema_snapshot, self._schema_view = schema, view
+        return self._schema_view
 
     def _discover_schema(
         self, node_properties: list[dict[str, Any]] | None = None
@@ -604,8 +677,14 @@ class GraphArrowAgentBackend(AnaRuntime):
                 labels_by_id, edges["rel_type"].to_pylist(), edges
             )
 
+        statistics = self._application._ana_schema_cache.edge_statistics
+        sources = self._application.repositories.graph.edge_property_sources(
+            self._state.snapshot.edges
+        )
         relationship_types, relationship_properties = (
-            self._application._ana_schema_cache.edge_statistics.discover(edges)
+            statistics.discover_files(sources)
+            if sources is not None
+            else statistics.discover(self._edges_with_properties())
         )
         return {
             "labels": sorted(self._label_ids),

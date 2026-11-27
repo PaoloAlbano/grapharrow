@@ -73,6 +73,7 @@ def edges_for_sources(
     relationship_mask: pa.ChunkedArray | None = None,
     batch: bool = True,
     max_batch_rows: int | None = None,
+    prefiltered: bool = False,
 ) -> Iterator[Iterable[dict[str, Any]]]:
     """Resolve candidates for each source without changing edge or input order."""
     if not batch or len(node_ids) < _BATCH_SOURCE_THRESHOLD:
@@ -86,13 +87,15 @@ def edges_for_sources(
         return
 
     source_ids = set(node_ids)
-    keys = pa.array(list(source_ids), type=pa.int64())
-    mask = pc.is_in(edges[source_columns[0]], keys)
-    if len(source_columns) == 2:
-        mask = pc.or_(mask, pc.is_in(edges[source_columns[1]], keys))
-    if relationship_mask is not None:
-        mask = pc.and_(mask, relationship_mask)
-    candidates = edges.filter(mask)
+    candidates = edges
+    if not prefiltered:
+        keys = pa.array(list(source_ids), type=pa.int64())
+        mask = pc.is_in(edges[source_columns[0]], keys)
+        if len(source_columns) == 2:
+            mask = pc.or_(mask, pc.is_in(edges[source_columns[1]], keys))
+        if relationship_mask is not None:
+            mask = pc.and_(mask, relationship_mask)
+        candidates = edges.filter(mask)
     if max_batch_rows is not None and candidates.num_rows > max_batch_rows:
         yield from edges_for_sources(candidates, node_ids, source_columns, batch=False)
         return
@@ -107,6 +110,32 @@ def edges_for_sources(
                 buckets[secondary].append(edge)
     for node_id in node_ids:
         yield buckets.get(node_id, [])
+
+
+def traversal_targets(
+    scan: TraversalScan,
+    node_ids: list[int],
+    columns: tuple[str, ...],
+    allowed: set[int],
+    *,
+    prefiltered: bool = False,
+) -> set[int]:
+    """Return complete branch membership independently of the visible row limit."""
+    edges = scan.edges
+    if not node_ids or not allowed:
+        return set()
+    if prefiltered and len(columns) == 1:
+        target = "dst_id" if columns[0] == "src_id" else "src_id"
+        return set(pc.unique(edges[target]).to_pylist()) & allowed
+    targets: set[int] = set()
+    keys = pa.array(list(set(node_ids)), type=pa.int64())
+    for column in columns:
+        values = edges["dst_id" if column == "src_id" else "src_id"]
+        mask = pc.is_in(edges[column], keys)
+        if scan.relationship_mask is not None:
+            mask = pc.and_(mask, scan.relationship_mask)
+        targets.update(set(pc.unique(pc.filter(values, mask)).to_pylist()) & allowed)
+    return targets
 
 
 def _edge_rows(edges: pa.Table) -> Iterator[dict[str, Any]]:
@@ -231,7 +260,7 @@ def iter_extend_rows(
     direction = str(hop.get("direction", "out"))
     if direction not in {"in", "out"}:
         raise ValueError("Pattern direction must be 'out' or 'in'")
-    if rel_type not in backend._schema["relationship_types"]:
+    if rel_type not in backend._relationship_types:
         raise ValueError(f"Unknown relationship_type {rel_type!r}")
     if rel_var in {source, target}:
         raise ValueError("Relationship and node variables must be distinct")
@@ -598,14 +627,25 @@ def _can_bound_order(backend: Any, args: dict[str, Any], grouped: bool) -> bool:
     """Preserve full stable-sort behavior for NaNs and untyped historical projections."""
     if grouped:
         return False
-    tables = getattr(backend, "_property_tables", {})
+    tables_for_order = getattr(backend, "_tables_for_order", None)
+    labels = dict.fromkeys(
+        str(label)
+        for label in (
+            args.get("start_label"),
+            *(hop.get("target_label") for hop in args.get("hops", ())),
+        )
+        if label is not None
+    )
+    if not labels:
+        return False
+    tables = tuple(tables_for_order(labels)) if tables_for_order is not None else ()
     aliases = {
         str(item.get("alias") or item["property"]): item["property"]
         for item in args.get("select") or []
     }
     for order in args.get("order_by") or []:
         prop = aliases.get(order.get("field"), order.get("property"))
-        for table in tables.values():
+        for table in tables:
             if prop not in table.column_names:
                 continue
             field = table.schema.field(prop)

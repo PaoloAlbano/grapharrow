@@ -7,6 +7,7 @@ Unsupported types or kernels fall back on the same captured snapshot.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -23,6 +24,7 @@ from grapharrow.use_cases.cypher_pipeline import (
     ReadBranch,
     ReadQuery,
     ReadRuntime,
+    Stage,
 )
 from grapharrow.use_cases.cypher_window import (
     limit_optimizations_enabled,
@@ -246,6 +248,182 @@ def _plan_selective_expansion(query: ReadQuery) -> core.CompiledMatchQuery | Non
     )
 
 
+def _plan_distinct_count(query: ReadQuery) -> tuple[core.CompiledMatchQuery, str] | None:
+    """Lower a fixed-hop MATCH, property WITH DISTINCT, and RETURN count(*)."""
+    if len(query.branches) != 1:
+        return None
+    branch = query.branches[0]
+    if branch.initial_scope or len(branch.stages) != 3:
+        return None
+    match, distinct, count = branch.stages
+    if (
+        not isinstance(match, MatchStage)
+        or match.optional
+        or match.paths
+        or match.predicate is not None
+        or len(match.patterns) != 1
+        or not isinstance(distinct, ProjectionStage)
+        or not distinct.distinct
+        or not _plain_projection(distinct)
+    ):
+        return None
+    name = _count_alias(count)
+    if name is None:
+        return None
+    path = match.patterns[0]
+    if not isinstance(path, core.PathPattern) or len(path.steps) != 1:
+        return None
+    step = path.steps[0]
+    if (
+        path.capture_relationships
+        or step.variable is not None
+        or step.variable_length
+        or step.direction == "undirected"
+        or step.rel_type is None
+        or len(step.rel_type_alternatives) > 1
+        or step.properties
+        or path.start.variable == step.node.variable
+        or any(len(node.labels) != 1 or node.properties for node in (path.start, step.node))
+    ):
+        return None
+
+    items = []
+    for alias, expression in distinct.items:
+        if expression.kind != "property":
+            return None
+        owner = expression.arguments[0]
+        field = expression.value
+        if (
+            owner.kind != "variable"
+            or owner.value not in {path.start.variable, step.node.variable}
+            or field in {"id", "keys", "labels", "node_id"}
+            or field.startswith("__")
+        ):
+            return None
+        items.append(core.ReturnItem(alias, owner.value, field))
+    if not items:
+        return None
+    return core.CompiledMatchQuery(
+        patterns=(path,),
+        where_predicate=None,
+        return_items=tuple(items),
+        distinct=False,
+        order_by=None,
+        skip=None,
+        limit=None,
+    ), name
+
+
+def _plain_projection(stage: ProjectionStage) -> bool:
+    return (
+        not stage.globals
+        and stage.predicate is None
+        and not stage.ordering
+        and stage.skip is None
+        and stage.limit is None
+    )
+
+
+def _count_alias(stage: Stage) -> str | None:
+    if (
+        isinstance(stage, ProjectionStage)
+        and not stage.distinct
+        and _plain_projection(stage)
+        and len(stage.items) == 1
+        and stage.items[0][1] == Expression("aggregate", ("count", False))
+    ):
+        return stage.items[0][0]
+    return None
+
+
+def _plan_optional_count(query: ReadQuery) -> core.CompiledMatchOptionalQuery | None:
+    """Lower a pass-through WITH before a fixed-hop OPTIONAL MATCH and count(*)."""
+    if len(query.branches) != 1:
+        return None
+    branch = query.branches[0]
+    if branch.initial_scope or len(branch.stages) != 4:
+        return None
+    start, carried, optional, result = branch.stages
+    name = _count_alias(result)
+    if (
+        name is None
+        or not isinstance(start, MatchStage)
+        or start.optional
+        or start.paths
+        or start.predicate is not None
+        or len(start.patterns) != 1
+        or not isinstance(carried, ProjectionStage)
+        or carried.distinct
+        or not _plain_projection(carried)
+        or not isinstance(optional, MatchStage)
+        or not optional.optional
+        or optional.paths
+        or len(optional.patterns) != 1
+    ):
+        return None
+    anchor, path = start.patterns[0], optional.patterns[0]
+    if (
+        not isinstance(anchor, core.NodePattern)
+        or len(anchor.labels) != 1
+        or anchor.properties
+        or not isinstance(path, core.PathPattern)
+        or len(path.steps) != 1
+        or path.start.variable != anchor.variable
+        or path.start.labels
+        or path.start.properties
+        or path.capture_relationships
+    ):
+        return None
+    step = path.steps[0]
+    if (
+        step.variable is not None
+        or step.variable_length
+        or step.direction == "undirected"
+        or step.rel_type is None
+        or len(step.rel_type_alternatives) > 1
+        or step.properties
+        or step.node.variable == anchor.variable
+        or len(step.node.labels) != 1
+        or step.node.properties
+        or any(alias == step.node.variable for alias, _ in carried.items)
+    ):
+        return None
+    binding = Expression("variable", anchor.variable)
+    if (anchor.variable, binding) not in carried.items or any(
+        expression != binding
+        and (expression.kind != "property" or expression.arguments != (binding,))
+        for _, expression in carried.items
+    ):
+        return None
+    where = None
+    predicate = optional.predicate
+    if predicate is not None:
+        if predicate.kind != "compare" or predicate.value != ("=",):
+            return None
+        left, right = predicate.arguments
+        if (
+            left.kind != "property"
+            or left.arguments != (Expression("variable", step.node.variable),)
+            or right.kind != "literal"
+            or type(right.value) is not bool
+            or left.value in {"id", "keys", "labels", "node_id"}
+            or left.value.startswith("__")
+        ):
+            return None
+        where = core.Comparison(step.node.variable, left.value, "=", right.value)
+    return core.CompiledMatchOptionalQuery(
+        match_patterns=(anchor,),
+        match_where_predicate=None,
+        optional_patterns=(path,),
+        optional_where_predicate=where,
+        return_items=(core.ReturnItem(name, "", None, aggregate="count", count_all=True),),
+        distinct=False,
+        order_by=None,
+        skip=None,
+        limit=None,
+    )
+
+
 def _category(dtype: pa.DataType) -> str:
     if pa.types.is_null(dtype):
         return "null"
@@ -257,6 +435,27 @@ def _category(dtype: pa.DataType) -> str:
         return "float"
     if pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
         return "str"
+    raise UnsupportedColumnar
+
+
+# The separators match the canonical property codec, so equal eligible
+# lists have identical keys without decoding nested values in Python.
+_JSON_LIST_KEYS = tuple(
+    r"^" + re.escape(core._JOIN_JSON_PREFIX) + rf"\[(?:{item}(?:, {item})*)?\]$"
+    for scalar in (r"0|-?[1-9][0-9]*", r"true|false", r'"[\x20-\x21\x23-\x5b\x5d-\x7e]*"')
+    for item in (rf"(?:null|{scalar})",)
+)
+
+
+def _check_list_keys(values: pa.ChunkedArray) -> None:
+    """Hash canonical lists as stored strings when their equality is unambiguous."""
+    if not (pa.types.is_string(values.type) or pa.types.is_large_string(values.type)):
+        raise UnsupportedColumnar
+    if any(
+        pc.all(pc.fill_null(pc.match_substring_regex(values, pattern), True)).as_py()
+        for pattern in _JSON_LIST_KEYS
+    ):
+        return
     raise UnsupportedColumnar
 
 
@@ -410,6 +609,12 @@ class ColumnarReadRuntime:
                 expansion = _plan_selective_expansion(query)
                 if expansion is not None:
                     return self._execute_expansion(graph, expansion)
+                distinct_count = _plan_distinct_count(query)
+                if distinct_count is not None:
+                    return self._execute_distinct_count(graph, *distinct_count)
+                optional_count = _plan_optional_count(query)
+                if optional_count is not None:
+                    return self._execute_optional_count(graph, optional_count)
             plans = tuple(plan_branch(branch) for branch in query.branches)
             self.runtime._snapshot = graph.capture_snapshot()
             rows: list[dict[str, Any]] = []
@@ -443,6 +648,72 @@ class ColumnarReadRuntime:
             return QueryResult(query.columns or (), tuple(rows))
         except (UnsupportedColumnar, pa.ArrowException, OverflowError, TypeError, ValueError):
             return None
+
+    def _execute_distinct_count(
+        self, graph: GraphStateUseCase, query: core.CompiledMatchQuery, name: str
+    ) -> QueryResult:
+        logical = core._build_match_logical_plan(query)
+        if logical is None:
+            raise UnsupportedColumnar
+        path = query.patterns[0]
+        assert isinstance(path, core.PathPattern)
+        with graph.borrow_tabular_state() as state:
+            self.runtime._snapshot = state.snapshot
+            labels = {node.variable: node.labels[0] for node in (path.start, path.steps[0].node)}
+            schemas = {
+                label: graph.load_node_property_schema(snapshot=state.snapshot, label=label)
+                for label in {labels[item.variable] for item in query.return_items}
+            }
+            columns: dict[str, bool] = {}
+            for item in query.return_items:
+                assert item.field is not None
+                schema = schemas[labels[item.variable]]
+                if item.field not in schema.names:
+                    raise UnsupportedColumnar
+                field = schema.field(item.field)
+                encoding = (field.metadata or {}).get(b"grapharrow.encoding")
+                if encoding != b"json" and (
+                    encoding != b"native"
+                    or _category(field.type) not in {"int", "bool", "str", "null"}
+                ):
+                    raise UnsupportedColumnar
+                columns[f"{item.variable}.{item.field}"] = encoding == b"json"
+            planned = self.runtime.executor._execute_match_logical_plan(logical, state=state)
+            assert planned.table is not None
+            if not planned.table.num_rows:
+                return QueryResult((name,), ({name: 0},))
+            keys = list(columns)
+            rows = planned.table.select(keys)
+            for column, encoded in columns.items():
+                if encoded:
+                    _check_list_keys(rows[column])
+            size = (
+                len(pc.unique(rows[keys[0]]))
+                if len(keys) == 1
+                else rows.group_by(keys).aggregate([]).num_rows
+            )
+            return QueryResult((name,), ({name: size},))
+
+    def _execute_optional_count(
+        self, graph: GraphStateUseCase, query: core.CompiledMatchOptionalQuery
+    ) -> QueryResult:
+        with graph.borrow_tabular_state() as state:
+            self.runtime._snapshot = state.snapshot
+            predicate = query.optional_where_predicate
+            if isinstance(predicate, core.Comparison):
+                path = query.optional_patterns[0]
+                assert isinstance(path, core.PathPattern)
+                schema = graph.load_node_property_schema(
+                    snapshot=state.snapshot, label=path.steps[0].node.labels[0]
+                )
+                if predicate.field not in schema.names:
+                    raise UnsupportedColumnar
+                field = schema.field(predicate.field)
+                if (field.metadata or {}).get(
+                    b"grapharrow.encoding"
+                ) != b"native" or not pa.types.is_boolean(field.type):
+                    raise UnsupportedColumnar
+            return self.runtime.executor._execute_match_optional(query, state=state)
 
     def _execute_expansion(
         self, graph: GraphStateUseCase, query: core.CompiledMatchQuery

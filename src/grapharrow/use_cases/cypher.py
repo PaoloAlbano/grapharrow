@@ -839,6 +839,11 @@ class CypherQueryUseCase:
                         )
         query = WriteCompiler(params, self._procedures).compile_write(tree)
         with _query_phase("runtime"):
+            from grapharrow.use_cases.cypher_point_set import try_point_set_batch
+
+            result = try_point_set_batch(self, query, idempotency=idempotency)
+            if result is not None:
+                return result
             return self._execute_write(
                 lambda executor: WriteRuntime(executor).execute_write(query),
                 idempotency=idempotency,
@@ -1786,13 +1791,15 @@ class CypherQueryUseCase:
             arrow=arrow,
         )
 
-    def _execute_match_optional(self, query: CompiledMatchOptionalQuery) -> QueryResult:
+    def _execute_match_optional(
+        self, query: CompiledMatchOptionalQuery, *, state: GraphTabularState | None = None
+    ) -> QueryResult:
         """Execute this query shape and return the result needed by the caller."""
         logical_plan = (
             _build_match_optional_logical_plan(query) if _cypher_planner_enabled() else None
         )
         if logical_plan is not None:
-            planned = self._execute_match_logical_plan(logical_plan)
+            planned = self._execute_match_logical_plan(logical_plan, state=state)
             if planned.query_result is not None:
                 return cast(QueryResult, planned.query_result)
             assert planned.table is not None
@@ -1804,7 +1811,7 @@ class CypherQueryUseCase:
                 skip=None if planned.planned_order_window else query.skip,
                 limit=None if planned.planned_order_window else query.limit,
             )
-        state = self._graph_service.load_tabular_state()
+        state = state if state is not None else self._graph_service.load_tabular_state()
         adjacency_loader = self._adjacency_loader_for_state(state)
         node_property_loader = self._node_property_loader_for_state(state)
         edge_property_loader = self._edge_property_loader_for_state(state)

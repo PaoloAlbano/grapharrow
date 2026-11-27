@@ -6,10 +6,10 @@ own their physical layout; callers consume Arrow tables and graph records.
 
 from __future__ import annotations
 
-from collections.abc import Generator, Iterator
+from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, TypeAlias, runtime_checkable
 
 import pyarrow as pa  # type: ignore[import-untyped]
 
@@ -39,6 +39,9 @@ from grapharrow.storage.models import (
 
 if TYPE_CHECKING:
     from grapharrow.use_cases.graph import GraphState
+
+
+EdgePropertySource: TypeAlias = tuple[tuple[DatasetFile, ...], Callable[[], pa.Table]]
 
 
 class CatalogStore(Protocol):
@@ -102,7 +105,15 @@ class GraphStore(Protocol):
 
     def load_node_table(self, files: tuple[DatasetFile, ...]) -> pa.Table: ...
 
-    def load_edge_table(self, files: tuple[DatasetFile, ...]) -> pa.Table: ...
+    def load_edge_table(
+        self, files: tuple[DatasetFile, ...], *, topology_only: bool = False
+    ) -> pa.Table: ...
+
+    def edge_property_sources(
+        self, files: tuple[DatasetFile, ...]
+    ) -> Iterable[EdgePropertySource] | None:
+        """Expose lazy property reads keyed by immutable files within a pinned snapshot."""
+        ...
 
     def load_node_label_table(self, files: tuple[DatasetFile, ...]) -> pa.Table: ...
 
@@ -253,6 +264,15 @@ class StorageBackend(Protocol):
         properties: dict[str, object],
         receipt: PointWriteReceipt | None = None,
     ) -> AbstractContextManager[tuple[EdgeRecord | None] | None]: ...
+
+    def edit_edge_property_batch(
+        self,
+        *,
+        property_name: str,
+        updates: dict[int, object],
+        rel_type: str | None,
+        receipt: PointWriteReceipt | None = None,
+    ) -> AbstractContextManager[tuple[EdgeRecord, ...] | None]: ...
 
     def edit_node_properties_by_id(
         self,

@@ -133,6 +133,44 @@ _STRING_LIST_JSON = (
 )
 
 
+def _normalize_entity_search(table: pa.Table, keys: pa.Array, *, aliases: bool) -> pa.Table:
+    """Prepare query-independent values in the pinned label's canonical order."""
+    name = (
+        table["name"].cast(pa.string())
+        if "name" in table.column_names
+        else pa.nulls(table.num_rows, type=pa.string())
+    )
+
+    def non_ascii(column: Any) -> Any:
+        return pc.fill_null(pc.match_substring_regex(column, pattern=r"[^\x00-\x7f]"), False)
+
+    unsafe = non_ascii(name)
+    columns = {"name": name, "name_lower": pc.ascii_lower(name)}
+    if "description" in table.column_names:
+        description = table["description"].cast(pa.string())
+        unsafe = pc.or_(unsafe, pc.or_(pc.is_null(description), non_ascii(description)))
+        columns["description_lower"] = pc.ascii_lower(description)
+    if aliases:
+        raw = pc.ascii_lower(table["aliases"])
+        malformed = pc.and_(
+            pc.is_valid(raw),
+            pc.invert(pc.fill_null(pc.match_substring_regex(raw, _STRING_LIST_JSON), False)),
+        )
+        escaped = pc.fill_null(pc.match_substring(raw, "\\"), False)
+        unsafe = pc.or_(unsafe, pc.or_(malformed, pc.or_(escaped, non_ascii(raw))))
+        columns["aliases_lower"] = raw
+    columns["unsafe"] = unsafe
+    prepared = pa.table(columns)
+    if not table["node_id"].equals(pa.chunked_array([keys])):
+        positions = pc.index_in(keys, value_set=table["node_id"])
+        if positions.null_count:
+            raise pa.ArrowInvalid("Node property projection is missing canonical bindings")
+        prepared = prepared.take(positions)
+    return prepared.append_column("node_id", keys).append_column(
+        "ordinal", pa.array(range(len(keys)), type=pa.int64())
+    )
+
+
 def _entity_prefilter(
     backend: Any, label: str, text: str, terms: list[str], search_terms: list[str], limit: int
 ) -> list[int] | None:
@@ -150,7 +188,7 @@ def _entity_prefilter(
         return None
     if len(needle) > 64 or len(search_terms) > 16:
         return None
-    table = backend._property_tables.get(label)
+    table = backend._property_table(label)
     if (
         table is None
         or "node_id" not in table.column_names
@@ -188,9 +226,6 @@ def _entity_prefilter(
         ):
             return None
     keys = pa.array(ids, type=pa.int64())
-    positions = pc.index_in(keys, value_set=table["node_id"])
-    if positions.null_count:
-        return None
     # Reverse matches (a whole stored name/alias inside the question) matter for
     # alternatives. Cap the question length above before enumerating substrings.
     parts = sorted(
@@ -201,66 +236,50 @@ def _entity_prefilter(
         }
     )
     try:
-        name = (
-            table["name"].cast(pa.string())
-            if "name" in table.column_names
-            else pa.nulls(table.num_rows, type=pa.string())
-        )
-        lowered = pc.ascii_lower(name)
-        ranked = _rank_entity_rows(
-            table, keys, positions, name, lowered, aliases, text, terms, search_terms, parts, limit
-        )
-        if ranked is not None:
-            return ranked
-        masks = [
-            pc.match_substring(lowered, needle),
-            pc.is_in(lowered, value_set=pa.array(parts, type=pa.string())),
-            pc.match_substring_regex(name, pattern=r"[^\x00-\x7f]"),
-        ]
-        if "description" in table.column_names:
-            description = table["description"].cast(pa.string())
-            masks.append(pc.match_substring_regex(description, pattern=r"[^\x00-\x7f]"))
-            description = pc.ascii_lower(pc.fill_null(description, "none"))
-        else:
-            description = None
-        for term in search_terms:
-            masks.append(pc.match_substring(lowered, term))
-            if description is not None:
-                masks.append(pc.match_substring(description, term))
-        if aliases is not None:
-            raw = pc.ascii_lower(aliases)
-            masks.extend(
-                [
-                    pc.and_kleene(
-                        pc.is_valid(raw),
-                        pc.invert(pc.match_substring_regex(raw, pattern=_STRING_LIST_JSON)),
-                    ),
-                    pc.match_substring(raw, "\\u"),
-                    pc.match_substring_regex(raw, pattern=r"[^\x00-\x7f]"),
-                    pc.match_substring(raw, json.dumps(needle)[1:-1]),
-                ]
-            )
+        with backend._borrow_entity_search(
+            label, lambda: _normalize_entity_search(table, keys, aliases=aliases is not None)
+        ) as normalized:
+            if not normalized["node_id"].equals(pa.chunked_array([keys])):
+                return None
+            lowered = normalized["name_lower"]
+            ranked = _rank_entity_rows(normalized, text, terms, search_terms, parts, limit)
+            if ranked is not None:
+                return ranked
+            masks = [
+                pc.match_substring(lowered, needle),
+                pc.is_in(lowered, value_set=pa.array(parts, type=pa.string())),
+                normalized["unsafe"],
+            ]
+            if "description" in table.column_names:
+                description = pc.fill_null(normalized["description_lower"], "none")
+            else:
+                description = None
             for term in search_terms:
-                masks.append(pc.match_substring(raw, json.dumps(term)[1:-1]))
-            reverse = '"(?:' + "|".join(re.escape(json.dumps(part)[1:-1]) for part in parts) + ')"'
-            masks.append(pc.match_substring_regex(raw, pattern=reverse))
-        mask = masks[0]
-        for part in masks[1:]:
-            mask = pc.or_kleene(mask, part)
-        return cast(
-            list[int], pc.filter(keys, pc.fill_null(pc.take(mask, positions), False)).to_pylist()
-        )
+                masks.append(pc.match_substring(lowered, term))
+                if description is not None:
+                    masks.append(pc.match_substring(description, term))
+            if aliases is not None:
+                raw = normalized["aliases_lower"]
+                masks.append(pc.match_substring(raw, json.dumps(needle)[1:-1]))
+                for term in search_terms:
+                    masks.append(pc.match_substring(raw, json.dumps(term)[1:-1]))
+                reverse = (
+                    '"(?:' + "|".join(re.escape(json.dumps(part)[1:-1]) for part in parts) + ')"'
+                )
+                masks.append(pc.match_substring_regex(raw, pattern=reverse))
+            mask = masks[0]
+            for part in masks[1:]:
+                mask = pc.or_kleene(mask, part)
+            return cast(
+                list[int],
+                pc.filter(keys, pc.fill_null(mask, False)).to_pylist(),
+            )
     except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError, UnicodeError):
         return None
 
 
 def _rank_entity_rows(
-    table: Any,
-    keys: Any,
-    positions: Any,
-    name: Any,
-    lowered: Any,
-    aliases: Any,
+    normalized: pa.Table,
     text: str,
     terms: list[str],
     search_terms: list[str],
@@ -280,33 +299,15 @@ def _rank_entity_rows(
     def truth(value: Any) -> Any:
         return pc.fill_null(value, False)
 
-    false = pc.is_null(table["node_id"])
-    unsafe = truth(pc.match_substring_regex(name, pattern=r"[^\x00-\x7f]"))
-    description = None
-    if "description" in table.column_names:
-        column = table["description"].cast(pa.string())
-        unsafe = pc.or_(
-            unsafe,
-            pc.or_(
-                pc.is_null(column), truth(pc.match_substring_regex(column, pattern=r"[^\x00-\x7f]"))
-            ),
-        )
-        description = pc.ascii_lower(pc.fill_null(column, ""))
-    raw = pc.ascii_lower(aliases) if aliases is not None else None
-    if raw is not None:
-        unsafe = pc.or_(
-            unsafe,
-            pc.or_(
-                pc.and_(
-                    pc.is_valid(raw),
-                    pc.invert(truth(pc.match_substring_regex(raw, pattern=_STRING_LIST_JSON))),
-                ),
-                pc.or_(
-                    truth(pc.match_substring(raw, "\\")),
-                    truth(pc.match_substring_regex(raw, pattern=r"[^\x00-\x7f]")),
-                ),
-            ),
-        )
+    name, lowered = normalized["name"], normalized["name_lower"]
+    keys = normalized["node_id"]
+    false = pc.is_null(keys)
+    description = (
+        pc.fill_null(normalized["description_lower"], "")
+        if "description_lower" in normalized.column_names
+        else None
+    )
+    raw = normalized["aliases_lower"] if "aliases_lower" in normalized.column_names else None
     alias_hit = truth(pc.match_substring(raw, needle)) if raw is not None else false
     score = pc.if_else(
         truth(pc.equal(name, text)),
@@ -351,14 +352,14 @@ def _rank_entity_rows(
     ranking = pa.table(
         {
             "node_id": keys,
-            "score": pc.take(score, positions),
-            "candidate": pc.take(candidate, positions),
-            "context": pc.take(context, positions),
-            "name": pc.take(pc.fill_null(name, ""), positions),
-            "order": pa.array(range(len(keys)), type=pa.int64()),
+            "score": score,
+            "candidate": candidate,
+            "context": context,
+            "name": name if not name.null_count else pc.fill_null(name, ""),
+            "order": normalized["ordinal"],
         }
     )
-    exceptional = truth(pc.take(unsafe, positions))
+    exceptional = normalized["unsafe"]
     selected = [pc.filter(keys, exceptional)]
     for column, count in (("score", limit), ("candidate", max(limit, 8))):
         eligible = ranking.filter(pc.and_(pc.invert(exceptional), pc.less(ranking[column], 99)))
@@ -374,7 +375,14 @@ def _rank_entity_rows(
                 ],
             )
             selected.append(pc.take(eligible["node_id"], order))
-    candidates = pa.chunked_array(selected, type=pa.int64())
+    candidates = pa.chunked_array(
+        [
+            array
+            for chunk in selected
+            for array in (chunk.chunks if isinstance(chunk, pa.ChunkedArray) else [chunk])
+        ],
+        type=pa.int64(),
+    )
     return cast(list[int], pc.filter(keys, pc.is_in(keys, value_set=candidates)).to_pylist())
 
 
@@ -419,7 +427,7 @@ def value_search(backend: Any, args: dict[str, Any]) -> dict[str, Any]:
 def _value_candidates(
     backend: Any, label: str, prop: str, text: str, mode: str, limit: int
 ) -> tuple[tuple[int, str, int], ...]:
-    table = backend._property_tables.get(label)
+    table = backend._property_table(label)
     if (
         table is not None
         and prop != "node_id"
@@ -483,7 +491,7 @@ def _search_rows(
 ) -> Iterator[tuple[int, dict[str, Any]]]:
     """Read narrow columns, preserving canonical types, missing fields, and input order."""
     ids = backend._label_ids.get(label, []) if node_ids is None else node_ids
-    table = backend._property_tables.get(label)
+    table = backend._property_table(label)
     projected = [prop for prop in properties if table is not None and prop in table.column_names]
     spec = backend._properties({"kind": "node", "label": label}) if require_all_properties else {}
     # Older scalar-subclass projections can mark raw strings as JSON. Seed
