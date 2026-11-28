@@ -109,6 +109,12 @@ class GraphStore(Protocol):
         self, files: tuple[DatasetFile, ...], *, topology_only: bool = False
     ) -> pa.Table: ...
 
+    def load_edge_property_payloads(
+        self, files: tuple[DatasetFile, ...], edge_ids: set[int]
+    ) -> pa.Table:
+        """Read canonical edge IDs and property payloads from pinned files."""
+        ...
+
     def edge_property_sources(
         self, files: tuple[DatasetFile, ...]
     ) -> Iterable[EdgePropertySource] | None:

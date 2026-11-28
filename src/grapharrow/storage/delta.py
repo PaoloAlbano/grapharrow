@@ -61,7 +61,12 @@ from grapharrow.repositories.graph import (
     node_records_from_table,
 )
 from grapharrow.storage.contracts import CatalogStore, GraphStore, SnapshotStore, StorageMaintenance
-from grapharrow.storage.delta_graph import DeltaEdgeRange, DeltaGraphStore, dataset_ref
+from grapharrow.storage.delta_graph import (
+    DeltaEdgeRange,
+    DeltaGraphStore,
+    _edge_partition,
+    dataset_ref,
+)
 from grapharrow.storage.delta_inventory import inspect_delta_storage, plan_delta_retention
 from grapharrow.storage.delta_read_view import DeltaReadView
 from grapharrow.storage.delta_retention import MANAGED_DESCRIPTION, DeltaRetentionCoordinator
@@ -257,7 +262,7 @@ class _ReadVersion:
         if not self.head.edge_range_size or not self.head.edge_count:
             return ()
         return tuple(
-            DeltaEdgeRange(kind, files)
+            DeltaEdgeRange(kind, files, self.head.edge_range_size)
             for kind, files in self.graph_files.items()
             if kind.startswith("edges-")
         )
@@ -1308,10 +1313,23 @@ class DeltaStorageBackend:
         receipt: IdempotencyReceipt,
         commit: CommitProperties,
     ) -> None:
+        position = pc.index(rows[field], identifier).as_py()
+        if position < 0:
+            raise StorageError("The entity is missing from its pinned Delta range.")
+        values = rows["properties_json"]
+        # Keep the unchanged strings in their original buffers while Delta publishes the range.
+        patched = pa.chunked_array(
+            [
+                *values.slice(0, position).chunks,
+                pa.array([properties], type=values.type),
+                *values.slice(position + 1).chunks,
+            ],
+            type=values.type,
+        )
         updated = rows.set_column(
             rows.schema.get_field_index("properties_json"),
             rows.schema.field("properties_json"),
-            pc.if_else(pc.equal(rows[field], identifier), properties, rows["properties_json"]),
+            patched,
         )
         receipts = _receipt_partition(receipt.key_hash)
         # Overwrite both partitions in one transaction. A competing receipt in the same
@@ -1661,10 +1679,6 @@ def _append_receipt(
         [asdict(receipt)], schema=pa.schema([_SCHEMA.field(name) for name in _RECEIPT_COLUMNS])
     )
     return pa.concat_tables([stored.cast(row.schema), row])
-
-
-def _edge_partition(bucket: int) -> str:
-    return f"edges-{bucket:020d}"
 
 
 def _edge_partitions(table: pa.Table, width: int) -> dict[str, pa.Table]:

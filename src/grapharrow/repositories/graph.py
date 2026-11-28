@@ -42,6 +42,9 @@ EDGE_SCHEMA = pa.schema(
     ]
 )
 EDGE_TOPOLOGY_SCHEMA = EDGE_SCHEMA.remove(EDGE_SCHEMA.get_field_index("properties_json"))
+EDGE_PROPERTY_PAYLOAD_SCHEMA = pa.schema(
+    [EDGE_SCHEMA.field(name) for name in ("edge_id", "properties_json")]
+)
 
 NODE_LABEL_SCHEMA = pa.schema([("node_id", pa.int64())])
 
@@ -318,6 +321,19 @@ class GraphRepository:
             [self._absolute_location(dataset_file.path) for dataset_file in files],
             schema=EDGE_TOPOLOGY_SCHEMA if topology_only else EDGE_SCHEMA,
         )
+
+    def load_edge_property_payloads(
+        self, files: tuple[DatasetFile, ...], edge_ids: set[int]
+    ) -> pa.Table:
+        if not edge_ids or not files:
+            return EDGE_PROPERTY_PAYLOAD_SCHEMA.empty_table()
+        selected = tuple(edge_ids)
+        table = self._parquet.read_dataset_table(
+            [self._absolute_location(file.path) for file in files],
+            schema=EDGE_PROPERTY_PAYLOAD_SCHEMA,
+            predicates=(ScanPredicate("edge_id", "in", selected),),
+        )
+        return table.filter(pc.is_in(table["edge_id"], value_set=pa.array(selected, pa.int64())))
 
     @staticmethod
     def edge_property_sources(files: tuple[DatasetFile, ...]) -> None:

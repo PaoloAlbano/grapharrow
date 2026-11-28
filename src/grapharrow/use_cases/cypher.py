@@ -6401,7 +6401,7 @@ def _optional_match_patterns_from_input_table(
 ) -> pa.Table:
     """Produce optional-match rows while preserving left-side bindings when needed."""
     if input_table.num_rows == 0:
-        return input_table
+        return _with_missing_optional_columns(input_table, _pattern_null_columns(patterns))
 
     if _can_use_optional_direct_path(patterns, input_table, where_predicate):
         return _optional_match_single_path_from_input_table(
@@ -6478,10 +6478,15 @@ def _can_use_optional_direct_path(
     pattern = patterns[0]
     if not isinstance(pattern, PathPattern):
         return False
+    if pattern.start.labels or pattern.start.properties:
+        return False
     if pattern.start.variable not in _entity_variables_from_table(input_table):
         return False
     for step in pattern.steps:
         if step.min_hops != 1 or step.max_hops != 1:
+            return False
+        # Filter the complete match before deciding whether an input row needs a null fallback.
+        if step.node.labels or step.node.properties:
             return False
         if step.node.variable in _entity_variables_from_table(input_table):
             return False

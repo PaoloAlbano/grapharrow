@@ -20,6 +20,7 @@ from grapharrow.ana.values import _int_arg, _primary_label
 from grapharrow.ana.values import equal as _property_equal
 from grapharrow.app import GraphArrowApplication
 from grapharrow.core import property_codec
+from grapharrow.core.errors import StorageError
 from grapharrow.use_cases import ana_patterns, ana_roles, ana_search
 from grapharrow.use_cases.ana_edge_statistics import schema_property_type as _property_type
 from grapharrow.use_cases.ana_node_lookup import AnaNodeLookup
@@ -644,6 +645,19 @@ class GraphArrowAgentBackend(AnaRuntime):
             return self._state.edge_table
         with self._application.use_cases.graph.borrow_edge_table(self._state.snapshot) as edges:
             return edges
+
+    def _edge_properties_for_ids(self, edge_ids: set[int]) -> dict[int, str]:
+        rows = self._application.repositories.graph.load_edge_property_payloads(
+            self._state.snapshot.edges, edge_ids
+        )
+        properties = dict(
+            zip(rows["edge_id"].to_pylist(), rows["properties_json"].to_pylist(), strict=True)
+        )
+        if properties.keys() != edge_ids or rows.num_rows != len(edge_ids):
+            raise StorageError(
+                "The selected ANA edges could not be read from their pinned snapshot."
+            )
+        return properties
 
     def _get_snapshot_schema(self) -> SnapshotSchema:
         return self._application._ana_schema_cache.get_or_create(

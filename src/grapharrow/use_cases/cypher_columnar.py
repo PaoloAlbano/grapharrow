@@ -17,7 +17,7 @@ import pyarrow.compute as pc  # type: ignore[import-untyped]
 from grapharrow.adapters.tabular import sort_window_indices
 from grapharrow.domain.scan import ScanPredicate
 from grapharrow.use_cases import cypher as core
-from grapharrow.use_cases.cypher_expression import Expression, freeze, has_aggregate
+from grapharrow.use_cases.cypher_expression import Expression, freeze, has_aggregate, sort_key
 from grapharrow.use_cases.cypher_pipeline import (
     MatchStage,
     ProjectionStage,
@@ -337,17 +337,15 @@ def _count_alias(stage: Stage) -> str | None:
 
 
 def _plan_optional_count(query: ReadQuery) -> core.CompiledMatchOptionalQuery | None:
-    """Lower a pass-through WITH before a fixed-hop OPTIONAL MATCH and count(*)."""
+    """Lower a pass-through WITH and fixed-hop optional grouped counts to Arrow."""
     if len(query.branches) != 1:
         return None
     branch = query.branches[0]
     if branch.initial_scope or len(branch.stages) != 4:
         return None
     start, carried, optional, result = branch.stages
-    name = _count_alias(result)
     if (
-        name is None
-        or not isinstance(start, MatchStage)
+        not isinstance(start, MatchStage)
         or start.optional
         or start.paths
         or start.predicate is not None
@@ -359,6 +357,12 @@ def _plan_optional_count(query: ReadQuery) -> core.CompiledMatchOptionalQuery | 
         or not optional.optional
         or optional.paths
         or len(optional.patterns) != 1
+        or not isinstance(result, ProjectionStage)
+        or result.distinct
+        or result.globals
+        or result.predicate is not None
+        or result.skip is not None
+        or result.limit is not None
     ):
         return None
     anchor, path = start.patterns[0], optional.patterns[0]
@@ -395,6 +399,10 @@ def _plan_optional_count(query: ReadQuery) -> core.CompiledMatchOptionalQuery | 
         for _, expression in carried.items
     ):
         return None
+    output = _optional_count_projection(result, carried, {anchor.variable, step.node.variable})
+    if output is None:
+        return None
+    returns, ordering = output
     where = None
     predicate = optional.predicate
     if predicate is not None:
@@ -416,12 +424,55 @@ def _plan_optional_count(query: ReadQuery) -> core.CompiledMatchOptionalQuery | 
         match_where_predicate=None,
         optional_patterns=(path,),
         optional_where_predicate=where,
-        return_items=(core.ReturnItem(name, "", None, aggregate="count", count_all=True),),
+        return_items=returns,
         distinct=False,
-        order_by=None,
+        order_by=ordering or None,
         skip=None,
         limit=None,
     )
+
+
+def _optional_count_projection(
+    result: ProjectionStage, carried: ProjectionStage, variables: set[str]
+) -> tuple[tuple[core.ReturnItem, ...], tuple[core.OrderByItem, ...]] | None:
+    """Resolve scalar aliases and count inputs against the two node bindings."""
+    aliases = dict(carried.items)
+    returns = []
+    for name, expression in result.items:
+        count = expression.kind == "aggregate"
+        if count:
+            if expression.value != ("count", False):
+                return None
+            if not expression.arguments:
+                returns.append(core.ReturnItem(name, "", None, aggregate="count", count_all=True))
+                continue
+            expression = expression.arguments[0]
+        if expression.kind == "variable":
+            expression = aliases.get(expression.value, expression)
+        if expression.kind != "property":
+            return None
+        owner = expression.arguments[0]
+        field = expression.value
+        if (
+            owner.kind != "variable"
+            or owner.value not in variables
+            or field in {"id", "keys", "labels", "node_id"}
+            or field.startswith("__")
+        ):
+            return None
+        returns.append(
+            core.ReturnItem(name, owner.value, field, aggregate="count" if count else None)
+        )
+
+    if not any(item.aggregate for item in returns):
+        return None
+    names = {item.expression for item in returns}
+    ordering = []
+    for expression, descending in result.ordering:
+        if expression.kind != "variable" or expression.value not in names:
+            return None
+        ordering.append(core.OrderByItem(expression.value, "value", descending))
+    return tuple(returns), tuple(ordering)
 
 
 def _category(dtype: pa.DataType) -> str:
@@ -699,21 +750,49 @@ class ColumnarReadRuntime:
     ) -> QueryResult:
         with graph.borrow_tabular_state() as state:
             self.runtime._snapshot = state.snapshot
+            path = query.optional_patterns[0]
+            anchor = query.match_patterns[0]
+            assert isinstance(path, core.PathPattern) and isinstance(anchor, core.NodePattern)
+            target = path.steps[0].node
             predicate = query.optional_where_predicate
-            if isinstance(predicate, core.Comparison):
-                path = query.optional_patterns[0]
-                assert isinstance(path, core.PathPattern)
-                schema = graph.load_node_property_schema(
-                    snapshot=state.snapshot, label=path.steps[0].node.labels[0]
+            for node in (anchor, target):
+                fields = {
+                    item.field for item in query.return_items if item.variable == node.variable
+                }
+                predicate_field = (
+                    predicate.field
+                    if isinstance(predicate, core.Comparison)
+                    and node.variable == predicate.variable
+                    else None
                 )
-                if predicate.field not in schema.names:
-                    raise UnsupportedColumnar
-                field = schema.field(predicate.field)
-                if (field.metadata or {}).get(
-                    b"grapharrow.encoding"
-                ) != b"native" or not pa.types.is_boolean(field.type):
-                    raise UnsupportedColumnar
-            return self.runtime.executor._execute_match_optional(query, state=state)
+                if predicate_field is not None:
+                    fields.add(predicate_field)
+                if not fields:
+                    continue
+                schema = graph.load_node_property_schema(
+                    snapshot=state.snapshot, label=node.labels[0]
+                )
+                for name in fields:
+                    if name not in schema.names:
+                        raise UnsupportedColumnar
+                    field = schema.field(name)
+                    if (field.metadata or {}).get(b"grapharrow.encoding") != b"native":
+                        raise UnsupportedColumnar
+                    allowed = (
+                        {"bool"} if name == predicate_field else {"bool", "int", "str", "null"}
+                    )
+                    if _category(field.type) not in allowed:
+                        raise UnsupportedColumnar
+            result = self.runtime.executor._execute_match_optional(
+                replace(query, order_by=None), state=state
+            )
+            if query.order_by is None:
+                return result
+            # Composable projections place nulls first when sorting descending.
+            rows = list(result.rows)
+            for order in reversed(query.order_by):
+                rows.sort(key=lambda row: sort_key(row[order.variable]), reverse=order.descending)
+            return QueryResult(result.columns, tuple(rows))
 
     def _execute_expansion(
         self, graph: GraphStateUseCase, query: core.CompiledMatchQuery

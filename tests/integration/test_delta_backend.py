@@ -1872,6 +1872,45 @@ def test_lost_point_set_response_replays_without_rewriting_metadata(
 
 
 @pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
+def test_keyed_set_preserves_wide_properties_at_both_ends_of_a_range(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+) -> None:
+    path, settings = delta_database
+    settings = settings.model_copy(update={"edge_parquet_range_size": 4})
+    app = build_application(path, settings=settings)
+    wide = "0123λ🙂" * 1024
+    app.use_cases.cypher.execute(
+        "CREATE (a:Author), (b:Book) "
+        "CREATE (a)-[:WROTE {since:2020, text:$text}]->(b), "
+        "(a)-[:WROTE {since:2021, text:$text}]->(b), "
+        "(a)-[:WROTE {since:2022, text:$text}]->(b), "
+        "(a)-[:WROTE {since:2023, text:$text}]->(b)",
+        {"text": wide},
+    )
+    pinned = app.storage_backend.capture_snapshot()
+    with TestClient(create_rest_app(path, settings=settings)) as client:
+        for edge_id in (1, 4):
+            headers = {"Idempotency-Key": f"wide-{edge_id}"}
+            payload = {"query": SET_EDGE, "params": {"id": edge_id, "since": 2030 + edge_id}}
+            response = client.post("/v1/query", json=payload, headers=headers)
+            assert response.status_code == 200
+            assert response.json()["data"]["rows"] == [{"since": 2030 + edge_id}]
+            assert (
+                client.post("/v1/query", json=payload, headers=headers).content == response.content
+            )
+
+    graph = app.use_cases.graph
+    current = graph.load_state()
+    assert current.snapshot.snapshot_id.value == pinned.snapshot_id.value + 2
+    assert [edge.properties for edge in current.edges] == [
+        {"since": since, "text": wide} for since in (2031, 2021, 2022, 2034)
+    ]
+    assert [edge.properties for edge in graph.load_state(snapshot=pinned).edges] == [
+        {"since": since, "text": wide} for since in range(2020, 2024)
+    ]
+
+
+@pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
 @pytest.mark.parametrize(
     "overlap", ["disjoint", "same-range", "same-key", "key-mismatch", "receipt-bucket", "catalog"]
 )
@@ -2588,6 +2627,122 @@ def test_delta_pinned_read_view_survives_head_advance_and_releases(
         assert backend._read_table(pinned.snapshot_id) is historical
     assert opened.count(pinned.snapshot_id) == 1
     assert not backend._read_pins
+
+
+@pytest.mark.parametrize(
+    ("delta_database", "width"),
+    [("local", 2), ("local", 0), ("s3", 2)],
+    indirect=["delta_database"],
+)
+def test_delta_ana_pattern_reads_only_selected_edge_properties_from_its_snapshot(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+    width: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from grapharrow.use_cases import ana_patterns
+
+    path, settings = delta_database
+    settings = settings.model_copy(update={"edge_parquet_range_size": width})
+    writer = build_application(path, settings=settings)
+    reader = build_application(path, settings=settings)
+    writer.use_cases.cypher.execute(
+        "CREATE (seed:Author:Seed), (other:Author), (book:Book), (draft:Draft) "
+        "CREATE (seed)-[:WROTE {since:2020, text:$text}]->(book), "
+        "(seed)-[:WROTE {since:2010, text:$text}]->(draft), "
+        "(other)-[:WROTE {since:2011, text:$text}]->(draft), "
+        "(other)-[:WROTE {since:2012, text:$text}]->(draft), "
+        "(seed)-[:WROTE {since:2025, text:$text}]->(book)",
+        {"text": "Wide properties λ" * 512},
+    )
+    graph = reader.repositories.graph
+    read = graph._read_partition
+    selections: list[tuple[SnapshotId, str, list[int]]] = []
+    full_reads: list[str] = []
+
+    def track(snapshot_id: SnapshotId, kind: str, columns: list[str], expression: object):
+        table = read(snapshot_id, kind, columns, expression)
+        if columns == ["edge_id", "properties_json"]:
+            assert expression is not None
+            selections.append((snapshot_id, kind, table["edge_id"].to_pylist()))
+        elif kind.startswith("edges") and "edge_id" in columns and "properties_json" in columns:
+            full_reads.append(kind)
+        return table
+
+    monkeypatch.setattr(graph, "_read_partition", track)
+
+    def pattern(workflow: GraphArrowAgentBackend, **overrides: Any) -> list[list[object]]:
+        seed = workflow.call("node_scan", {"label": "Seed", "as": "author", "limit": 1})
+        result = workflow.call(
+            "pattern_query",
+            {
+                "from": seed["handle"],
+                "start_label": "Author",
+                "start_as": "author",
+                "hops": [{"relationship_type": "WROTE", "target_label": "Book", "rel_as": "r"}],
+                "select": [{"var": "r", "property": "since"}],
+                "distinct": False,
+                **overrides,
+            },
+        )
+        return workflow.call("fetch", {"from": result["handle"]})["rows"]
+
+    with GraphArrowAgentBackend(reader) as pinned:
+        base = pinned._state.snapshot.snapshot_id
+        assert pattern(pinned) == [[2020], [2025]]
+        assert not full_reads
+        assert selections == (
+            [(base, "edges-00000000000000000000", [1]), (base, "edges-00000000000000000002", [5])]
+            if width
+            else [(base, "edges", [1, 5])]
+        )
+        selections.clear()
+        assert pattern(pinned) == [[2020], [2025]]
+        assert (
+            pattern(
+                pinned,
+                hops=[{"relationship_type": "WROTE", "target_label": "Missing", "rel_as": "r"}],
+            )
+            == []
+        )
+        assert not selections and not full_reads
+
+        writer.use_cases.cypher.execute(SET_EDGE, {"id": 5, "since": 2035})
+        with GraphArrowAgentBackend(reader) as fresh:
+            current = fresh._state.snapshot.snapshot_id
+            assert current != base
+            assert pattern(fresh) == [[2020], [2035]]
+            assert selections == (
+                [(current, "edges-00000000000000000002", [5])]
+                if width
+                else [(current, "edges", [1, 5])]
+            )
+            assert not full_reads
+            assert pattern(
+                fresh, filters=[{"var": "r", "property": "since", "op": "gt", "value": 2020}]
+            ) == [[2035]]
+
+        assert pattern(pinned) == [[2020], [2025]]
+        assert pattern(
+            pinned,
+            hops=[
+                {"relationship_type": "WROTE", "target_label": "Book", "rel_as": "r"},
+                {
+                    "relationship_type": "WROTE",
+                    "direction": "in",
+                    "target_label": "Author",
+                    "rel_as": "back",
+                },
+            ],
+            select=[
+                {"var": "r", "property": "since", "alias": "outbound"},
+                {"var": "back", "property": "since", "alias": "inbound"},
+            ],
+        ) == [[2020, 2025], [2025, 2020]]
+
+        with monkeypatch.context() as patch:
+            patch.setattr(ana_patterns, "_MAX_SELECTIVE_EDGES", 1)
+            assert pattern(pinned) == [[2020], [2025]]
+        assert full_reads
 
 
 @pytest.mark.parametrize("delta_database", ["local"], indirect=True)

@@ -122,6 +122,61 @@ def test_fixed_hop_count_pipelines_preserve_duplicates_and_optional_rows(
     assert cypher.execute(list_query).rows == ({"n": 3},)
 
 
+@pytest.mark.parametrize("backend", ["native", "delta"])
+def test_with_optional_grouped_counts_use_arrow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
+    if backend == "delta":
+        pytest.importorskip("deltalake")
+    app = build_application(
+        tmp_path / backend, settings=GraphArrowSettings(storage_backend=backend)
+    )
+    cypher = app.use_cases.cypher
+    cypher.execute(
+        "CREATE (a:Source {zone:1}), (b:Source {zone:2}), (:Source {zone:2}), (:Source), "
+        "(x:Reading {active:true, value:7}), (y:Reading {active:true}), "
+        "(z:Reading {active:false, value:8}), (other:Noise {value:9}), "
+        "(a)-[:LINK]->(x), (a)-[:LINK]->(x), (a)-[:LINK]->(y), "
+        "(a)-[:LINK]->(other), (b)-[:LINK]->(z), (b)-[:LINK]->(other)"
+    )
+    query = (
+        "MATCH (s:Source) WITH s, s.zone AS zone "
+        "OPTIONAL MATCH (s)-[:LINK]->(t:Reading) WHERE t.active = true "
+        "RETURN zone AS area, count(*) AS rows, count(t.value) AS readings, "
+        "count(zone) AS known ORDER BY area DESC"
+    )
+
+    def no_records(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("A grouped optional count materialized graph records")
+
+    with monkeypatch.context() as patch:
+        patch.setenv("GRAPHARROW_DISABLE_CYPHER_COLUMNAR", "1")
+        expected = cypher.execute(query)
+    assert expected.rows == (
+        {"area": None, "rows": 1, "readings": 0, "known": 0},
+        {"area": 2, "rows": 2, "readings": 0, "known": 2},
+        {"area": 1, "rows": 3, "readings": 2, "known": 3},
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(app.use_cases.graph, "load_state", no_records)
+        assert cypher.execute(query) == expected
+        assert cypher.execute(query.replace(" WHERE t.active = true", "")).rows == (
+            {"area": None, "rows": 1, "readings": 0, "known": 0},
+            {"area": 2, "rows": 2, "readings": 1, "known": 2},
+            {"area": 1, "rows": 3, "readings": 2, "known": 3},
+        )
+        assert cypher.execute(
+            "MATCH (s:Absent) WITH s OPTIONAL MATCH (s)-[:LINK]->(t:Reading) "
+            "RETURN count(t.value) AS readings"
+        ).rows == ({"readings": 0},)
+
+    cypher.execute("CREATE (:Source {zone:[1]})")
+    with monkeypatch.context() as patch:
+        patch.setenv("GRAPHARROW_DISABLE_CYPHER_COLUMNAR", "1")
+        expected_mixed = cypher.execute(query)
+    assert cypher.execute(query) == expected_mixed
+
+
 @pytest.mark.parametrize(
     "query",
     [

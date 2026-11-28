@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Callable, Generator, Iterable
 from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ import pyarrow.dataset as ds  # type: ignore[import-untyped]
 from grapharrow.adapters.scan_filter import dataset_filter
 from grapharrow.adapters.snapshot_tables import SnapshotTableCache
 from grapharrow.core import property_codec
+from grapharrow.core.errors import StorageError
 from grapharrow.domain import DatasetFile, SnapshotId, SnapshotManifest
 from grapharrow.domain.records import EdgeRecord, NodeRecord
 from grapharrow.domain.scan import ScanPredicate
@@ -22,6 +24,7 @@ from grapharrow.domain.snapshot import DatasetKind
 from grapharrow.repositories.graph import (
     _EDGE_ENDPOINT_FIELDS,
     ADJACENCY_BY_SOURCE_SCHEMA,
+    EDGE_PROPERTY_PAYLOAD_SCHEMA,
     EDGE_SCHEMA,
     EDGE_TOPOLOGY_SCHEMA,
     NODE_LABEL_SCHEMA,
@@ -58,10 +61,15 @@ def _snapshot_id(file: DatasetFile) -> SnapshotId:
     return SnapshotId(int(file.path.split("/")[1]))
 
 
+def _edge_partition(bucket: int) -> str:
+    return f"edges-{bucket:020d}"
+
+
 @dataclass(frozen=True, slots=True)
 class DeltaEdgeRange:
     partition: str
     files: tuple[DatasetFile, ...]
+    width: int
 
 
 class DeltaGraphStore:
@@ -148,6 +156,43 @@ class DeltaGraphStore:
                     for item in ranges
                 ]
             )
+
+    def load_edge_property_payloads(
+        self, files: tuple[DatasetFile, ...], edge_ids: set[int]
+    ) -> pa.Table:
+        if not edge_ids or not files:
+            return EDGE_PROPERTY_PAYLOAD_SCHEMA.empty_table()
+        snapshot_id = _snapshot_id(files[0])
+        ranges = self._edge_ranges(snapshot_id)
+        parts = {}
+        requested: dict[str, list[int]] = defaultdict(list)
+        if ranges:
+            width = ranges[0].width
+            parts = {item.partition: item.files for item in ranges}
+            for edge_id in sorted(edge_ids):
+                requested[_edge_partition((edge_id - 1) // width)].append(edge_id)
+        else:
+            parts["edges"] = files
+            requested["edges"] = sorted(edge_ids)
+
+        columns = EDGE_PROPERTY_PAYLOAD_SCHEMA.names
+        tables = []
+        for kind, ids in requested.items():
+            physical = parts.get(kind)
+            if not physical:
+                raise StorageError("The selected ANA edges are missing from their pinned range.")
+            # Key the selection by immutable files so a later unrelated commit can reuse it.
+            suffix = ",".join(map(str, ids))
+            key = tuple(
+                DatasetFile(f"{file.path}#{suffix}", file.row_count, file.kind) for file in physical
+            )
+            expression = ds.field("edge_id").isin(ids)
+            with self._snapshot_tables.borrow(
+                ("edge_property_payloads", key),
+                partial(self._read_partition, snapshot_id, kind, columns, expression),
+            ) as table:
+                tables.append(table.cast(EDGE_PROPERTY_PAYLOAD_SCHEMA))
+        return pa.concat_tables(tables)
 
     def edge_property_sources(
         self, files: tuple[DatasetFile, ...]

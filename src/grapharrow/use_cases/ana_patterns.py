@@ -37,6 +37,8 @@ from grapharrow.use_cases.ana_seed import select_node_ids
 
 _BATCH_SOURCE_THRESHOLD = 8
 _EDGE_ROW_BATCH_SIZE = 256
+_MAX_SELECTIVE_EDGE_SOURCES = 32
+_MAX_SELECTIVE_EDGES = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +253,7 @@ def iter_extend_rows(
     distinct: bool = False,
     matched_node_ids: set[int] | None = None,
     required_bindings: set[str] | None = None,
+    selective_edge_properties: bool = False,
 ) -> tuple[Iterator[dict[str, Any]], str]:
     """Validate a hop eagerly and expand bounded input batches in binding order."""
     rel_type = str(hop["relationship_type"])
@@ -264,58 +267,101 @@ def iter_extend_rows(
         raise ValueError(f"Unknown relationship_type {rel_type!r}")
     if rel_var in {source, target}:
         raise ValueError("Relationship and node variables must be distinct")
-    scan = backend._traversal_scan(rel_type, properties=True)
+    topology = (
+        backend._traversal_scan(rel_type)
+        if selective_edge_properties and backend._edge_topology_only
+        else None
+    )
     source_column, target_column = (
         ("src_id", "dst_id") if direction == "out" else ("dst_id", "src_id")
     )
     target_ids = set(backend._label_ids.get(target_label, []))
     keep_target = required_bindings is None or target in required_bindings
 
+    def matching_edges(
+        batch: list[dict[str, Any]], scan: TraversalScan, *, properties: bool
+    ) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
+        candidates = backend._edges_for_sources(
+            rel_type,
+            [source_node_id(row[source], backend._owner) for row in batch],
+            (source_column,),
+            properties=properties,
+            max_batch_rows=4096,
+            scan=scan,
+        )
+        for row, selected in zip(batch, candidates, strict=True):
+            for edge in selected:
+                edge_id = str(edge["edge_id"])
+                target_id = edge[target_column]
+                if target_id not in target_ids:
+                    continue
+                if exclude_traversed and edge_id in row.get("__rel_ids", []):
+                    continue
+                if target in row and entity_identity(row[target]) != EntityReference(
+                    backend._owner, str(target_id)
+                ):
+                    continue
+                if rel_var in row and str(row[rel_var]["id"]) != edge_id:
+                    continue
+                yield row, edge
+
+    def bind(row: dict[str, Any], edge: dict[str, Any], properties: str) -> dict[str, Any]:
+        edge_id = str(edge["edge_id"])
+        expanded = row.copy()
+        if keep_target:
+            expanded[target] = backend._node(edge[target_column])
+        expanded[rel_var] = {
+            "id": edge_id,
+            "type": rel_type,
+            "start": str(edge["src_id"]),
+            "end": str(edge["dst_id"]),
+            "properties": property_codec.loads(properties, public=True),
+        }
+        expanded["__rel_ids"] = [*row.get("__rel_ids", []), edge_id]
+        return expanded
+
     def expand() -> Iterator[dict[str, Any]]:
-        inputs = iter(rows)
         emitted = 0
-        while batch := list(islice(inputs, _EDGE_ROW_BATCH_SIZE)):
-            node_ids = [source_node_id(row[source], backend._owner) for row in batch]
-            candidates = backend._edges_for_sources(
-                rel_type,
-                node_ids,
-                (source_column,),
-                properties=True,
-                max_batch_rows=4096,
-                scan=scan,
-            )
-            for row, selected in zip(batch, candidates, strict=True):
-                for edge in selected:
-                    edge_id = str(edge["edge_id"])
+
+        def admitted(
+            pairs: Iterable[tuple[dict[str, Any], dict[str, Any]]],
+        ) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
+            nonlocal emitted
+            for row, edge in pairs:
+                if matched_node_ids is not None:
                     target_id = edge[target_column]
-                    if target_id not in target_ids:
+                    duplicate = target_id in matched_node_ids
+                    matched_node_ids.add(target_id)
+                    if (max_rows is not None and emitted >= max_rows) or distinct and duplicate:
                         continue
-                    if exclude_traversed and edge_id in row.get("__rel_ids", []):
-                        continue
-                    if target in row and entity_identity(row[target]) != EntityReference(
-                        backend._owner, str(target_id)
-                    ):
-                        continue
-                    if rel_var in row and str(row[rel_var]["id"]) != edge_id:
-                        continue
-                    if matched_node_ids is not None:
-                        duplicate = target_id in matched_node_ids
-                        matched_node_ids.add(target_id)
-                        if (max_rows is not None and emitted >= max_rows) or distinct and duplicate:
-                            continue
-                    emitted += 1
-                    expanded = row.copy()
-                    if keep_target:
-                        expanded[target] = backend._node(target_id)
-                    expanded[rel_var] = {
-                        "id": edge_id,
-                        "type": rel_type,
-                        "start": str(edge["src_id"]),
-                        "end": str(edge["dst_id"]),
-                        "properties": property_codec.loads(edge["properties_json"], public=True),
-                    }
-                    expanded["__rel_ids"] = [*row.get("__rel_ids", []), edge_id]
-                    yield expanded
+                emitted += 1
+                yield row, edge
+
+        inputs = iter(rows)
+        full_scan = None
+        while batch := list(islice(inputs, _EDGE_ROW_BATCH_SIZE)):
+            if (
+                topology is not None
+                and full_scan is None
+                and len(batch) <= _MAX_SELECTIVE_EDGE_SOURCES
+            ):
+                matches = matching_edges(batch, topology, properties=False)
+                pairs = list(islice(matches, _MAX_SELECTIVE_EDGES + 1))
+                if len(pairs) <= _MAX_SELECTIVE_EDGES:
+                    visible = list(admitted(pairs))
+                    if visible:
+                        properties = backend._edge_properties_for_ids(
+                            {edge["edge_id"] for _, edge in visible}
+                        )
+                        for row, edge in visible:
+                            yield bind(row, edge, properties[edge["edge_id"]])
+                    continue
+
+            # Wide expansions share the full Arrow scan across their source batches.
+            if full_scan is None:
+                full_scan = backend._traversal_scan(rel_type, properties=True)
+            for row, edge in admitted(matching_edges(batch, full_scan, properties=True)):
+                yield bind(row, edge, edge["properties_json"])
 
     return expand(), target
 
@@ -347,6 +393,7 @@ def prepare_pattern(
     require_hops: bool = False,
     limit_final_rows: bool = False,
     project_aggregate_bindings: bool = False,
+    selective_edge_properties: bool = False,
 ) -> tuple[Iterable[dict[str, Any]], str, dict[str, Any], set[int] | None]:
     hops = list(args.get("hops") or [])
     if require_hops and not hops:
@@ -430,6 +477,7 @@ def prepare_pattern(
             max_rows=max_rows,
             distinct=_bool_arg(normalized.get("distinct")),
             matched_node_ids=matched_node_ids,
+            selective_edge_properties=selective_edge_properties,
             required_bindings=(
                 bound | aggregate_bindings if final_hop and aggregate_bindings is not None else None
             ),
@@ -768,6 +816,7 @@ def pattern_query(backend: Any, args: dict[str, Any], *, multi_hop: bool = False
         require_hops=multi_hop,
         limit_final_rows=True,
         project_aggregate_bindings=True,
+        selective_edge_properties=True,
     )
     return finish_pattern(backend, rows, focus, normalized, node_ids=node_ids)
 
