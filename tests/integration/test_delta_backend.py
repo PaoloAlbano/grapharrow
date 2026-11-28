@@ -2663,7 +2663,7 @@ def test_delta_ana_pattern_reads_only_selected_edge_properties_from_its_snapshot
         table = read(snapshot_id, kind, columns, expression)
         if columns == ["edge_id", "properties_json"]:
             assert expression is not None
-            selections.append((snapshot_id, kind, table["edge_id"].to_pylist()))
+            selections.append((snapshot_id, kind, sorted(table["edge_id"].to_pylist())))
         elif kind.startswith("edges") and "edge_id" in columns and "properties_json" in columns:
             full_reads.append(kind)
         return table
