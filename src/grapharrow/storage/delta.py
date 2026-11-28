@@ -1121,18 +1121,26 @@ class DeltaStorageBackend:
                 if prepared is not None:
                     self._commit_receipt(snapshot.snapshot_id, prepared)
                 return
-            # Match the general batch writer's pinned-base policy, including
-            # ranges read for the result whose rows did not change.
-            with self._point_publication(snapshot.snapshot_id, max_retries=0) as (base, commit):
+            # Rebase only when the overwrite predicate covers every range read.
+            # An unchanged range can still determine the returned rows.
+            can_rebase = staged.keys() == ranges.keys()
+            retries = _POINT_COMMIT_RETRIES if can_rebase else 0
+            with self._point_publication(snapshot.snapshot_id, max_retries=retries) as (
+                base,
+                commit,
+            ):
                 if prepared is not None:
                     kind = _receipt_partition(prepared.key_hash)
                     staged[kind] = self._append_write_receipt(base, kind, prepared)
                 kinds = ", ".join(f"'{kind}'" for kind in staged)
+                predicate = f"kind IN ({kinds})"
+                if can_rebase:
+                    predicate += f" OR {_point_metadata_guard(current.head.commit_id)}"
                 write_deltalake(
                     base,
                     pa.concat_tables([_rows(table, kind) for kind, table in staged.items()]),
                     mode="overwrite",
-                    predicate=f"kind IN ({kinds})",
+                    predicate=predicate,
                     commit_properties=commit,
                 )
 
@@ -1208,8 +1216,7 @@ class DeltaStorageBackend:
             if isinstance(entity, NodeRecord)
             else ("edge_id", entity.edge_id)
         )
-        # The guard matches no row in the base and matches replacement metadata during rebase.
-        guard = f"(kind = 'metadata' AND (key_hash IS NULL OR key_hash <> '{metadata_id}'))"
+        guard = _point_metadata_guard(metadata_id)
         properties = property_codec.dumps(entity.properties)
         with self._point_publication(snapshot_id, max_retries=_POINT_COMMIT_RETRIES) as (
             base,
@@ -1625,6 +1632,11 @@ def _pointer(manifest: SnapshotManifest) -> CurrentSnapshotPointer:
 
 def _receipt_partition(key_hash: str) -> str:
     return f"receipt-{key_hash[:2]}"
+
+
+def _point_metadata_guard(metadata_id: str) -> str:
+    """Match replacement metadata during rebase while retaining the base row."""
+    return f"(kind = 'metadata' AND (key_hash IS NULL OR key_hash <> '{metadata_id}'))"
 
 
 def _find_receipt(table: _ReadSource, key_hash: str) -> IdempotencyReceipt | None:

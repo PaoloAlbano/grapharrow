@@ -83,7 +83,7 @@ def test_schema_preserves_directed_label_relationships(tmp_path: Path, multi_lab
     expected.sort()
     with GraphArrowAgentBackend(app) as reader:
         arrow = _arrow_label_relationships(reader._state.node_table, reader._state.edge_table)
-        assert arrow == (None if multi_label else expected)
+        assert arrow == expected
         overview = reader.call("schema_overview", {})
         assert overview["relationship_types"] == ["BACK", "HIDDEN", "OUT", "SELF"]
         assert [
@@ -105,6 +105,40 @@ def test_arrow_schema_ignores_missing_and_unlabeled_endpoints() -> None:
         ("Person", "LINK", "Person"),
         ("Person", "SELF", "Person"),
     ]
+
+
+def test_arrow_schema_expands_multilabel_self_loops_without_key_collisions() -> None:
+    nodes = pa.table(
+        {
+            "node_id": [10, 20, 30, 40],
+            "labels": [["a,b", "c"], ["a", "b,c"], ["c", "a,b"], []],
+        }
+    )
+    edges = pa.table(
+        {
+            "src_id": [10, 30, 30, 20, 40, 10, 99, 20],
+            "dst_id": [20, 20, 20, 20, 10, 40, 10, 99],
+            "rel_type": ["LINK", "LINK", "LINK", "SELF", "HIDDEN", "HIDDEN", "HIDDEN", "HIDDEN"],
+        }
+    )
+    nodes = pa.concat_tables([nodes.slice(0, 2), nodes.slice(2)])
+    edges = pa.concat_tables([edges.slice(0, 3), edges.slice(3)])
+    assert _arrow_label_relationships(nodes, edges) == sorted(
+        [
+            *((src, "LINK", dst) for src in ("a,b", "c") for dst in ("a", "b,c")),
+            *((src, "SELF", dst) for src in ("a", "b,c") for dst in ("a", "b,c")),
+        ]
+    )
+
+
+def test_arrow_schema_bounds_wide_multilabel_products(monkeypatch: pytest.MonkeyPatch) -> None:
+    from grapharrow.use_cases import ana
+
+    nodes = pa.table({"node_id": [1, 2], "labels": [["One", "Two"], ["Three", "Four"]]})
+    edges = pa.table({"src_id": [1], "dst_id": [2], "rel_type": ["LINK"]})
+    assert len(_arrow_label_relationships(nodes, edges)) == 4
+    monkeypatch.setattr(ana, "_MAX_SCHEMA_LABEL_PAIRS", 3)
+    assert _arrow_label_relationships(nodes, edges) is None
 
 
 def test_concurrent_workflows_discover_once_and_release_the_cache(

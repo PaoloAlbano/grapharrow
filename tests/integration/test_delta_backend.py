@@ -2031,9 +2031,15 @@ def test_delta_batch_set_preserves_duplicate_and_missing_id_semantics(
     assert current.edges[0].properties == {"since": 2032}
 
 
-@pytest.mark.parametrize("delta_database", ["local"], indirect=True)
-def test_delta_batch_set_rejects_concurrent_publication_atomically(
-    delta_database: tuple[str | Path, GraphArrowSettings], monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("delta_database", ["local", "s3"], indirect=True)
+@pytest.mark.parametrize(
+    "overlap",
+    ["disjoint", "disjoint-unkeyed", "same-range", "catalog", "receipt-bucket", "no-op-range"],
+)
+def test_delta_batch_set_arbitrates_concurrent_publication(
+    delta_database: tuple[str | Path, GraphArrowSettings],
+    overlap: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from grapharrow.storage import delta
 
@@ -2041,30 +2047,82 @@ def test_delta_batch_set_rejects_concurrent_publication_atomically(
     settings = settings.model_copy(update={"edge_parquet_range_size": 2})
     writer = build_application(path, settings=settings)
     writer.use_cases.cypher.execute(CREATE_EDGE_RANGES)
+    writer.use_cases.cypher.execute(
+        "MATCH (a:Author), (b:Book) CREATE (a)-[:WROTE {since:2020}]->(b)"
+    )
     base = writer.storage_backend.capture_snapshot()
     publish = delta.write_deltalake
-
-    def interleave(table, data, **kwargs):
-        if "edges-00000000000000000001" in kwargs.get("predicate", ""):
-            writer.use_cases.cypher.execute(SET_EDGE, {"id": 1, "since": 2099})
-        return publish(table, data, **kwargs)
-
+    interleaved = False
+    concurrent_edge = {"same-range": 2, "no-op-range": 3}.get(overlap, 5)
+    since = 2020 if overlap == "no-op-range" else 2033
     payload = {
         "query": BATCH_SET_EDGE,
-        "params": {"updates": [{"id": 1, "since": 2031}, {"id": 3, "since": 2033}]},
+        "params": {"updates": [{"id": 1, "since": 2031}, {"id": 3, "since": since}]},
     }
-    headers = {"Idempotency-Key": "batched-conflict"}
-    with TestClient(create_rest_app(path, settings=settings)) as client:
+    headers = {} if overlap == "disjoint-unkeyed" else {"Idempotency-Key": "first"}
+    rebased = overlap in {"disjoint", "disjoint-unkeyed"}
+
+    def interleave(table, data, **kwargs):
+        nonlocal interleaved
+        if not interleaved:
+            interleaved = True
+            if overlap == "catalog":
+                writer.use_cases.indexes.create_index(
+                    name="author_name",
+                    kind="range",
+                    owner_kind="label",
+                    owner_name="Author",
+                    property_names=("name",),
+                )
+            elif overlap == "receipt-bucket":
+                other_key = "other-17"
+                assert sha256(other_key.encode()).digest()[0] == sha256(b"first").digest()[0]
+                response = other.post(
+                    "/v1/query",
+                    json={"query": SET_EDGE, "params": {"id": concurrent_edge, "since": 2099}},
+                    headers={"Idempotency-Key": other_key},
+                )
+                assert response.status_code == 200
+            else:
+                writer.use_cases.cypher.execute(SET_EDGE, {"id": concurrent_edge, "since": 2099})
+        return publish(table, data, **kwargs)
+
+    with (
+        TestClient(create_rest_app(path, settings=settings)) as client,
+        TestClient(create_rest_app(path, settings=settings)) as other,
+    ):
         with monkeypatch.context() as patch:
             patch.setattr(delta, "write_deltalake", interleave)
             response = client.post("/v1/query", json=payload, headers=headers)
-        assert response.status_code == 409
+        assert interleaved
         state = writer.use_cases.graph.load_state()
-        assert state.snapshot.snapshot_id.value == base.snapshot_id.value + 1
-        assert [edge.properties["since"] for edge in state.edges] == [2099, 2020, 2020, 2020]
-        retry = client.post("/v1/query", json=payload, headers=headers)
-        assert retry.status_code == 200
-        assert retry.json()["data"]["rows"] == [{"since": 2031}, {"since": 2033}]
+        expected = [2020] * 5
+        if overlap != "catalog":
+            expected[concurrent_edge - 1] = 2099
+        if rebased:
+            assert response.status_code == 200, response.text
+            expected[0], expected[2] = 2031, 2033
+        else:
+            assert response.status_code == 409, response.text
+            assert response.json()["error"]["code"] == "WRITE_CONFLICT"
+        assert [edge.properties["since"] for edge in state.edges] == expected
+        assert state.snapshot.snapshot_id.value == base.snapshot_id.value + (2 if rebased else 1)
+        completed = client.post("/v1/query", json=payload, headers=headers)
+        assert completed.status_code == 200, completed.text
+        assert completed.json()["data"]["rows"] == [{"since": 2031}, {"since": since}]
+        if rebased:
+            assert completed.content == response.content
+            assert writer.storage_backend.capture_snapshot() == state.snapshot
+        if overlap == "receipt-bucket":
+            after_retry = writer.storage_backend.capture_snapshot()
+            replayed = other.post(
+                "/v1/query",
+                json={"query": SET_EDGE, "params": {"id": concurrent_edge, "since": 2099}},
+                headers={"Idempotency-Key": "other-17"},
+            )
+            assert replayed.status_code == 200
+            assert replayed.json()["data"]["rows"] == [{"since": 2099}]
+            assert writer.storage_backend.capture_snapshot() == after_retry
 
 
 @pytest.mark.parametrize("delta_database", ["local"], indirect=True)

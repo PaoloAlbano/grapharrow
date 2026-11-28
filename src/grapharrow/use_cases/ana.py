@@ -34,6 +34,8 @@ from grapharrow.use_cases.ana_runtime import AnaRuntime
 from grapharrow.use_cases.ana_schema_cache import SnapshotSchema
 from grapharrow.use_cases.graph import GraphTabularState
 
+_MAX_SCHEMA_LABEL_PAIRS = 1_048_576
+
 
 class GraphArrowAgentBackend(AnaRuntime):
     """One read-only workflow over an in-memory view of one published snapshot."""
@@ -725,13 +727,16 @@ class GraphArrowAgentBackend(AnaRuntime):
 def _arrow_label_relationships(
     nodes: pa.Table, edges: pa.Table
 ) -> list[tuple[str, str, str]] | None:
-    """Find distinct directed label triples for nodes with at most one label."""
+    """Find distinct directed label triples from the snapshot topology."""
     if not edges.num_rows:
         return []
     node_labels = nodes["labels"]
     lengths = pc.list_value_length(node_labels)
     if pc.any(pc.greater(lengths, 1)).as_py():
-        return None
+        labeled = pc.greater(lengths, 0)
+        return _arrow_multi_label_relationships(
+            nodes["node_id"].filter(labeled), node_labels.filter(labeled).combine_chunks(), edges
+        )
 
     labeled = pc.equal(lengths, 1)
     ids = nodes["node_id"].filter(labeled)
@@ -753,6 +758,50 @@ def _arrow_label_relationships(
     targets = pc.take(labels, pc.index_in(edges["dst_id"], value_set=ids))
     triples = pa.table({"src": sources, "rel": edges["rel_type"], "dst": targets})
     triples = triples.filter(pc.and_(pc.is_valid(sources), pc.is_valid(targets)))
+    return _sorted_label_triples(triples)
+
+
+def _arrow_multi_label_relationships(
+    node_ids: pa.ChunkedArray, label_lists: pa.ListArray, edges: pa.Table
+) -> list[tuple[str, str, str]] | None:
+    """Deduplicate label groups before expanding their Cartesian products."""
+    flat = pc.list_flatten(label_lists)
+    if flat.null_count:
+        return None
+    # Joining integer label IDs produces an unambiguous key for each list,
+    # including arbitrary punctuation in the original label names.
+    tokens = pc.dictionary_encode(flat).indices.cast(pa.string())
+    token_lists = pa.ListArray.from_arrays(label_lists.offsets, tokens)
+    keys = pc.binary_join(token_lists, ",")
+    groups = pc.dictionary_encode(keys)
+    representatives = pc.index_in(groups.dictionary, value_set=keys)
+    group_labels = pc.take(label_lists, representatives)
+    sources = pc.take(groups.indices, pc.index_in(edges["src_id"], value_set=node_ids))
+    targets = pc.take(groups.indices, pc.index_in(edges["dst_id"], value_set=node_ids))
+    triples = pa.table({"src": sources, "rel": edges["rel_type"], "dst": targets})
+    connected = triples.filter(pc.and_(pc.is_valid(sources), pc.is_valid(targets)))
+    unique = connected.group_by(["src", "rel", "dst"]).aggregate([])
+    sizes = pc.list_value_length(group_labels).cast(pa.int64())
+    pairs = pc.multiply(pc.take(sizes, unique["src"]), pc.take(sizes, unique["dst"]))
+    if (pc.sum(pairs).as_py() or 0) > _MAX_SCHEMA_LABEL_PAIRS:
+        # The streaming set fallback avoids allocating very wide intermediate joins.
+        return None
+    left = pc.take(group_labels, unique["src"]).combine_chunks()
+    right = pc.take(group_labels, unique["dst"]).combine_chunks()
+    left_parent = pc.list_parent_indices(left)
+    right_per_left = pc.take(right, left_parent)
+    right_parent = pc.list_parent_indices(right_per_left)
+    expanded = pa.table(
+        {
+            "src": pc.take(pc.list_flatten(left), right_parent),
+            "rel": pc.take(unique["rel"], pc.take(left_parent, right_parent)),
+            "dst": pc.list_flatten(right_per_left),
+        }
+    )
+    return _sorted_label_triples(expanded)
+
+
+def _sorted_label_triples(triples: pa.Table) -> list[tuple[str, str, str]]:
     unique = triples.group_by(["src", "rel", "dst"]).aggregate([])
     return sorted(
         zip(
