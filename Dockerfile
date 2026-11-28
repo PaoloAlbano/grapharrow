@@ -1,6 +1,9 @@
 # Release builds consume the verified wheel; local builds create it from source.
-ARG PYTHON_BASE=python:3.15-slim-trixie@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928
+ARG PYTHON_BASE=python-base
 ARG DISTRIBUTION_SOURCE=wheel-builder
+
+# Keep the default image in a FROM instruction so Dependabot can update it.
+FROM python:3.15-slim-trixie@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928 AS python-base
 
 FROM ${PYTHON_BASE} AS wheel-builder
 ARG STORAGE_EXTRA="cloud delta"
